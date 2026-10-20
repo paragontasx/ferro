@@ -1,0 +1,26 @@
+round 0 throughput ferro iGPU                    8582 ms     348 tok/s  (2989 tokens)
+round 0 throughput ferro CPU (2t)               40708 ms      73 tok/s  (2989 tokens)
+round 0 throughput llama.cpp Vulkan iGPU        11198 ms     267 tok/s  (2989 tokens)
+round 0 throughput llama.cpp CPU (2t)           61578 ms      49 tok/s  (2989 tokens)
+round 0 latency    ferro iGPU                    9064 ms     330 tok/s  (2989 tokens)
+round 0 latency    ferro CPU (2t)               42380 ms      71 tok/s  (2989 tokens)
+round 0 latency    llama.cpp Vulkan iGPU        13751 ms     217 tok/s  (2989 tokens)
+round 0 latency    llama.cpp CPU (2t)           62565 ms      48 tok/s  (2989 tokens)
+round 1 throughput ferro iGPU                    8460 ms     353 tok/s  (2989 tokens)
+round 1 throughput ferro CPU (2t)               41715 ms      72 tok/s  (2989 tokens)
+round 1 throughput llama.cpp Vulkan iGPU        11076 ms     270 tok/s  (2989 tokens)
+round 1 throughput llama.cpp CPU (2t)           61190 ms      49 tok/s  (2989 tokens)
+round 1 latency    ferro iGPU                    8949 ms     334 tok/s  (2989 tokens)
+round 1 latency    ferro CPU (2t)               42414 ms      70 tok/s  (2989 tokens)
+round 1 latency    llama.cpp Vulkan iGPU        13742 ms     218 tok/s  (2989 tokens)
+round 1 latency    llama.cpp CPU (2t)           61374 ms      49 tok/s  (2989 tokens)
+
+BEST
+latency    ferro iGPU                    8949 ms
+latency    llama.cpp Vulkan iGPU        13742 ms
+latency    ferro CPU (2t)               42380 ms
+latency    llama.cpp CPU (2t)           61374 ms
+throughput ferro iGPU                    8460 ms
+throughput llama.cpp Vulkan iGPU        11076 ms
+throughput ferro CPU (2t)               40708 ms
+throughput llama.cpp CPU (2t)           61190 ms

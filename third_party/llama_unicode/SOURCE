@@ -1,0 +1,2 @@
+0ce8cd11416c8840498e6701bcbe39ad4b858c2b Mon Oct 19 12:18:24 2026 -0500
+Vendored verbatim from llama.cpp src/ (MIT, see LICENSE) for byte-level BPE pre-tokenization parity.

@@ -1,0 +1,16 @@
+# build outputs
+*.o
+*.d
+ferro-embed
+tests/test_kernels
+tests/test_decision
+tests/test_media
+bench/mm/mm_ref
+bench/mm/dec_ref
+# large / third-party-licensed artifacts: fetched by scripts, not committed
+models/
+baselines/
+bench/d1/media/
+bench/dump_tokens
+bench/ferro_ref
+bench/ferro_ref_vk

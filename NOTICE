@@ -1,0 +1,17 @@
+ferro includes or derives from the following third-party work.
+
+llama.cpp (MIT) - Copyright (c) 2023-2026 The ggml authors  https://github.com/ggml-org/llama.cpp
+  - third_party/llama_unicode/      : vendored copy of llama.cpp's unicode tables and regex splitting
+  - src/mm_preproc.{h,cpp}          : near-verbatim port of tools/mtmd image tiling, Pillow-compatible
+                                      resize and audio log-mel preprocessing
+  - src/decision.cpp, src/mm_encoder.cpp, src/model_lfm2.cpp, src/tokenizer_bpe.cpp :
+                                      independent reimplementations that follow llama.cpp's behavior
+                                      (tools/server/server-decision.cpp, tools/mtmd/models/*, src/models/lfm2.cpp)
+  - bench/mm/*.cpp, bench/ferro_ref*.cpp : test oracles that link against a separate llama.cpp build
+
+stb_image (public domain / MIT) - Sean Barrett   third_party/stb/stb_image.h
+miniaudio (public domain / MIT-0) - David Reid   third_party/miniaudio/miniaudio.h
+
+Models (not distributed here, fetched by scripts/fetch_assets.sh; see their own licenses):
+  - google/embeddinggemma  (Gemma terms of use)
+  - LiquidAI/d1-omni-600M-GGUF

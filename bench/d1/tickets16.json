@@ -1,0 +1,482 @@
+[
+ {
+  "state": "I was charged twice this month, please refund one of them.",
+  "questions": {
+   "refund": {
+    "type": "noul",
+    "instructions": "Is the customer asking for a refund?"
+   },
+   "team": {
+    "type": "choice",
+    "instructions": "Which team should handle this?",
+    "criteria": {
+     "billing": "Charges, refunds, invoices",
+     "technical": "App or site faults",
+     "fraud": "Suspected unauthorised use",
+     "logistics": "Shipping and delivery",
+     "privacy": "Account data and deletion"
+    }
+   },
+   "urgency": {
+    "type": "score",
+    "instructions": "How urgent is this?",
+    "criteria": [
+     "Can wait",
+     "This week",
+     "Today",
+     "Blocking the customer now"
+    ]
+   }
+  }
+ },
+ {
+  "state": "The app crashes every time I open the settings page on Android 14.",
+  "questions": {
+   "refund": {
+    "type": "noul",
+    "instructions": "Is the customer asking for a refund?"
+   },
+   "team": {
+    "type": "choice",
+    "instructions": "Which team should handle this?",
+    "criteria": {
+     "billing": "Charges, refunds, invoices",
+     "technical": "App or site faults",
+     "fraud": "Suspected unauthorised use",
+     "logistics": "Shipping and delivery",
+     "privacy": "Account data and deletion"
+    }
+   },
+   "urgency": {
+    "type": "score",
+    "instructions": "How urgent is this?",
+    "criteria": [
+     "Can wait",
+     "This week",
+     "Today",
+     "Blocking the customer now"
+    ]
+   }
+  }
+ },
+ {
+  "state": "Someone logged into my account from another country and changed my email.",
+  "questions": {
+   "refund": {
+    "type": "noul",
+    "instructions": "Is the customer asking for a refund?"
+   },
+   "team": {
+    "type": "choice",
+    "instructions": "Which team should handle this?",
+    "criteria": {
+     "billing": "Charges, refunds, invoices",
+     "technical": "App or site faults",
+     "fraud": "Suspected unauthorised use",
+     "logistics": "Shipping and delivery",
+     "privacy": "Account data and deletion"
+    }
+   },
+   "urgency": {
+    "type": "score",
+    "instructions": "How urgent is this?",
+    "criteria": [
+     "Can wait",
+     "This week",
+     "Today",
+     "Blocking the customer now"
+    ]
+   }
+  }
+ },
+ {
+  "state": "Where is my parcel? It was due Monday and tracking hasn't updated in five days.",
+  "questions": {
+   "refund": {
+    "type": "noul",
+    "instructions": "Is the customer asking for a refund?"
+   },
+   "team": {
+    "type": "choice",
+    "instructions": "Which team should handle this?",
+    "criteria": {
+     "billing": "Charges, refunds, invoices",
+     "technical": "App or site faults",
+     "fraud": "Suspected unauthorised use",
+     "logistics": "Shipping and delivery",
+     "privacy": "Account data and deletion"
+    }
+   },
+   "urgency": {
+    "type": "score",
+    "instructions": "How urgent is this?",
+    "criteria": [
+     "Can wait",
+     "This week",
+     "Today",
+     "Blocking the customer now"
+    ]
+   }
+  }
+ },
+ {
+  "state": "Can I upgrade my plan mid-cycle and only pay the difference?",
+  "questions": {
+   "refund": {
+    "type": "noul",
+    "instructions": "Is the customer asking for a refund?"
+   },
+   "team": {
+    "type": "choice",
+    "instructions": "Which team should handle this?",
+    "criteria": {
+     "billing": "Charges, refunds, invoices",
+     "technical": "App or site faults",
+     "fraud": "Suspected unauthorised use",
+     "logistics": "Shipping and delivery",
+     "privacy": "Account data and deletion"
+    }
+   },
+   "urgency": {
+    "type": "score",
+    "instructions": "How urgent is this?",
+    "criteria": [
+     "Can wait",
+     "This week",
+     "Today",
+     "Blocking the customer now"
+    ]
+   }
+  }
+ },
+ {
+  "state": "Your website shows a 502 error at checkout, I can't complete my order.",
+  "questions": {
+   "refund": {
+    "type": "noul",
+    "instructions": "Is the customer asking for a refund?"
+   },
+   "team": {
+    "type": "choice",
+    "instructions": "Which team should handle this?",
+    "criteria": {
+     "billing": "Charges, refunds, invoices",
+     "technical": "App or site faults",
+     "fraud": "Suspected unauthorised use",
+     "logistics": "Shipping and delivery",
+     "privacy": "Account data and deletion"
+    }
+   },
+   "urgency": {
+    "type": "score",
+    "instructions": "How urgent is this?",
+    "criteria": [
+     "Can wait",
+     "This week",
+     "Today",
+     "Blocking the customer now"
+    ]
+   }
+  }
+ },
+ {
+  "state": "I want to cancel my subscription before the renewal next week.",
+  "questions": {
+   "refund": {
+    "type": "noul",
+    "instructions": "Is the customer asking for a refund?"
+   },
+   "team": {
+    "type": "choice",
+    "instructions": "Which team should handle this?",
+    "criteria": {
+     "billing": "Charges, refunds, invoices",
+     "technical": "App or site faults",
+     "fraud": "Suspected unauthorised use",
+     "logistics": "Shipping and delivery",
+     "privacy": "Account data and deletion"
+    }
+   },
+   "urgency": {
+    "type": "score",
+    "instructions": "How urgent is this?",
+    "criteria": [
+     "Can wait",
+     "This week",
+     "Today",
+     "Blocking the customer now"
+    ]
+   }
+  }
+ },
+ {
+  "state": "The invoice for March has the wrong company name and VAT number on it.",
+  "questions": {
+   "refund": {
+    "type": "noul",
+    "instructions": "Is the customer asking for a refund?"
+   },
+   "team": {
+    "type": "choice",
+    "instructions": "Which team should handle this?",
+    "criteria": {
+     "billing": "Charges, refunds, invoices",
+     "technical": "App or site faults",
+     "fraud": "Suspected unauthorised use",
+     "logistics": "Shipping and delivery",
+     "privacy": "Account data and deletion"
+    }
+   },
+   "urgency": {
+    "type": "score",
+    "instructions": "How urgent is this?",
+    "criteria": [
+     "Can wait",
+     "This week",
+     "Today",
+     "Blocking the customer now"
+    ]
+   }
+  }
+ },
+ {
+  "state": "My password reset link expires instantly, I'm locked out of my account.",
+  "questions": {
+   "refund": {
+    "type": "noul",
+    "instructions": "Is the customer asking for a refund?"
+   },
+   "team": {
+    "type": "choice",
+    "instructions": "Which team should handle this?",
+    "criteria": {
+     "billing": "Charges, refunds, invoices",
+     "technical": "App or site faults",
+     "fraud": "Suspected unauthorised use",
+     "logistics": "Shipping and delivery",
+     "privacy": "Account data and deletion"
+    }
+   },
+   "urgency": {
+    "type": "score",
+    "instructions": "How urgent is this?",
+    "criteria": [
+     "Can wait",
+     "This week",
+     "Today",
+     "Blocking the customer now"
+    ]
+   }
+  }
+ },
+ {
+  "state": "The headphones I received are the wrong colour, I ordered black not white.",
+  "questions": {
+   "refund": {
+    "type": "noul",
+    "instructions": "Is the customer asking for a refund?"
+   },
+   "team": {
+    "type": "choice",
+    "instructions": "Which team should handle this?",
+    "criteria": {
+     "billing": "Charges, refunds, invoices",
+     "technical": "App or site faults",
+     "fraud": "Suspected unauthorised use",
+     "logistics": "Shipping and delivery",
+     "privacy": "Account data and deletion"
+    }
+   },
+   "urgency": {
+    "type": "score",
+    "instructions": "How urgent is this?",
+    "criteria": [
+     "Can wait",
+     "This week",
+     "Today",
+     "Blocking the customer now"
+    ]
+   }
+  }
+ },
+ {
+  "state": "There is a charge from your company I don't recognise, I never signed up.",
+  "questions": {
+   "refund": {
+    "type": "noul",
+    "instructions": "Is the customer asking for a refund?"
+   },
+   "team": {
+    "type": "choice",
+    "instructions": "Which team should handle this?",
+    "criteria": {
+     "billing": "Charges, refunds, invoices",
+     "technical": "App or site faults",
+     "fraud": "Suspected unauthorised use",
+     "logistics": "Shipping and delivery",
+     "privacy": "Account data and deletion"
+    }
+   },
+   "urgency": {
+    "type": "score",
+    "instructions": "How urgent is this?",
+    "criteria": [
+     "Can wait",
+     "This week",
+     "Today",
+     "Blocking the customer now"
+    ]
+   }
+  }
+ },
+ {
+  "state": "Push notifications stopped working after the last update on iOS.",
+  "questions": {
+   "refund": {
+    "type": "noul",
+    "instructions": "Is the customer asking for a refund?"
+   },
+   "team": {
+    "type": "choice",
+    "instructions": "Which team should handle this?",
+    "criteria": {
+     "billing": "Charges, refunds, invoices",
+     "technical": "App or site faults",
+     "fraud": "Suspected unauthorised use",
+     "logistics": "Shipping and delivery",
+     "privacy": "Account data and deletion"
+    }
+   },
+   "urgency": {
+    "type": "score",
+    "instructions": "How urgent is this?",
+    "criteria": [
+     "Can wait",
+     "This week",
+     "Today",
+     "Blocking the customer now"
+    ]
+   }
+  }
+ },
+ {
+  "state": "I need a copy of all invoices from last year for my accountant.",
+  "questions": {
+   "refund": {
+    "type": "noul",
+    "instructions": "Is the customer asking for a refund?"
+   },
+   "team": {
+    "type": "choice",
+    "instructions": "Which team should handle this?",
+    "criteria": {
+     "billing": "Charges, refunds, invoices",
+     "technical": "App or site faults",
+     "fraud": "Suspected unauthorised use",
+     "logistics": "Shipping and delivery",
+     "privacy": "Account data and deletion"
+    }
+   },
+   "urgency": {
+    "type": "score",
+    "instructions": "How urgent is this?",
+    "criteria": [
+     "Can wait",
+     "This week",
+     "Today",
+     "Blocking the customer now"
+    ]
+   }
+  }
+ },
+ {
+  "state": "The delivery driver left the package in the rain and the box is soaked.",
+  "questions": {
+   "refund": {
+    "type": "noul",
+    "instructions": "Is the customer asking for a refund?"
+   },
+   "team": {
+    "type": "choice",
+    "instructions": "Which team should handle this?",
+    "criteria": {
+     "billing": "Charges, refunds, invoices",
+     "technical": "App or site faults",
+     "fraud": "Suspected unauthorised use",
+     "logistics": "Shipping and delivery",
+     "privacy": "Account data and deletion"
+    }
+   },
+   "urgency": {
+    "type": "score",
+    "instructions": "How urgent is this?",
+    "criteria": [
+     "Can wait",
+     "This week",
+     "Today",
+     "Blocking the customer now"
+    ]
+   }
+  }
+ },
+ {
+  "state": "Two-factor codes arrive minutes late so login always fails.",
+  "questions": {
+   "refund": {
+    "type": "noul",
+    "instructions": "Is the customer asking for a refund?"
+   },
+   "team": {
+    "type": "choice",
+    "instructions": "Which team should handle this?",
+    "criteria": {
+     "billing": "Charges, refunds, invoices",
+     "technical": "App or site faults",
+     "fraud": "Suspected unauthorised use",
+     "logistics": "Shipping and delivery",
+     "privacy": "Account data and deletion"
+    }
+   },
+   "urgency": {
+    "type": "score",
+    "instructions": "How urgent is this?",
+    "criteria": [
+     "Can wait",
+     "This week",
+     "Today",
+     "Blocking the customer now"
+    ]
+   }
+  }
+ },
+ {
+  "state": "Please close my account and delete all my personal data under GDPR.",
+  "questions": {
+   "refund": {
+    "type": "noul",
+    "instructions": "Is the customer asking for a refund?"
+   },
+   "team": {
+    "type": "choice",
+    "instructions": "Which team should handle this?",
+    "criteria": {
+     "billing": "Charges, refunds, invoices",
+     "technical": "App or site faults",
+     "fraud": "Suspected unauthorised use",
+     "logistics": "Shipping and delivery",
+     "privacy": "Account data and deletion"
+    }
+   },
+   "urgency": {
+    "type": "score",
+    "instructions": "How urgent is this?",
+    "criteria": [
+     "Can wait",
+     "This week",
+     "Today",
+     "Blocking the customer now"
+    ]
+   }
+  }
+ }
+]
