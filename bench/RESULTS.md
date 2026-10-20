@@ -225,4 +225,3 @@ Token counts equal the server's in every case (1104 for 44 s: ONE `<|audio>..<au
 - Audio attention / conv module / SSCP still run on the CPU (the audio GEMMs are on the iGPU).
 - Text/audio sequences beyond ~2900 tokens fall back to the CPU layer loop (score scratch cap 128 MB).
 - Llama.cpp's Vulkan path was not benchmarked for the EmbeddingGemma-2 encoders.
-- The 1080p case has no cached oracle other than the server reference captured during this run.
