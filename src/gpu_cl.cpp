@@ -1030,10 +1030,17 @@ __kernel void dattn_pv(__global const float* S, __global const float2* st, float
   __local float tot[256];
   for (int k0 = 0; k0 < n; k0 += 32) {
     barrier(CLK_LOCAL_MEM_FENCE);
-    for (int c4 = g; c4 < 8; c4 += 4) {           // P: row r, keys k0 + 4*c4 .. +3 (n is a multiple of 4)
+    for (int c4 = g; c4 < 8; c4 += 4) {           // P: row r, keys k0 + 4*c4 .. +3 (a ragged tail is handled below)
       const int kk = k0 + c4 * 4;
       float4 p = (float4)(0.f);
-      if (rok && kk < n) { p = native_exp2(vload4(0, Sh + (size_t)(i0 + r) * n + kk) * sl2 - ml2); psum += p.x + p.y + p.z + p.w; }
+      if (rok && kk + 3 < n) { p = native_exp2(vload4(0, Sh + (size_t)(i0 + r) * n + kk) * sl2 - ml2); psum += p.x + p.y + p.z + p.w; }
+      else if (rok && kk < n) {                      // ragged tail (n % 4 != 0): in-range keys as scalars, the rest stay 0
+        const __global float* sr = Sh + (size_t)(i0 + r) * n + kk;
+        p.x = native_exp2(sr[0] * sl2 - ml2);
+        if (kk + 1 < n) p.y = native_exp2(sr[1] * sl2 - ml2);
+        if (kk + 2 < n) p.z = native_exp2(sr[2] * sl2 - ml2);
+        psum += p.x + p.y + p.z + p.w;
+      }
       Ps[(c4 * 4 + 0) * 64 + r] = p.x; Ps[(c4 * 4 + 1) * 64 + r] = p.y; Ps[(c4 * 4 + 2) * 64 + r] = p.z; Ps[(c4 * 4 + 3) * 64 + r] = p.w;
     }
     for (int e = lid; e < 32 * 16; e += 256) {     // V: 32 key rows x 64 dims
@@ -1069,6 +1076,32 @@ __kernel void score_out(__global const float* O, __global const float* cb, __glo
   const float s = wg_add(dot(g, vload4(lid, w)), red);
   if (lid == 0) out[k] = s + wb;
 }
+
+// Gemma 4 vision qkv post-process: WG per (slot, token), LS = 64 (hd = 64 only, one lane per head dim).
+// q/k: RMSNorm(weight) then 2-D neox RoPE (x position on dims [0,hd/2), y position on dims [hd/2,hd), each half a
+// rotate-half block of hn = hd/4 pairs, angle = pos * theta^(-i/hn)); v: RMSNorm without weight; no RoPE.
+__kernel void qkv_post_g4(__global float* C, int rowc, int nq, int nkv, int hd, __global const float* qw,
+                          __global const float* kw, __global const float* invf, __global const int* posx,
+                          __global const int* posy, float eps) {
+  __local float red[32];
+  __local float buf[64];
+  const int slot = get_group_id(0), t = get_group_id(1), lid = get_local_id(0);
+  __global float* v = C + (size_t)t * rowc + slot * hd;
+  const float x = v[lid];
+  const float inv = 1.0f / sqrt(wg_add(x * x, red) / (float)hd + eps);
+  if (slot >= nq + nkv) { v[lid] = x * inv; return; }
+  const float y = x * inv * (slot < nq ? qw : kw)[lid];
+  buf[lid] = y;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  const int hn = hd / 4;                       // 16 pairs per block
+  const int blk = lid / (2 * hn);              // 0: x block, 1: y block
+  const int w = lid - blk * 2 * hn;            // index within the block [0, 2*hn)
+  const int i = w < hn ? w : w - hn;           // pair index
+  const float p = (float)(blk == 0 ? posx[t] : posy[t]);
+  const float a = p * invf[i], c = cos(a), sn = sin(a);
+  const float x0 = buf[blk * 2 * hn + i], x1 = buf[blk * 2 * hn + i + hn];
+  v[lid] = w < hn ? x0 * c - x1 * sn : x0 * sn + x1 * c;
+}
 )CL";
 
 // ---------------------------------------------------------------- state
@@ -1089,7 +1122,7 @@ static cl_kernel k_quant = nullptr, k_gemm = nullptr, k_gemm_sw = nullptr, k_rms
                  k_attq2 = nullptr, k_gmq2 = nullptr, k_gmvq2 = nullptr,
                  k_rowf3 = nullptr, k_qkvp3 = nullptr, k_attq3 = nullptr, k_gmq3 = nullptr, k_gmvq3 = nullptr,
                  k_rnq = nullptr, k_hinq = nullptr, k_convq = nullptr, k_siluq = nullptr, k_bactq = nullptr,
-                 k_badd = nullptr, k_score = nullptr, k_attq4 = nullptr, k_attq5 = nullptr, k_quantq = nullptr, k_lngq = nullptr, k_dqk = nullptr, k_dsm = nullptr, k_dpv = nullptr;
+                 k_badd = nullptr, k_score = nullptr, k_attq4 = nullptr, k_attq5 = nullptr, k_quantq = nullptr, k_lngq = nullptr, k_dqk = nullptr, k_dsm = nullptr, k_dpv = nullptr, k_qkvg4 = nullptr;
 static std::vector<Slot> g_slots;
 static size_t g_bytes = 0;
 static cl_mem g_Xp = nullptr, g_Xs = nullptr;           // quantized-activation scratch
@@ -1157,7 +1190,7 @@ bool init(bool verbose) {
         {&k_attn, "attention"}, {&k_gmul, "gelu_mul"}, {&k_gmulv, "gelu_mulvec"}, {&k_add, "add_scale"},
         {&k_rowf, "row_fused"}, {&k_qkvp, "qkv_post"}, {&k_attq, "attention_q"}, {&k_gmq, "gelu_mul_q"},
         {&k_gmvq, "gelu_mulvec_q"}, {&k_attq2, "attention_q2"}, {&k_gmq2, "gelu_mul_q2"}, {&k_gmvq2, "gelu_mulvec_q2"},
-        {&k_rowf3, "row_fused3"}, {&k_qkvp3, "qkv_post3"}, {&k_attq3, "attention_q3"}, {&k_gmq3, "gelu_mul_q3"},
+        {&k_qkvg4, "qkv_post_g4"}, {&k_rowf3, "row_fused3"}, {&k_qkvp3, "qkv_post3"}, {&k_attq3, "attention_q3"}, {&k_gmq3, "gelu_mul_q3"},
         {&k_gmvq3, "gelu_mulvec_q3"}, {&k_rnq, "resid_norm_q3"}, {&k_hinq, "head_in_q3"}, {&k_convq, "conv_gate_q3"},
         {&k_siluq, "silu_mul_q8"}, {&k_bactq, "bias_act_q8"}, {&k_badd, "bias_add"}, {&k_score, "score_out"}, {&k_attq4, "attention_q4"}, {&k_attq5, "attention_q5"}, {&k_quantq, "quant_q3"}, {&k_lngq, "ln_gather_q3"}, {&k_dqk, "dattn_qk"}, {&k_dsm, "dattn_stats"}, {&k_dpv, "dattn_pv"}};
     for (auto& k : ks) { *k.k = cl.clCreateKernel(g_prog, k.n, &err); CK(err); }
@@ -1323,6 +1356,13 @@ bool op_row_fused(Buf R, Buf D, Buf wd, float scale, Buf OUT, Buf wq, bool norm_
              (cl_int)do_q, (Buf)g_Xp, (Buf)g_Xs, (cl_int)cols, eps);
     size_t g[1] = {(size_t)T * LS}, l[1] = {LS};
     return launch(k_rowf, 1, g, l);
+}
+
+bool op_qkv_post_g4(Buf C, int rowc, int T, int nq, int nkv, int hd, Buf qw, Buf kw, Buf invf, Buf posx, Buf posy, float eps) {
+    if (hd != 64) return false;
+    set_args(k_qkvg4, C, (cl_int)rowc, (cl_int)nq, (cl_int)nkv, (cl_int)hd, qw, kw, invf, posx, posy, eps);
+    size_t g[2] = {(size_t)(nq + 2 * nkv) * 64, (size_t)T}, l[2] = {64, 1};
+    return launch(k_qkvg4, 2, g, l);
 }
 
 bool op_qkv_post(Buf C, int rowc, int T, int nq, int nkv, int hd, Buf qw, Buf kw, Buf cosb, Buf sinb, Buf pos, int hlf, float eps, bool norm_v) {
@@ -1568,7 +1608,7 @@ void shutdown() {
     g_Xp = g_Xs = g_hX = g_hY = nullptr;
     for (cl_kernel k : {k_quant, k_gemm, k_gemm_sw, k_rms, k_rope, k_attn, k_gmul, k_gmulv, k_add, k_rowf, k_qkvp, k_attq, k_gmq, k_gmvq,
                         k_attq2, k_gmq2, k_gmvq2, k_rowf3, k_qkvp3, k_attq3, k_gmq3, k_gmvq3,
-                        k_rnq, k_hinq, k_convq, k_siluq, k_bactq, k_badd, k_score, k_attq4, k_attq5, k_quantq, k_lngq, k_dqk, k_dsm, k_dpv})
+                        k_rnq, k_hinq, k_convq, k_siluq, k_bactq, k_badd, k_score, k_attq4, k_attq5, k_quantq, k_lngq, k_dqk, k_dsm, k_dpv, k_qkvg4})
         if (k) cl.clReleaseKernel(k);
     cl.clReleaseProgram(g_prog); cl.clReleaseCommandQueue(g_q); cl.clReleaseContext(g_ctx);
     g_ok = false;

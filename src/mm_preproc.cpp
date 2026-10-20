@@ -402,6 +402,100 @@ bool d1omni_audio_mel(const float* samples_in, size_t n_in, int n_mel, Mel& out)
     return true;
 }
 
+// ---------------------------------------------------------------- Gemma 4 audio frontend
+namespace {
+struct G4MelCache {
+    MelCache c;
+    int n_mel = 0;
+};
+void fill_mel_filterbank_htk(MelCache& c, int n_mel, int n_fft, int sample_rate) {
+    const double fmin = 0.0, fmax = 0.5 * sample_rate;
+    auto hz_to_mel = [](double f) { return 2595.0 * log10(1.0 + f / 700.0); };
+    auto mel_to_hz = [](double m) { return 700.0 * (pow(10.0, m / 2595.0) - 1.0); };
+    const double bin_hz = (double)sample_rate / n_fft;
+    const double m_lo = hz_to_mel(fmin), m_hi = hz_to_mel(fmax);
+    std::vector<double> hz(n_mel + 2);
+    for (int i = 0; i < n_mel + 2; ++i) hz[i] = mel_to_hz(m_lo + (m_hi - m_lo) * ((double)i / (n_mel + 1)));
+    const int nb = n_fft / 2 + 1;
+    c.filters.assign((size_t)n_mel * nb, 0.f);
+    for (int m = 0; m < n_mel; ++m) {
+        const double fl = hz[m], fc = hz[m + 1], fr = hz[m + 2];
+        const double dl = std::max(1e-30, fc - fl), dr = std::max(1e-30, fr - fc);
+        for (int k = 0; k < nb; ++k) {
+            const double f = k * bin_hz;
+            double w = 0.0;
+            if (f >= fl && f <= fc) w = (f - fl) / dl;
+            else if (f > fc && f <= fr) w = (fr - f) / dr;
+            c.filters[(size_t)m * nb + k] = (float)w;                      // no Slaney area normalisation
+        }
+    }
+    c.n_mel = n_mel;
+}
+const MelCache& g4_mel_cache(int n_mel) {
+    static MelCache c;
+    if (c.n_mel != n_mel) {
+        fill_sin_cos(c, 512);
+        c.hann.assign(512, 0.f);                                          // periodic Hann over the 20 ms window, zero-padded to the FFT size
+        for (int i = 0; i < 320; ++i) c.hann[i] = 0.5f - 0.5f * cosf((2.0f * (float)M_PI * i) / 320.0f);
+        fill_mel_filterbank_htk(c, n_mel, 512, 16000);
+    }
+    return c;
+}
+}  // namespace
+
+bool gemma4a_audio_mel(const float* samples_in, size_t n_in, int n_mel, std::vector<Mel>& out) {
+    if (n_in == 0) return false;
+    const int SR = 16000, N_FFT = 512, WIN = 320, HOP = 160;
+    const MelCache& c = g4_mel_cache(n_mel);
+    const size_t chunk_samples = (size_t)30 * SR;
+    for (size_t off = 0; off < n_in; off += chunk_samples) {
+        const float* chunk = samples_in + off;
+        const size_t chunk_len = std::min(chunk_samples, n_in - off);
+        // semicausal left padding + right padding to match the PyTorch frame count
+        const int pad_left = WIN / 2;
+        const int n_with_left = (int)chunk_len + pad_left;
+        const int64_t pt_frames = (n_with_left - (WIN + 1)) / HOP + 1;
+        const int64_t n_padded_needed = (pt_frames - 1) * HOP + N_FFT;
+        const int total_pad = std::max((int)(n_padded_needed - (int)chunk_len), pad_left);
+        std::vector<float> sp(total_pad + chunk_len, 0.0f);
+        std::copy(chunk, chunk + chunk_len, sp.begin() + pad_left);
+        const int n_samples = (int)sp.size();
+        const int n_fft_bins = N_FFT / 2 + 1;
+        int n_len = (n_samples - N_FFT) / HOP + 1;
+        if (n_len <= 0 || n_samples < N_FFT) return false;
+        std::vector<float> data((size_t)n_mel * n_len);
+        std::vector<float> fft_in(N_FFT * 2, 0.f), fft_out(N_FFT * 2 * 2 * 2);
+        int64_t i = 0;
+        for (; i < std::min((int64_t)(n_samples / HOP + 1), (int64_t)n_len); ++i) {
+            const int64_t o = i * HOP;
+            const int valid = std::min(N_FFT, std::max(0, n_samples - (int)o));
+            for (int j = 0; j < valid; j++) fft_in[j] = c.hann[j] * sp[o + j];
+            if (valid < N_FFT) std::fill(fft_in.begin() + valid, fft_in.end(), 0.0f);
+            fft_real(c, fft_in.data(), N_FFT, fft_out.data());
+            for (int j = 0; j < n_fft_bins; j++) {
+                const float power = fft_out[2 * j] * fft_out[2 * j] + fft_out[2 * j + 1] * fft_out[2 * j + 1];
+                fft_out[j] = sqrtf(power);                                // magnitude
+            }
+            for (int j = 0; j < n_mel; j++) {
+                double sum = 0.0;
+                int k = 0;
+                const float* f = c.filters.data() + (size_t)j * n_fft_bins;
+                for (k = 0; k < n_fft_bins - 3; k += 4)
+                    sum += fft_out[k] * f[k] + fft_out[k + 1] * f[k + 1] + fft_out[k + 2] * f[k + 2] + fft_out[k + 3] * f[k + 3];
+                for (; k < n_fft_bins; k++) sum += fft_out[k] * f[k];
+                sum = std::max(sum, 0.001);                               // mel floor
+                data[(size_t)j * n_len + i] = (float)log(sum);
+            }
+        }
+        for (; i < n_len; ++i) for (int j = 0; j < n_mel; j++) data[(size_t)j * n_len + i] = (float)log(1e-10);
+        Mel m; m.n_mel = n_mel; m.n_len = (int)std::min<int64_t>(n_len, pt_frames); m.data.resize((size_t)n_mel * m.n_len);
+        for (int j = 0; j < n_mel; ++j)                                   // trim to the PyTorch frame count, keep [mel][frame]
+            std::copy_n(data.begin() + (size_t)j * n_len, m.n_len, m.data.begin() + (size_t)j * m.n_len);
+        out.push_back(std::move(m));
+    }
+    return true;
+}
+
 int audio_tokens(const Mel& m) { return ((((m.n_len + 1) / 2) + 1) / 2 + 1) / 2; }
 
 // ---- Gemma 4 / EmbeddingGemma 2 vision: mtmd_image_preprocessor_dyn_size (smart_resize, align patch*merge, bicubic)

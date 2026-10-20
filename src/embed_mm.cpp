@@ -69,6 +69,7 @@ bool MmEmbedder::init(const std::string& model_path, const std::string& mmproj_p
     if (!eng_.init(model_path, threads, err)) return false;
     if (!tokf_.open_file(model_path.c_str(), err) || !tok_.load(tokf_, err)) return false;
     if (!mmproj_path.empty() && !proj_.load(mmproj_path, err)) return false;
+    if (!mmproj_path.empty()) proj_.upload_gpu();      // vision tower on the iGPU (CPU fallback kept)
     return true;
 }
 

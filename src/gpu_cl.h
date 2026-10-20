@@ -47,6 +47,8 @@ bool op_gemm_q(int slot, int T, Buf Y);                     // GEMM on the curre
 bool op_row_fused(Buf R, Buf D, Buf wd, float scale, Buf OUT, Buf wq, bool norm_q, bool do_q, int T, int cols, float eps);
 bool op_qkv_post(Buf C, int rowc, int T, int nq, int nkv, int hd, Buf qw, Buf kw, Buf cosb, Buf sinb, Buf pos, int hlf, float eps,
                  bool norm_v = true);   // norm_v=false: V untouched (models without a V-norm)
+// Gemma 4 vision (hd = 64): q/k RMSNorm(w) + 2-D RoPE (posx on dims [0,32), posy on [32,64), invf[16]); v RMSNorm (no weight)
+bool op_qkv_post_g4(Buf C, int rowc, int T, int nq, int nkv, int hd, Buf qw, Buf kw, Buf invf, Buf posx, Buf posy, float eps);
 bool op_attention_q(Buf C, int ldc, int qoff, int koff, int voff, int T, int nq, int nkv, int hd,
                     Buf seg_lo, Buf seg_hi, int window, float scale,
                     Buf pre_lo = nullptr, Buf pre_hi = nullptr);

@@ -7,6 +7,7 @@ tests/test_decision
 tests/test_media
 bench/mm/mm_ref
 bench/mm/dec_ref
+bench/mm/mel_ref
 # large / third-party-licensed artifacts: fetched by scripts, not committed
 models/
 baselines/

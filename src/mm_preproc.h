@@ -25,6 +25,13 @@ struct Mel { int n_mel = 0, n_len = 0; std::vector<float> data; };   // data[mel
 bool d1omni_audio_mel(const float* pcm, size_t n, int n_mel, Mel& out);
 int audio_tokens(const Mel& m);   // ceil(ceil(ceil(frames/2)/2)/2)
 
+// Gemma 4 / EmbeddingGemma 2 audio (mtmd_audio_preprocessor_gemma4a): 16 kHz, n_fft 512, 20 ms periodic Hann (320, left-aligned
+// in the FFT frame), hop 160, semicausal padding, magnitude spectrum, HTK mel (no area norm), ln(max(x, 1e-3)), no
+// normalization. Audio longer than 30 s is split into 30 s pieces: one Mel per piece (data[mel * n_len + frame]).
+bool gemma4a_audio_mel(const float* pcm, size_t n, int n_mel, std::vector<Mel>& out);
+// encoder tokens for a Mel of n_len frames: two stride-2 3x3 convs (pad 1): n -> (n-1)/2+1, twice
+inline int gemma4a_tokens(int n_len) { int n = n_len; for (int i = 0; i < 2; ++i) n = (n - 1) / 2 + 1; return n; }
+
 // Pillow-compatible resize (bilinear), exposed for tests
 void resize_pillow_bilinear(const uint8_t* src, int sw, int sh, uint8_t* dst, int dw, int dh);
 void resize_pillow_bicubic(const uint8_t* src, int sw, int sh, uint8_t* dst, int dw, int dh);

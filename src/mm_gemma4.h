@@ -21,6 +21,10 @@ public:
     const Gemma4VisionPre& vision_params() const { return vp_; }
     // embeddings [n_tok][n_embd_out] for one preprocessed image (n_tok = (nx/48)*(ny/48))
     std::vector<float> encode_image(const VisionInput& in);
+    // move the vision weights to the iGPU (fused qkv / gate|up GEMMs, int8 DP4A); call after gpu::init().
+    // encode_image() then runs the whole tower on the device (FERRO_MM_GPU=0 or any failure -> CPU path).
+    void upload_gpu();
+    bool vision_on_gpu() const;
     struct Impl;
 private:
     GgufFile g_;

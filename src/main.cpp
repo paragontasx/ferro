@@ -226,14 +226,20 @@ static int run_mm_embed_g4(const std::string& mmproj, const std::string& media, 
     Gemma4Proj mm;
     std::string err;
     if (!mm.load(mmproj, &err)) { fprintf(stderr, "mmproj: %s\n", err.c_str()); return 1; }
+    const char* ge = getenv("FERRO_GPU");
+    if ((!ge || atoi(ge) != 0) && gpu::init(getenv("FERRO_VERBOSE") != nullptr)) mm.upload_gpu();   // vision tower on the iGPU
     std::ifstream f(media, std::ios::binary);
     if (!f) { fprintf(stderr, "cannot read %s\n", media.c_str()); return 1; }
     std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
     MediaItem it = decode_media(bytes, 16000);
     std::vector<std::vector<float>> chunks;
-    auto t0 = clk::now();
     if (it.is_audio) { fprintf(stderr, "gemma4 audio encoder not implemented yet\n"); return 1; }
     VisionInput in = gemma4_preprocess_image(it.rgb.data(), it.nx, it.ny, mm.vision_params());
+    if (getenv("FERRO_MM_WARM")) {                       // steady-state timing: first call pays kernel build + buffer allocation
+        auto w0 = clk::now(); (void)mm.encode_image(in);
+        fprintf(stderr, "[mm] warm-up encode %.1f ms (vision on %s)\n", std::chrono::duration<double, std::milli>(clk::now() - w0).count(), mm.vision_on_gpu() ? "iGPU" : "CPU");
+    }
+    auto t0 = clk::now();
     chunks.push_back(mm.encode_image(in));
     fprintf(stderr, "[mm] image %dx%d input %dx%d -> %d tokens\n", it.nx, it.ny, in.nx, in.ny, (in.nx / 48) * (in.ny / 48));
     fprintf(stderr, "[mm] encoded in %.1f ms\n", std::chrono::duration<double, std::milli>(clk::now() - t0).count());
@@ -348,6 +354,19 @@ int main(int argc, char** argv) {
         fprintf(stderr, "[embed-media] %d tokens, %.2f s\n", nt, std::chrono::duration<double>(clk::now() - t0).count());
         if (!outp.empty()) { FILE* o = fopen(outp.c_str(), "wb"); if (!o) return 1; fwrite(vec.data(), 4, vec.size(), o); fclose(o); }
         else { for (size_t i = 0; i < vec.size(); ++i) printf("%s%.6f", i ? " " : "", vec[i]); printf("\n"); }
+        return 0;
+    }
+    if (cmd == "mel-dump") {          // Gemma 4 audio frontend only: raw f32 16 kHz mono PCM -> mel chunks (bench/mm/mel_ref format)
+        if (media.empty() || outp.empty()) { fprintf(stderr, "mel-dump --media in.f32 --out mel.bin\n"); return 2; }
+        std::ifstream f(media, std::ios::binary);
+        std::vector<float> pcm; { float v; while (f.read((char*)&v, 4)) pcm.push_back(v); }
+        std::vector<Mel> mels;
+        if (!gemma4a_audio_mel(pcm.data(), pcm.size(), 128, mels)) { fprintf(stderr, "mel failed\n"); return 1; }
+        FILE* o = fopen(outp.c_str(), "wb"); if (!o) return 1;
+        int32_t nc = (int32_t)mels.size(); fwrite(&nc, 4, 1, o);
+        for (auto& m : mels) { int32_t nm = m.n_mel, nl = m.n_len; fwrite(&nm, 4, 1, o); fwrite(&nl, 4, 1, o); fwrite(m.data.data(), 4, m.data.size(), o);
+                               fprintf(stderr, "chunk: n_mel=%d n_len=%d tokens=%d\n", nm, nl, gemma4a_tokens(nl)); }
+        fclose(o);
         return 0;
     }
     if (cmd == "mm-embed") {
