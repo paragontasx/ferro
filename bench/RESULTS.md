@@ -177,3 +177,52 @@ ferro iGPU vs llama.cpp Vulkan: 1.90x / 2.30x; vs llama.cpp CPU: 10.9x / 10.0x. 
 EmbeddingGemma llama.cpp rows were not re-run (still the 2026-10-20 numbers).
 d1 kernel profile now (T=2,989, 5.6 s device): ffn gate|up 2.19 s, ffn down 1.20 s, conv.in 0.46 s, attention
 0.47 s, SwiGLU 0.25 s; GEMMs are ~75% of the forward.
+
+
+## 2026-10-21: EmbeddingGemma-2 multimodal on the iGPU (vision, audio, video)
+
+`ferro-embed embed-media` (text / image / audio / video items interleaved into one 768-d embedding). Oracle: llama-server
+`/v1/embeddings` with `--mmproj` (`scripts/eg2_parity_mm.py`, cached references, built-in oracle-sanity guard). Gate: cosine of the
+final L2-normalised embedding >= 0.999. Encoder ground truth: `bench/mm/mm_ref` (libmtmd), audio mel: `bench/mm/mel_ref` (upstream
+`mtmd_audio_preprocessor_gemma4a`, compiled unmodified; our mel is bit-exact).
+
+### Final-embedding parity (12 cases, all pass, final build)
+| case | tokens | cosine | ferro time |
+|---|---|---|---|
+| text | 12 | 0.999952 | 0.07 s |
+| image 100x80 | 84 | 0.999362 | 1.5 s |
+| image 640x480 | 134 | 0.999652 | 2.8 s |
+| image 1920x1080 | 924 | 0.999848 | 70 s |
+| text + image | 139 | 0.999300 | 2.9 s |
+| audio 11 s (wav / mp3 / flac 44.1 kHz) | 279 | 0.999902 / 0.999932 / 0.999936 | 2.0 s |
+| text + audio | 284 | 0.999923 | 2.1 s |
+| audio 44 s (two 30 s chunks, one span) | 1104 | 0.999859 | 8.8 s |
+| video 2 s (8 frames @ 4 fps) | 669 | 0.999646 | 12.3 s |
+| text + image + audio | 412 | 0.999819 | 5.2 s |
+Token counts equal the server's in every case (1104 for 44 s: ONE `<|audio>..<audio|>` span for all 30 s chunks, as mtmd).
+
+### What moved the numbers
+- **Vision tower on the iGPU** (was CPU-only: 51% attention_fma + 38% GEMM): 640x480 photo 16.4 s -> 2.5 s. Fused `[q|k|v]` and
+  `[gate|up]` weights, `row_fused` for the sandwich norms, one new kernel (`qkv_post_g4`: 2-D RoPE + q/k/v norms), dense attention.
+  Per-chunk mean cosine vs libmtmd .9962 (CPU path .9972): int8 activations compound over 16 layers (relL2 vs CPU 0.24% at layer 0
+  -> 6.4% at layer 15, smooth, no step) - the pooled embedding averages it out (.9997).
+- **Audio** (new): mel frontend bit-exact; encoder = SSCP (ggml_conv_2d rounds BOTH conv operands to fp16 - reproduced), 12 conformer
+  blocks with chunked local attention (C=12, P=12), blocked relative shift, softcap 50, clamped linears, causal depthwise conv.
+  `per_dim_scale` is applied raw (softplus: cos .90). 11 s clip: CPU 4.5 s -> iGPU GEMMs 1.4 s. Per-chunk mean cosine .99987 (CPU) /
+  .99976 (iGPU). Remaining audio cost (11 s, warm): FFN 735 ms, attention 253, conv module 173, sscp 173 (attention/conv on the CPU).
+- **Text model attention for long single sequences** (the lane-per-key kernels are O(T) serial per query; at 660 tokens attention was
+  90% of the forward): head-dim generic dense kernels (`dattn_qk_h` / `dattn_stats_w` / `dattn_pv_h`, band mask for the SWA layers,
+  swa_window is stored as window/2+1 = 513) used when ONE segment covers all tokens. iGPU forward, old -> new: 126 tok 363 -> 217 ms,
+  423 tok 2830 -> 804, 542 tok 4468 -> 1131, 672 tok 6729 -> 1545, 951 tok 13239 -> 2608 (5.1x). Sequences above the old 1024-token
+  limit stay on the iGPU (1150 tok 3.7 s, 1587 tok 6.4 s, 2104 tok 10.4 s; cos vs llama.cpp >= .9998). Headline 16x188 bench unchanged.
+- **Query-tiled dense attention**: a 1080p photo is 8280 patches (3.3 GB of scores); queries are tiled into a bounded 64 MB scratch.
+  1080p: 67 s encode vs llama.cpp CPU 183 s; attention is 88% of it (qk 28.9 s, pv 28.1 s, stats 4.7 s, ~58 GMAC/s = 55% of fp32 peak).
+
+### Limits / not done
+- 1080p photos are slow (~70 s): ViT attention at ~55% of fp32 peak; fp16/flash-style fusion is not available through this OpenCL.
+- Video costs ~1.5 s/frame: small frames are upscaled to the 70-token minimum image (a 320x240 frame becomes 480x384 = 720 patches).
+  Batching frames into one forward (segment-masked attention) would amortise the weight traffic; not done.
+- Audio attention / conv module / SSCP still run on the CPU (the audio GEMMs are on the iGPU).
+- Text/audio sequences beyond ~2900 tokens fall back to the CPU layer loop (score scratch cap 128 MB).
+- Llama.cpp's Vulkan path was not benchmarked for the EmbeddingGemma-2 encoders.
+- The 1080p case has no cached oracle other than the server reference captured during this run.
