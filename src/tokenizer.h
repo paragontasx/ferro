@@ -13,7 +13,7 @@ public:
     bool load(const GgufFile& g, std::string* err);
 
     // Plain text -> token ids. Adds BOS/EOS according to GGUF add_bos/add_eos flags.
-    std::vector<int> tokenize(const std::string& text) const;
+    std::vector<int> tokenize(const std::string& text, bool add_special = true) const;   // add_special=false: no BOS/EOS (text pieces between media)
 
     int bos_id() const { return bos_id_; }
     int eos_id() const { return eos_id_; }

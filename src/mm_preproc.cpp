@@ -4,6 +4,7 @@
 #include "mm_preproc.h"
 
 #include <algorithm>
+#include <cstring>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
@@ -13,10 +14,17 @@ namespace ferro {
 
 // ============================================================ images
 // Pillow-compatible separable resampling (bilinear), 22-bit fixed point
-void resize_pillow_bilinear(const uint8_t* src, int sw, int sh, uint8_t* dst, int dw, int dh) {
+static void resize_pillow(const uint8_t* src, int sw, int sh, uint8_t* dst, int dw, int dh, bool bicubic) {
     const int PRECISION_BITS = 32 - 8 - 2;
-    const double filter_support = 1.0;
-    auto filt = [](double x) { if (x < 0.0) x = -x; return x < 1.0 ? 1.0 - x : 0.0; };
+    const double filter_support = bicubic ? 2.0 : 1.0;
+    auto filt = [bicubic](double x) {
+        if (x < 0.0) x = -x;
+        if (!bicubic) return x < 1.0 ? 1.0 - x : 0.0;
+        constexpr double a = -0.5;                       // Pillow's bicubic (GGML/PyTorch use -0.75)
+        if (x < 1.0) return ((a + 2.0) * x - (a + 3.0)) * x * x + 1;
+        if (x < 2.0) return (((x - 5) * x + 8) * x - 4) * a;
+        return 0.0;
+    };
     auto clip8 = [](int v) -> uint8_t { return v < 0 ? 0 : v > 255 ? 255 : (uint8_t)v; };
     auto precompute = [&](int inSize, int outSize, std::vector<int>& bounds, std::vector<int32_t>& weights) {
         double scale, filterscale;
@@ -102,6 +110,9 @@ void resize_pillow_bilinear(const uint8_t* src, int sw, int sh, uint8_t* dst, in
     else out.assign(src, src + (size_t)sw * sh * 3);
     std::copy(out.begin(), out.end(), dst);
 }
+
+void resize_pillow_bilinear(const uint8_t* src, int sw, int sh, uint8_t* dst, int dw, int dh) { resize_pillow(src, sw, sh, dst, dw, dh, false); }
+void resize_pillow_bicubic(const uint8_t* src, int sw, int sh, uint8_t* dst, int dw, int dh) { resize_pillow(src, sw, sh, dst, dw, dh, true); }
 
 namespace {
 struct Size { int w = 0, h = 0; };
@@ -392,5 +403,47 @@ bool d1omni_audio_mel(const float* samples_in, size_t n_in, int n_mel, Mel& out)
 }
 
 int audio_tokens(const Mel& m) { return ((((m.n_len + 1) / 2) + 1) / 2 + 1) / 2; }
+
+// ---- Gemma 4 / EmbeddingGemma 2 vision: mtmd_image_preprocessor_dyn_size (smart_resize, align patch*merge, bicubic)
+static void gemma4_target_size(int width, int height, int align, long min_pixels, long max_pixels, int& w_bar, int& h_bar) {
+    auto round_by = [align](float x) { return (int)std::round(x / (float)align) * align; };
+    auto ceil_by = [align](float x) { return (int)std::ceil(x / (float)align) * align; };
+    auto floor_by = [align](float x) { return (int)std::floor(x / (float)align) * align; };
+    w_bar = std::max(align, round_by((float)width));
+    h_bar = std::max(align, round_by((float)height));
+    if (max_pixels > 0 && (long)h_bar * w_bar > max_pixels) {
+        const float beta = std::sqrt((float)height * width / (float)max_pixels);
+        h_bar = std::max(align, floor_by(height / beta));
+        w_bar = std::max(align, floor_by(width / beta));
+    } else if (min_pixels > 0 && (long)h_bar * w_bar < min_pixels) {
+        const float beta = std::sqrt((float)min_pixels / ((float)height * width));
+        h_bar = ceil_by(height * beta);
+        w_bar = ceil_by(width * beta);
+    }
+}
+
+VisionInput gemma4_preprocess_image(const uint8_t* rgb, int nx, int ny, const Gemma4VisionPre& p) {
+    const int patch_area = p.patch_size * p.patch_size * p.n_merge * p.n_merge;
+    int w, h;
+    gemma4_target_size(nx, ny, p.patch_size * p.n_merge, (long)p.min_tokens * patch_area, (long)p.max_tokens * patch_area, w, h);
+    std::vector<uint8_t> rs((size_t)w * h * 3);
+    if (w == nx && h == ny) {
+        std::copy(rgb, rgb + (size_t)nx * ny * 3, rs.begin());
+    } else {
+        // mtmd img_tool::resize with PAD_CEIL: fit inside the target keeping aspect ratio (ceil), black letterbox, centered
+        const float scale = std::min((float)w / nx, (float)h / ny);
+        const int nw = std::min((int)std::ceil(nx * scale), w), nh = std::min((int)std::ceil(ny * scale), h);
+        std::vector<uint8_t> fit((size_t)nw * nh * 3);
+        resize_pillow_bicubic(rgb, nx, ny, fit.data(), nw, nh);
+        std::fill(rs.begin(), rs.end(), 0);
+        const int ox = (w - nw) / 2, oy = (h - nh) / 2;
+        for (int y = 0; y < nh; ++y) memcpy(rs.data() + ((size_t)(y + oy) * w + ox) * 3, fit.data() + (size_t)y * nw * 3, (size_t)nw * 3);
+    }
+    VisionInput out;
+    out.nx = w; out.ny = h; out.chw.resize((size_t)3 * w * h);
+    for (int c = 0; c < 3; ++c)                          // mean 0 / std 1: x / 255 (the encoder applies 2x - 1)
+        for (size_t i = 0; i < (size_t)w * h; ++i) out.chw[(size_t)c * w * h + i] = rs[i * 3 + c] / 255.0f;
+    return out;
+}
 
 }  // namespace ferro

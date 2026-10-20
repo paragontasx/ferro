@@ -317,6 +317,9 @@ bool EG2Model::load(const std::string& path, std::string* err) {
     n_embd_out= (int)I("embedding_length_out", n_embd);
     rms_eps   = (float)F("attention.layer_norm_rms_epsilon", 1e-6);
     swa_window= (int)I("attention.sliding_window", 0);
+    // llama.cpp LLAMA_SWA_TYPE_SYMMETRIC (gemma-embedding/-2): a pair is masked when |i-j| > n_swa/2. The kernels mask
+    // at |i-j| >= window, so store n_swa/2 + 1. (Only visible for inputs longer than n_swa/2 = 512 tokens.)
+    if (swa_window > 0) swa_window = swa_window / 2 + 1;
     rope_base = F("rope.freq_base", 1e6);
     rope_base_swa = F("rope.freq_base_swa", rope_base);
     auto toks = gguf.get_strarr("tokenizer.ggml.tokens");
@@ -523,6 +526,15 @@ void Engine::encode(const int* ids, const int* seg, const int* pos, int T, int n
                 Tg, ms_gpu, T - Tg, ms_cpu, gpu_share_);
 }
 
+void Engine::encode_mm(const int* ids, const int* seg, const int* pos, int T, int n_seq, float* out,
+                       const float* media_rows, const int* media_idx) {
+    std::vector<int> safe(ids, ids + T);
+    for (int t = 0; t < T; ++t) if (media_idx[t] >= 0) safe[t] = 0;    // keep gather_embd in range
+    ext_rows_ = media_rows; ext_idx_ = media_idx;
+    encode_impl(*impl_, safe.data(), seg, pos, T, n_seq, out, 0);
+    ext_rows_ = nullptr; ext_idx_ = nullptr;
+}
+
 void Engine::encode_impl(Impl& in_, const int* ids, const int* seg, const int* pos, int T, int n_seq, float* out, int mode) {
     static const bool timing = getenv("FERRO_TIME") != nullptr;
     using clk = std::chrono::steady_clock;
@@ -539,6 +551,9 @@ void Engine::encode_impl(Impl& in_, const int* ids, const int* seg, const int* p
 
     // 1. token embeddings scaled by sqrt(n_embd)
     gather_embd(m.tok_embd, ids, T, std::sqrt((float)E0), in.A.get(0));
+    if (ext_idx_)
+        for (int t = 0; t < T; ++t)
+            if (ext_idx_[t] >= 0) memcpy(in.A.get((size_t)t * E0), ext_rows_ + (size_t)ext_idx_[t] * E0, (size_t)E0 * sizeof(float));
     STAGE(t_embd);
     dbg("embd", in.A.get(0), (size_t)T * E0);
 

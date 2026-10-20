@@ -27,5 +27,11 @@ int audio_tokens(const Mel& m);   // ceil(ceil(ceil(frames/2)/2)/2)
 
 // Pillow-compatible resize (bilinear), exposed for tests
 void resize_pillow_bilinear(const uint8_t* src, int sw, int sh, uint8_t* dst, int dw, int dh);
+void resize_pillow_bicubic(const uint8_t* src, int sw, int sh, uint8_t* dst, int dw, int dh);
+
+// Gemma 4 / EmbeddingGemma 2 vision input (mtmd_image_preprocessor_dyn_size): one image, aspect preserved, edges
+// aligned to patch*merge, token budget [min_tokens, max_tokens] (tokens = patch^2 * merge^2 pixels each), bicubic.
+struct Gemma4VisionPre { int patch_size = 16, n_merge = 3, min_tokens = 70, max_tokens = 1120; };
+VisionInput gemma4_preprocess_image(const uint8_t* rgb, int nx, int ny, const Gemma4VisionPre& p);
 
 }  // namespace ferro

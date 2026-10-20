@@ -2,6 +2,7 @@
 // mm_encoder.cpp — see mm_encoder.h. CPU reference forward (GEMMs route to the iGPU when the weights are
 // resident there); op order and layouts follow llama.cpp tools/mtmd (siglip.cpp, conformer.cpp, clip.cpp).
 #include "mm_encoder.h"
+#include "mm_util.h"
 #include "gpu_cl.h"
 #include "threadpool.h"
 
@@ -19,7 +20,7 @@ namespace ferro {
 static std::deque<std::string> g_mm_names;
 static const char* keepn(const std::string& s) { g_mm_names.push_back(s); return g_mm_names.back().c_str(); }
 
-static std::vector<float> tf32(const GgufFile& g, const std::string& name) {
+std::vector<float> tf32(const GgufFile& g, const std::string& name) {
     const GGUFTensor* t = g.tensor(name);
     if (!t) throw std::runtime_error("mmproj: missing tensor " + name);
     size_t n = 1;
@@ -38,14 +39,8 @@ static std::vector<float> tf32(const GgufFile& g, const std::string& name) {
     } else throw std::runtime_error("mmproj: unsupported tensor type for " + name);
     return v;
 }
-// linear layer weight: Q8_0 kept bit-exact (int8 path), F32/F16 kept as f32 (exact)
-struct Lin {
-    WMat q;                    // Q8 weights
-    std::vector<float> f;      // f32 weights [rows][cols] (when the GGUF has float weights)
-    std::vector<float> b;      // bias (optional)
-    int rows = 0, cols = 0;
-};
-static Lin lin(const GgufFile& g, const std::string& w, const std::string& b = "") {
+static inline uint16_t f32_to_f16_bits(float x);
+Lin lin(const GgufFile& g, const std::string& w, const std::string& b) {
     const GGUFTensor* t = g.tensor(w);
     if (!t) throw std::runtime_error("mmproj: missing tensor " + w);
     Lin L;
@@ -58,8 +53,20 @@ static Lin lin(const GgufFile& g, const std::string& w, const std::string& b = "
     return L;
 }
 // Y[T][rows] = X[T][cols] W^T + b
-static void apply(const Lin& L, const float* X, int T, float* Y) {
+void apply(const Lin& L, const float* X, int T, float* Y) {
     if (!L.f.empty()) gemm_f32(L.f.data(), L.rows, L.cols, X, T, Y, L.rows);
+    else if (getenv("FERRO_MM_QACT")) {
+        // emulate ggml's CPU mul_mat: activations quantized to Q8_0 (32-blocks, fp16 scale) before the int8 dot
+        std::vector<float> xq((size_t)T * L.cols);
+        for (size_t r = 0; r < (size_t)T; ++r)
+            for (int b = 0; b < L.cols / 32; ++b) {
+                const float* x = X + r * L.cols + b * 32; float* o = xq.data() + r * L.cols + b * 32;
+                float amax = 0; for (int i = 0; i < 32; ++i) amax = std::max(amax, std::fabs(x[i]));
+                const float df = amax / 127.0f, id = df != 0.0f ? 1.0f / df : 0.0f, d = fp16_to_f32(f32_to_f16_bits(df));
+                for (int i = 0; i < 32; ++i) o[i] = std::round(x[i] * id) * d;
+            }
+        gemm_q8_fma(L.q, xq.data(), T, nullptr, nullptr, Y, L.rows);
+    }
     else gemm_q8_fma(L.q, X, T, nullptr, nullptr, Y, L.rows);
     if (!L.b.empty()) {
         const float* b = L.b.data();
@@ -85,7 +92,6 @@ static void layernorm(const float* x, int T, int d, const float* w, const float*
         }
     });
 }
-enum Act { GELU_TANH, GELU_ERF, SILU, RELU };
 // round-to-nearest-even f32 -> f16 bits (F16C)
 __attribute__((target("f16c"))) static inline uint16_t f32_to_f16_bits(float x) { return (uint16_t)_cvtss_sh(x, 0); }
 __attribute__((target("f16c"))) static inline float f16_bits_to_f32(uint16_t h) { return _cvtsh_ss(h); }
@@ -97,7 +103,7 @@ __attribute__((target("f16c"))) static float gelu_tanh_f16table(float v) {
     const float g = 0.5f * x * (1.0f + std::tanh(0.79788456080286535587989211986876f * x * (1.0f + 0.044715f * x * x)));
     return f16_bits_to_f32(f32_to_f16_bits(g));
 }
-static void act(float* x, size_t n, Act a) {
+void act(float* x, size_t n, Act a) {
     static const bool gelu16 = getenv("FERRO_MM_GELU16") != nullptr;
     Pool::get().parallel_for((int)((n + 4095) / 4096), [&](int lo, int hi) {
         const size_t i1 = std::min(n, (size_t)hi * 4096);
@@ -112,7 +118,7 @@ static void act(float* x, size_t n, Act a) {
         }
     });
 }
-static void add_inplace(float* y, const float* x, size_t n, float s = 1.0f) {
+void add_inplace(float* y, const float* x, size_t n, float s) {
     Pool::get().parallel_for((int)((n + 8191) / 8192), [&](int lo, int hi) {
         const size_t i1 = std::min(n, (size_t)hi * 8192);
         for (size_t i = (size_t)lo * 8192; i < i1; ++i) y[i] += s * x[i];

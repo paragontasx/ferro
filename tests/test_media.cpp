@@ -94,6 +94,26 @@ static void test_image_geometry() {
     CHECK(dst[0] == 128 && dst[1] == 128 && dst[2] == 128, "Pillow bilinear 2x2 -> 1x1 averages (round half up)");
 }
 
+static void test_gemma4_geometry() {
+    Gemma4VisionPre p;
+    auto toks = [&](int nx, int ny) {
+        std::vector<uint8_t> rgb((size_t)nx * ny * 3, 100);
+        VisionInput v = gemma4_preprocess_image(rgb.data(), nx, ny, p);
+        CHECK(v.nx % 48 == 0 && v.ny % 48 == 0 && v.chw.size() == (size_t)3 * v.nx * v.ny, "aligned to patch*merge");
+        return (v.nx / 48) * (v.ny / 48);
+    };
+    // token counts of the llama.cpp mtmd oracle (bench/mm/mm_ref on mmproj-embeddinggemma-2)
+    CHECK(toks(640, 480) == 130, "640x480 -> 130 tokens");
+    CHECK(toks(1920, 1080) == 920, "1920x1080 -> 920 tokens");
+    CHECK(toks(100, 80) == 80, "100x80 -> 80 tokens (min budget)");
+    CHECK(toks(8000, 6000) <= 1120, "huge image capped at 1120 tokens");
+    // bicubic: constant image stays constant; a 4x1 ramp downscaled keeps its mean
+    std::vector<uint8_t> flat(4 * 4 * 3, 77), out(2 * 2 * 3);
+    resize_pillow_bicubic(flat.data(), 4, 4, out.data(), 2, 2);
+    bool ok = true; for (uint8_t v : out) ok = ok && v == 77;
+    CHECK(ok, "bicubic keeps a constant image constant");
+}
+
 static void test_files() {
     auto slurp = [](const char* path) { std::ifstream f(path, std::ios::binary); return std::vector<uint8_t>((std::istreambuf_iterator<char>(f)), {}); };
     std::vector<uint8_t> b = slurp("bench/d1/media/jfk.wav");
@@ -117,6 +137,7 @@ int main() {
     test_base64_url();
     test_audio();
     test_image_geometry();
+    test_gemma4_geometry();
     test_files();
     if (fails) { fprintf(stderr, "test_media: %d FAILED\n", fails); return 1; }
     printf("test_media: ALL PASS\n");

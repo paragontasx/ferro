@@ -8,6 +8,8 @@
 #include "model_lfm2.h"
 #include "media.h"
 #include "mm_encoder.h"
+#include "mm_gemma4.h"
+#include "embed_mm.h"
 #include "gpu_cl.h"
 #include "tokenizer.h"
 #include "threadpool.h"
@@ -217,6 +219,33 @@ static int run_decide(const std::string& model, const std::string& reqf, const s
 }
 
 // debug/oracle: media embeddings from the mmproj (same binary layout as bench/mm/mm_ref)
+// EmbeddingGemma 2 projector (gemma4v / gemma4a): same dump format as the d1 path
+static int run_mm_embed_g4(const std::string& mmproj, const std::string& media, const std::string& outp, int threads) {
+    struct PoolGuard { ~PoolGuard() { Pool::get().shutdown(); } } pool_guard;
+    Pool::get().init(threads);
+    Gemma4Proj mm;
+    std::string err;
+    if (!mm.load(mmproj, &err)) { fprintf(stderr, "mmproj: %s\n", err.c_str()); return 1; }
+    std::ifstream f(media, std::ios::binary);
+    if (!f) { fprintf(stderr, "cannot read %s\n", media.c_str()); return 1; }
+    std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    MediaItem it = decode_media(bytes, 16000);
+    std::vector<std::vector<float>> chunks;
+    auto t0 = clk::now();
+    if (it.is_audio) { fprintf(stderr, "gemma4 audio encoder not implemented yet\n"); return 1; }
+    VisionInput in = gemma4_preprocess_image(it.rgb.data(), it.nx, it.ny, mm.vision_params());
+    chunks.push_back(mm.encode_image(in));
+    fprintf(stderr, "[mm] image %dx%d input %dx%d -> %d tokens\n", it.nx, it.ny, in.nx, in.ny, (in.nx / 48) * (in.ny / 48));
+    fprintf(stderr, "[mm] encoded in %.1f ms\n", std::chrono::duration<double, std::milli>(clk::now() - t0).count());
+    FILE* o = fopen(outp.c_str(), "wb");
+    if (!o) return 1;
+    int32_t nc = (int32_t)chunks.size(), ne = mm.n_embd_out();
+    fwrite(&nc, 4, 1, o);
+    for (auto& c : chunks) { int32_t n = (int32_t)(c.size() / ne); fwrite(&n, 4, 1, o); fwrite(&ne, 4, 1, o); fwrite(c.data(), 4, c.size(), o); }
+    fclose(o);
+    return 0;
+}
+
 static int run_mm_embed(const std::string& mmproj, const std::string& media, const std::string& outp, int threads) {
     struct PoolGuard { ~PoolGuard() { Pool::get().shutdown(); } } pool_guard;
     Pool::get().init(threads);
@@ -268,6 +297,8 @@ int main(int argc, char** argv) {
     if (argc < 2) usage();
     std::string cmd = argv[1];
     std::string model, inp, tokf, outp, reqf, mmproj, media;
+    std::vector<std::string> items;   // embed-media: ordered text:/image:/audio:/video: items
+    float video_fps = 4.0f;
     int threads = 0, maxtok = 2048, reps = 5;  // 0 = auto: power-limited SoCs run best on 2 cores
     bool int8 = false;
     for (int i = 2; i < argc; ++i) {
@@ -283,6 +314,8 @@ int main(int argc, char** argv) {
         else if (a == "--in") inp = next("--in");
         else if (a == "--tokens") tokf = next("--tokens");
         else if (a == "--out") outp = next("--out");
+        else if (a == "--item") items.push_back(next("--item"));
+        else if (a == "--fps") video_fps = (float)atof(next("--fps"));
         else if (a == "--threads") threads = atoi(next("--threads"));
         else if (a == "--max-tokens") maxtok = atoi(next("--max-tokens"));
         else if (a == "--reps") reps = atoi(next("--reps"));
@@ -292,8 +325,38 @@ int main(int argc, char** argv) {
         else if (a == "--hetero") { setenv("FERRO_GPU", "1", 1); setenv("FERRO_HETERO", "1", 1); }  // CPU+iGPU split
         else usage();
     }
+    if (cmd == "embed-media") {
+        if (model.empty() || items.empty()) { fprintf(stderr, "embed-media --model M.gguf [--mmproj P.gguf] --item text:STR|image:F|audio:F|video:F ... [--fps N] [--out f.bin]\n"); return 2; }
+        struct PoolGuard { ~PoolGuard() { Pool::get().shutdown(); } } pool_guard;
+        MmEmbedder me; std::string err;
+        if (!me.init(model, mmproj, threads > 0 ? threads : 2, &err)) { fprintf(stderr, "init: %s\n", err.c_str()); return 1; }
+        std::vector<EmbedItem> its;
+        for (auto& s : items) {
+            const size_t c = s.find(':');
+            if (c == std::string::npos) { fprintf(stderr, "bad --item %s (want kind:value)\n", s.c_str()); return 2; }
+            const std::string k = s.substr(0, c), v = s.substr(c + 1);
+            EmbedItem it; it.value = v;
+            if (k == "text") it.kind = EmbedItem::TEXT; else if (k == "image") it.kind = EmbedItem::IMAGE;
+            else if (k == "audio") it.kind = EmbedItem::AUDIO; else if (k == "video") it.kind = EmbedItem::VIDEO;
+            else { fprintf(stderr, "unknown item kind %s\n", k.c_str()); return 2; }
+            its.push_back(std::move(it));
+        }
+        MmEmbedOptions opt; opt.video_fps = video_fps;
+        std::vector<float> vec; int nt = 0;
+        auto t0 = clk::now();
+        if (!me.embed(its, opt, vec, &err, &nt)) { fprintf(stderr, "embed: %s\n", err.c_str()); return 1; }
+        fprintf(stderr, "[embed-media] %d tokens, %.2f s\n", nt, std::chrono::duration<double>(clk::now() - t0).count());
+        if (!outp.empty()) { FILE* o = fopen(outp.c_str(), "wb"); if (!o) return 1; fwrite(vec.data(), 4, vec.size(), o); fclose(o); }
+        else { for (size_t i = 0; i < vec.size(); ++i) printf("%s%.6f", i ? " " : "", vec[i]); printf("\n"); }
+        return 0;
+    }
     if (cmd == "mm-embed") {
         if (mmproj.empty() || media.empty() || outp.empty()) { fprintf(stderr, "mm-embed --mmproj P.gguf --media file --out f.bin\n"); return 2; }
+        {
+            GgufFile peek; std::string perr;
+            if (peek.open_file(mmproj.c_str(), &perr) && peek.get_str("clip.vision.projector_type") == "gemma4v")
+                return run_mm_embed_g4(mmproj, media, outp, threads > 0 ? threads : 2);
+        }
         return run_mm_embed(mmproj, media, outp, threads > 0 ? threads : 2);
     }
     if (model.empty()) usage();

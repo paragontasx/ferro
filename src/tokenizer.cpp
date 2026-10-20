@@ -60,9 +60,9 @@ static void emit_symbol(const std::string& sym,
     }
 }
 
-std::vector<int> FerroTokenizer::tokenize(const std::string& text) const {
+std::vector<int> FerroTokenizer::tokenize(const std::string& text, bool add_special) const {
     std::vector<int> ids;
-    if (add_bos_ && bos_id_ >= 0) ids.push_back(bos_id_);
+    if (add_special && add_bos_ && bos_id_ >= 0) ids.push_back(bos_id_);
 
     // SPM-style: spaces -> U+2581 ; split on newline runs (gemma4 pre-tokenizer); BPE per chunk.
     std::string norm;
@@ -110,7 +110,7 @@ std::vector<int> FerroTokenizer::tokenize(const std::string& text) const {
         i = j;
     }
 
-    if (add_eos_ && eos_id_ >= 0) ids.push_back(eos_id_);
+    if (add_special && add_eos_ && eos_id_ >= 0) ids.push_back(eos_id_);
     return ids;
 }
 

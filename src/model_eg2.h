@@ -54,6 +54,12 @@ public:
     // buffer out must hold n_seq * n_embd_out floats.
     void encode(const int* ids, const int* seg, const int* pos, int T, int n_seq, float* out);
 
+    // Like encode(), but tokens with media_idx[t] >= 0 take row media_idx[t] of media_rows [n][n_embd] (raw encoder
+    // embeddings, NOT scaled by sqrt(n_embd)) instead of the token embedding. ids[t] of such tokens is ignored.
+    // Single batch, no CPU/iGPU split.
+    void encode_mm(const int* ids, const int* seg, const int* pos, int T, int n_seq, float* out,
+                   const float* media_rows, const int* media_idx);
+
     int dim_out() const { return m_.n_embd_out; }
     int dim_in() const { return m_.n_embd; }
     const EG2Model& model() const { return m_; }
@@ -67,6 +73,8 @@ private:
     struct Impl;
     std::shared_ptr<Impl> impl_;
     std::shared_ptr<Impl> impl_gpu_;      // buffers for the concurrent iGPU half of a split batch
+    const float* ext_rows_ = nullptr;     // encode_mm(): media rows / per-token row index (-1 = text)
+    const int* ext_idx_ = nullptr;
     double gpu_share_ = 0.78;             // fraction of tokens sent to the iGPU (adapted per call)
     // mode: 0 = auto (GPU layer loop if available), 1 = CPU only, 2 = GPU (falls back to CPU on failure)
     void encode_impl(Impl& in, const int* ids, const int* seg, const int* pos, int T, int n_seq, float* out, int mode);
