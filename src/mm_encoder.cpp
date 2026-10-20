@@ -369,6 +369,7 @@ static bool encode_vision_gpu(MmProj::Impl& I, const std::vector<VisionInput>& i
     int nmax = 0; for (auto& sg : segs) nmax = std::max(nmax, sg.second);
     static const bool dense = !getenv("FERRO_MM_DENSE") || atoi(getenv("FERRO_MM_DENSE")) != 0;
     bool use_dense = dense && hd == 64;
+    for (auto& sg : segs) if (sg.second & 3) use_dense = false;   // the dense kernels use float4 rows
     if (use_dense && (size_t)nh * nmax * nmax > I.capS) {
         gpu::release(I.bS);
         I.capS = (size_t)nh * nmax * nmax;
@@ -543,38 +544,193 @@ static void conv3x3_s2(const float* in, int C, int H, int W, const float* w, con
         }
     });
 }
-// pointwise conv [C][N] -> [Cout][N] (+bias), optional relu
+// pointwise conv [C][N] -> [Cout][N] (+bias), optional relu.
+// AVX2/FMA: 4 output channels x 16 pixels per tile (8 accumulators); pixel tile outer so the 16-pixel input
+// slab of all C channels stays in L1 across the output-channel groups.
+#pragma GCC push_options
+#pragma GCC target("avx2,fma")
 static void conv1x1(const float* in, int C, int N, const float* w, const float* b, int Cout, bool relu, float* out) {
+    const int NT = N / 16;
+    Pool::get().parallel_for(NT, [&](int lo, int hi) {
+        for (int t = lo; t < hi; ++t) {
+            const int n0 = t * 16;
+            int o = 0;
+            for (; o + 4 <= Cout; o += 4) {
+                __m256 a00 = _mm256_set1_ps(b[o]), a01 = a00, a10 = _mm256_set1_ps(b[o + 1]), a11 = a10;
+                __m256 a20 = _mm256_set1_ps(b[o + 2]), a21 = a20, a30 = _mm256_set1_ps(b[o + 3]), a31 = a30;
+                const float* w0 = w + (size_t)o * C;
+                const float* ip = in + n0;
+                for (int c = 0; c < C; ++c, ip += N) {
+                    const __m256 x0 = _mm256_loadu_ps(ip), x1 = _mm256_loadu_ps(ip + 8);
+                    __m256 wv = _mm256_broadcast_ss(w0 + c);
+                    a00 = _mm256_fmadd_ps(wv, x0, a00); a01 = _mm256_fmadd_ps(wv, x1, a01);
+                    wv = _mm256_broadcast_ss(w0 + C + c);
+                    a10 = _mm256_fmadd_ps(wv, x0, a10); a11 = _mm256_fmadd_ps(wv, x1, a11);
+                    wv = _mm256_broadcast_ss(w0 + 2 * (size_t)C + c);
+                    a20 = _mm256_fmadd_ps(wv, x0, a20); a21 = _mm256_fmadd_ps(wv, x1, a21);
+                    wv = _mm256_broadcast_ss(w0 + 3 * (size_t)C + c);
+                    a30 = _mm256_fmadd_ps(wv, x0, a30); a31 = _mm256_fmadd_ps(wv, x1, a31);
+                }
+                if (relu) {
+                    const __m256 z = _mm256_setzero_ps();
+                    a00 = _mm256_max_ps(a00, z); a01 = _mm256_max_ps(a01, z); a10 = _mm256_max_ps(a10, z); a11 = _mm256_max_ps(a11, z);
+                    a20 = _mm256_max_ps(a20, z); a21 = _mm256_max_ps(a21, z); a30 = _mm256_max_ps(a30, z); a31 = _mm256_max_ps(a31, z);
+                }
+                float* op = out + (size_t)o * N + n0;
+                _mm256_storeu_ps(op, a00); _mm256_storeu_ps(op + 8, a01);
+                _mm256_storeu_ps(op + N, a10); _mm256_storeu_ps(op + N + 8, a11);
+                _mm256_storeu_ps(op + 2 * (size_t)N, a20); _mm256_storeu_ps(op + 2 * (size_t)N + 8, a21);
+                _mm256_storeu_ps(op + 3 * (size_t)N, a30); _mm256_storeu_ps(op + 3 * (size_t)N + 8, a31);
+            }
+            for (; o < Cout; ++o)                              // leftover output channels
+                for (int n = n0; n < n0 + 16; ++n) {
+                    float acc = b[o];
+                    for (int c = 0; c < C; ++c) acc += w[(size_t)o * C + c] * in[(size_t)c * N + n];
+                    out[(size_t)o * N + n] = relu && acc < 0 ? 0.f : acc;
+                }
+        }
+    });
+    for (int n = NT * 16; n < N; ++n)                          // leftover pixels
+        for (int o = 0; o < Cout; ++o) {
+            float acc = b[o];
+            for (int c = 0; c < C; ++c) acc += w[(size_t)o * C + c] * in[(size_t)c * N + n];
+            out[(size_t)o * N + n] = relu && acc < 0 ? 0.f : acc;
+        }
+}
+
+// first subsampling conv (1 -> Cout channels, 3x3 stride 2 pad 1) + ReLU: one shared im2col [9][pixels], then every
+// output channel is 9 FMAs per 8 pixels
+static void conv0_relu(const float* in, int H, int W, const float* w, const float* b, int Cout, float* out, int& Ho, int& Wo) {
+    Ho = (H - 1) / 2 + 1; Wo = (W - 1) / 2 + 1;
+    const int NP = Ho * Wo;
+    std::vector<float> col((size_t)9 * NP);
+    Pool::get().parallel_for(Ho, [&](int lo, int hi) {
+        for (int y = lo; y < hi; ++y)
+            for (int x = 0; x < Wo; ++x)
+                for (int kh = 0; kh < 3; ++kh)
+                    for (int kw = 0; kw < 3; ++kw) {
+                        const int iy = 2 * y - 1 + kh, ix = 2 * x - 1 + kw;
+                        col[(size_t)(kh * 3 + kw) * NP + (size_t)y * Wo + x] = (iy < 0 || iy >= H || ix < 0 || ix >= W) ? 0.f : in[(size_t)iy * W + ix];
+                    }
+    });
     Pool::get().parallel_for(Cout, [&](int lo, int hi) {
         for (int o = lo; o < hi; ++o) {
-            float* op = out + (size_t)o * N;
-            for (int n = 0; n < N; ++n) op[n] = b[o];
-            for (int c = 0; c < C; ++c) {
-                const float wv = w[(size_t)o * C + c];
-                const float* ip = in + (size_t)c * N;
-                for (int n = 0; n < N; ++n) op[n] += wv * ip[n];
+            __m256 wv[9];
+            for (int k = 0; k < 9; ++k) wv[k] = _mm256_set1_ps(w[(size_t)o * 9 + k]);
+            const __m256 bv = _mm256_set1_ps(b[o]), z = _mm256_setzero_ps();
+            float* op = out + (size_t)o * NP;
+            int p = 0;
+            for (; p + 8 <= NP; p += 8) {
+                __m256 acc = bv;
+                for (int k = 0; k < 9; ++k) acc = _mm256_fmadd_ps(wv[k], _mm256_loadu_ps(col.data() + (size_t)k * NP + p), acc);
+                _mm256_storeu_ps(op + p, _mm256_max_ps(acc, z));
             }
-            if (relu) for (int n = 0; n < N; ++n) op[n] = op[n] > 0 ? op[n] : 0;
+            for (; p < NP; ++p) {
+                float acc = b[o];
+                for (int k = 0; k < 9; ++k) acc += w[(size_t)o * 9 + k] * col[(size_t)k * NP + p];
+                op[p] = acc > 0 ? acc : 0.f;
+            }
         }
     });
 }
 
+
+// Transformer-XL rel-pos attention for head_dim 64: sc[j] = ((q+u).k_j + (q+v).p_{T-1-i+j}) * scale, softmax, O = P V.
+// AVX2/FMA: 4 keys per step share the q loads; P V keeps the 64-wide output row in 8 registers across all keys.
+static void rel_attention_hd64(const float* Q, const float* K, const float* V, const float* Pp, const float* ub, const float* vb,
+                               float* O, int T, int nh, int d, float scale) {
+    Pool::get().parallel_for(nh * T, [&](int lo, int hi) {
+        std::vector<float> sc((size_t)T + 8);
+        alignas(32) float qu[64], qv[64];
+        for (int idx = lo; idx < hi; ++idx) {
+            const int h = idx / T, i = idx % T;
+            const float* q = Q + (size_t)i * d + h * 64;
+            for (int e = 0; e < 64; ++e) { qu[e] = q[e] + ub[h * 64 + e]; qv[e] = q[e] + vb[h * 64 + e]; }
+            const float* kb = K + h * 64;
+            const float* pb = Pp + (size_t)(T - 1 - i) * d + h * 64;     // row for key j is pb + j * d
+            int j = 0;
+            float mx = -1e30f;
+            for (; j + 4 <= T; j += 4) {
+                __m256 ac0 = _mm256_setzero_ps(), ac1 = ac0, ac2 = ac0, ac3 = ac0, bd0 = ac0, bd1 = ac0, bd2 = ac0, bd3 = ac0;
+                const float* k0 = kb + (size_t)j * d;
+                const float* p0 = pb + (size_t)j * d;
+                for (int e = 0; e < 64; e += 8) {
+                    const __m256 a = _mm256_load_ps(qu + e), b = _mm256_load_ps(qv + e);
+                    ac0 = _mm256_fmadd_ps(a, _mm256_loadu_ps(k0 + e), ac0);
+                    ac1 = _mm256_fmadd_ps(a, _mm256_loadu_ps(k0 + d + e), ac1);
+                    ac2 = _mm256_fmadd_ps(a, _mm256_loadu_ps(k0 + 2 * (size_t)d + e), ac2);
+                    ac3 = _mm256_fmadd_ps(a, _mm256_loadu_ps(k0 + 3 * (size_t)d + e), ac3);
+                    bd0 = _mm256_fmadd_ps(b, _mm256_loadu_ps(p0 + e), bd0);
+                    bd1 = _mm256_fmadd_ps(b, _mm256_loadu_ps(p0 + d + e), bd1);
+                    bd2 = _mm256_fmadd_ps(b, _mm256_loadu_ps(p0 + 2 * (size_t)d + e), bd2);
+                    bd3 = _mm256_fmadd_ps(b, _mm256_loadu_ps(p0 + 3 * (size_t)d + e), bd3);
+                }
+                auto hsum = [](__m256 v) {
+                    __m128 x = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+                    x = _mm_add_ps(x, _mm_movehl_ps(x, x));
+                    x = _mm_add_ss(x, _mm_shuffle_ps(x, x, 1));
+                    return _mm_cvtss_f32(x);
+                };
+                sc[j] = (hsum(ac0) + hsum(bd0)) * scale; sc[j + 1] = (hsum(ac1) + hsum(bd1)) * scale;
+                sc[j + 2] = (hsum(ac2) + hsum(bd2)) * scale; sc[j + 3] = (hsum(ac3) + hsum(bd3)) * scale;
+                mx = std::max(std::max(mx, sc[j]), std::max(std::max(sc[j + 1], sc[j + 2]), sc[j + 3]));
+            }
+            for (; j < T; ++j) {
+                float ac = 0, bd = 0;
+                const float* k = kb + (size_t)j * d; const float* p = pb + (size_t)j * d;
+                for (int e = 0; e < 64; ++e) { ac += qu[e] * k[e]; bd += qv[e] * p[e]; }
+                sc[j] = (ac + bd) * scale;
+                mx = std::max(mx, sc[j]);
+            }
+            float sum = 0;
+            for (int jj = 0; jj < T; ++jj) { sc[jj] = std::exp(sc[jj] - mx); sum += sc[jj]; }
+            const float inv = 1.0f / sum;
+            __m256 o0 = _mm256_setzero_ps(), o1 = o0, o2 = o0, o3 = o0, o4 = o0, o5 = o0, o6 = o0, o7 = o0;
+            const float* vj = V + h * 64;
+            for (int jj = 0; jj < T; ++jj, vj += d) {
+                const __m256 pj = _mm256_set1_ps(sc[jj] * inv);
+                o0 = _mm256_fmadd_ps(pj, _mm256_loadu_ps(vj), o0);      o1 = _mm256_fmadd_ps(pj, _mm256_loadu_ps(vj + 8), o1);
+                o2 = _mm256_fmadd_ps(pj, _mm256_loadu_ps(vj + 16), o2); o3 = _mm256_fmadd_ps(pj, _mm256_loadu_ps(vj + 24), o3);
+                o4 = _mm256_fmadd_ps(pj, _mm256_loadu_ps(vj + 32), o4); o5 = _mm256_fmadd_ps(pj, _mm256_loadu_ps(vj + 40), o5);
+                o6 = _mm256_fmadd_ps(pj, _mm256_loadu_ps(vj + 48), o6); o7 = _mm256_fmadd_ps(pj, _mm256_loadu_ps(vj + 56), o7);
+            }
+            float* o = O + (size_t)i * d + h * 64;
+            _mm256_storeu_ps(o, o0); _mm256_storeu_ps(o + 8, o1); _mm256_storeu_ps(o + 16, o2); _mm256_storeu_ps(o + 24, o3);
+            _mm256_storeu_ps(o + 32, o4); _mm256_storeu_ps(o + 40, o5); _mm256_storeu_ps(o + 48, o6); _mm256_storeu_ps(o + 56, o7);
+        }
+    });
+}
+
+#pragma GCC pop_options
+
 std::vector<float> MmProj::encode_audio(const Mel& mel) {
     if (!a_ok_) throw std::runtime_error("this mmproj has no audio encoder");
     Impl& I = *impl_;
+    static const bool prof = getenv("FERRO_TIME") != nullptr;
+    double tm[8] = {0};
+    auto tl = std::chrono::steady_clock::now();
+    auto lap = [&](int k) { if (!prof) return; auto t = std::chrono::steady_clock::now(); tm[k] += std::chrono::duration<double>(t - tl).count(); tl = t; };
     const int Tf = mel.n_len, W0 = mel.n_mel, ch = (int)I.c0b.size();
     // input map [1][H = frames][W = mel]
     std::vector<float> in((size_t)Tf * W0);
     for (int t = 0; t < Tf; ++t) for (int m = 0; m < W0; ++m) in[(size_t)t * W0 + m] = mel.data[(size_t)m * Tf + t];
     int H1, W1, H2, W2, H3, W3;
     std::vector<float> a((size_t)ch * ((Tf + 1) / 2 + 1) * (W0 / 2 + 1)), b2;
-    conv3x3_s2(in.data(), 1, Tf, W0, I.c0w.data(), I.c0b.data(), ch, false, a.data(), H1, W1);
-    act(a.data(), (size_t)ch * H1 * W1, RELU);
+    double tc[6] = {0}; auto tcl = std::chrono::steady_clock::now();
+    auto clap = [&](int k) { auto t = std::chrono::steady_clock::now(); tc[k] += std::chrono::duration<double>(t - tcl).count(); tcl = t; };
+    conv0_relu(in.data(), Tf, W0, I.c0w.data(), I.c0b.data(), ch, a.data(), H1, W1);
+    clap(0);
     b2.resize((size_t)ch * ((H1 + 1) / 2 + 1) * (W1 / 2 + 1));
     conv3x3_s2(a.data(), ch, H1, W1, I.c2w.data(), I.c2b.data(), ch, true, b2.data(), H2, W2);
+    clap(1);
     conv1x1(b2.data(), ch, H2 * W2, I.c3w.data(), I.c3b.data(), ch, true, a.data());
+    clap(2);
     conv3x3_s2(a.data(), ch, H2, W2, I.c5w.data(), I.c5b.data(), ch, true, b2.data(), H3, W3);
+    clap(3);
     conv1x1(b2.data(), ch, H3 * W3, I.c6w.data(), I.c6b.data(), ch, true, a.data());
+    clap(4);
+    if (prof) fprintf(stderr, "[mm-time] audio convs: c0 %.0f  dw2 %.0f  pw3 %.0f  dw5 %.0f  pw6 %.0f ms (ch=%d, %dx%d -> %dx%d -> %dx%d)\n", tc[0]*1e3, tc[1]*1e3, tc[2]*1e3, tc[3]*1e3, tc[4]*1e3, ch, H1, W1, H2, W2, H3, W3);
+    lap(0);
     // flatten (channel, freq) per time step: feature = w + W3 * c
     const int T = H3, fin = ch * W3, d = I.a_d;
     if (fin != I.pre_out.cols) throw std::runtime_error("audio: unexpected pre-encode width");
@@ -601,6 +757,7 @@ std::vector<float> MmProj::encode_audio(const Mel& mel) {
     std::vector<float> R((size_t)T * d), Hn((size_t)T * d), F((size_t)T * I.al[0].ffn_up.rows), Q((size_t)T * d), K((size_t)T * d),
         V((size_t)T * d), O((size_t)T * d), Pp((size_t)P * d), G((size_t)T * 2 * d);
     const float scale = 1.0f / std::sqrt((float)hd);
+    lap(1);
     for (int il = 0; il < I.a_layers; ++il) {
         const ALayer& L = I.al[il];
         // macaron FFN 1 (half step)
@@ -609,12 +766,16 @@ std::vector<float> MmProj::encode_audio(const Mel& mel) {
         act(F.data(), (size_t)T * L.ffn_up.rows, SILU);
         apply(L.ffn_down, F.data(), T, R.data());
         for (size_t i = 0; i < (size_t)T * d; ++i) R[i] = X[i] + 0.5f * R[i];
+        lap(2);
         // rel-pos self-attention (Transformer-XL: (q+u)k + (q+v)p_rel)
         layernorm(R.data(), T, d, L.ln1w.data(), L.ln1b.data(), I.a_eps, Hn.data());
         apply(L.q, Hn.data(), T, Q.data());
         apply(L.k, Hn.data(), T, K.data());
         apply(L.v, Hn.data(), T, V.data());
         apply(L.linear_pos, pe.data(), P, Pp.data());
+        lap(3);
+        if (hd == 64) rel_attention_hd64(Q.data(), K.data(), V.data(), Pp.data(), L.pos_bias_u.data(), L.pos_bias_v.data(), O.data(), T, nh, d, scale);
+        else
         Pool::get().parallel_for(nh * T, [&](int lo, int hi) {
             std::vector<float> sc(T), qu(hd), qv(hd);
             for (int idx = lo; idx < hi; ++idx) {
@@ -642,8 +803,10 @@ std::vector<float> MmProj::encode_audio(const Mel& mel) {
                 }
             }
         });
+        lap(4);
         apply(L.o, O.data(), T, Hn.data());
         add_inplace(R.data(), Hn.data(), (size_t)T * d);
+        lap(3);
         // conv module: pw1 -> GLU -> depthwise(9) -> affine norm -> SiLU -> pw2
         layernorm(R.data(), T, d, L.norm_conv_w.data(), L.norm_conv_b.data(), I.a_eps, Hn.data());
         apply(L.pw1, Hn.data(), T, G.data());
@@ -668,8 +831,10 @@ std::vector<float> MmProj::encode_audio(const Mel& mel) {
                 }
             }
         });
+        lap(5);
         apply(L.pw2, O.data(), T, Hn.data());
         add_inplace(R.data(), Hn.data(), (size_t)T * d);
+        lap(5);
         // macaron FFN 2 (half step) + output norm
         layernorm(R.data(), T, d, L.ffn_norm1_w.data(), L.ffn_norm1_b.data(), I.a_eps, Hn.data());
         apply(L.ffn_up1, Hn.data(), T, F.data());
@@ -677,6 +842,7 @@ std::vector<float> MmProj::encode_audio(const Mel& mel) {
         apply(L.ffn_down1, F.data(), T, Hn.data());
         add_inplace(R.data(), Hn.data(), (size_t)T * d, 0.5f);
         layernorm(R.data(), T, d, L.ln2w.data(), L.ln2b.data(), I.a_eps, X.data());
+        lap(2);
     }
     // adapter: LN -> mlp.1 -> GELU(erf) -> mlp.3 ; residual block LN -> mlp.5 -> GELU -> mlp.6
     layernorm(X.data(), T, d, I.mm0w.data(), I.mm0b.data(), 1e-5f, Hn.data());
@@ -691,6 +857,9 @@ std::vector<float> MmProj::encode_audio(const Mel& mel) {
     act(B.data(), B.size(), GELU_ERF);
     apply(I.mma6, B.data(), T, Rb.data());
     add_inplace(out.data(), Rb.data(), out.size());
+    lap(6);
+    if (prof) fprintf(stderr, "[mm-time] audio T=%d: conv stack %.0f  pre-out %.0f  ffn %.0f  qkv+pos+o %.0f  rel-pos attention %.0f  conv module %.0f  adapter %.0f ms\n",
+                      T, tm[0] * 1e3, tm[1] * 1e3, tm[2] * 1e3, tm[3] * 1e3, tm[4] * 1e3, tm[5] * 1e3, tm[6] * 1e3);
     return out;
 }
 

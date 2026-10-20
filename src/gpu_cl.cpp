@@ -959,75 +959,100 @@ __kernel void attention_q5(__global const float* C, int ldc, int qoff, int koff,
 // S[h][i][j] = q_i . k_j (one segment of n rows starting at row r0), softmax rows in place, O = P V.
 // 64x64 output tile per WG, 16x16 lanes, 4x4 per lane; the inner dimension is staged in SLM.
 __kernel void dattn_qk(__global const float* C, int ldc, int qoff, int koff, int r0, int n, __global float* S) {
-  __local float As[64 * 65];
-  __local float Bs[64 * 65];
+  // 64x64 score tile, 16x16 lanes; lane (tx,ty) owns rows 4ty..4ty+3 x cols 4tx..4tx+3 (float4 SLM reads: 2 loads / 16 FMA).
+  // Operands are staged transposed ([k][row], pitch 64) with consecutive lanes on consecutive rows: no bank conflicts.
+  __local float As[64 * 64];
+  __local float Bs[64 * 64];
   const int h = get_group_id(2), tx = get_local_id(0), ty = get_local_id(1);
   const int i0 = get_group_id(1) * 64, j0 = get_group_id(0) * 64, lid = ty * 16 + tx;
-  for (int e = lid; e < 64 * 64; e += 256) {
-    const int r = e >> 6, c = e & 63;
-    As[r * 65 + c] = i0 + r < n ? C[(size_t)(r0 + i0 + r) * ldc + qoff + h * 64 + c] : 0.f;
-    Bs[r * 65 + c] = j0 + r < n ? C[(size_t)(r0 + j0 + r) * ldc + koff + h * 64 + c] : 0.f;
+  {
+    const int r = lid & 63, g = lid >> 6;
+    const bool ra = i0 + r < n, rb = j0 + r < n;
+    const __global float* qa = C + (size_t)(r0 + i0 + r) * ldc + qoff + h * 64;
+    const __global float* kb = C + (size_t)(r0 + j0 + r) * ldc + koff + h * 64;
+    for (int c4 = g; c4 < 16; c4 += 4) {
+      const float4 a = ra ? vload4(c4, qa) : (float4)(0.f);
+      const float4 b = rb ? vload4(c4, kb) : (float4)(0.f);
+      As[(c4 * 4 + 0) * 64 + r] = a.x; As[(c4 * 4 + 1) * 64 + r] = a.y; As[(c4 * 4 + 2) * 64 + r] = a.z; As[(c4 * 4 + 3) * 64 + r] = a.w;
+      Bs[(c4 * 4 + 0) * 64 + r] = b.x; Bs[(c4 * 4 + 1) * 64 + r] = b.y; Bs[(c4 * 4 + 2) * 64 + r] = b.z; Bs[(c4 * 4 + 3) * 64 + r] = b.w;
+    }
   }
   barrier(CLK_LOCAL_MEM_FENCE);
-  float acc[4][4];
-  for (int a = 0; a < 4; ++a) for (int b = 0; b < 4; ++b) acc[a][b] = 0.f;
+  float4 acc0 = (float4)(0.f), acc1 = acc0, acc2 = acc0, acc3 = acc0;
   for (int k = 0; k < 64; ++k) {
-    float qa[4], kb[4];
-    for (int a = 0; a < 4; ++a) qa[a] = As[(ty + 16 * a) * 65 + k];
-    for (int b = 0; b < 4; ++b) kb[b] = Bs[(tx + 16 * b) * 65 + k];
-    for (int a = 0; a < 4; ++a) for (int b = 0; b < 4; ++b) acc[a][b] = mad(qa[a], kb[b], acc[a][b]);
+    const float4 qa = vload4(0, As + k * 64 + ty * 4);
+    const float4 kb = vload4(0, Bs + k * 64 + tx * 4);
+    acc0 = mad((float4)(qa.x), kb, acc0);
+    acc1 = mad((float4)(qa.y), kb, acc1);
+    acc2 = mad((float4)(qa.z), kb, acc2);
+    acc3 = mad((float4)(qa.w), kb, acc3);
   }
   __global float* Sh = S + (size_t)h * n * n;
-  for (int a = 0; a < 4; ++a) {
-    const int i = i0 + ty + 16 * a;
-    if (i >= n) continue;
-    for (int b = 0; b < 4; ++b) { const int j = j0 + tx + 16 * b; if (j < n) Sh[(size_t)i * n + j] = acc[a][b]; }
-  }
+  const int jj = j0 + tx * 4;
+#define DQK_ROW(A, ACC) { const int i = i0 + ty * 4 + (A); if (i < n) { \
+    if (jj + 3 < n && (n & 3) == 0) vstore4(ACC, 0, Sh + (size_t)i * n + jj); \
+    else { if (jj < n) Sh[(size_t)i * n + jj] = ACC.x; if (jj + 1 < n) Sh[(size_t)i * n + jj + 1] = ACC.y; \
+           if (jj + 2 < n) Sh[(size_t)i * n + jj + 2] = ACC.z; if (jj + 3 < n) Sh[(size_t)i * n + jj + 3] = ACC.w; } } }
+  DQK_ROW(0, acc0) DQK_ROW(1, acc1) DQK_ROW(2, acc2) DQK_ROW(3, acc3)
+#undef DQK_ROW
 }
-// in-place softmax(scale * row) over n keys. WG per (row, head), LS = 256.
-__kernel void dattn_softmax(__global float* S, int n, float scale) {
+// per-row max of S (the softmax shift): st[h*n + i] = max_j S[h][i][j]. WG per (row, head), LS = 256.
+// P is never materialized: dattn_pv applies exp() while staging and normalizes by the row sum at the end.
+__kernel void dattn_stats(__global const float* S, int n, float scale, __global float2* st) {
   __local float red[32];
   const int i = get_group_id(0), h = get_group_id(1), lid = get_local_id(0);
-  __global float* row = S + ((size_t)h * n + i) * n;
+  const __global float* row = S + ((size_t)h * n + i) * n;
   float m = -1e30f;
-  for (int j = lid; j < n; j += 256) m = fmax(m, row[j] * scale);
+  for (int j = lid * 4; j + 3 < n; j += 1024) { const float4 v = vload4(0, row + j); m = fmax(m, fmax(fmax(v.x, v.y), fmax(v.z, v.w))); }
+  for (int j = (n & ~3) + lid; j < n; j += 256) m = fmax(m, row[j]);     // tail when n % 4 != 0
   m = wg_max(m, red);
-  float sum = 0.f;
-  for (int j = lid; j < n; j += 256) { const float e = exp(row[j] * scale - m); row[j] = e; sum += e; }
-  const float inv = 1.0f / wg_add(sum, red);
-  for (int j = lid; j < n; j += 256) row[j] *= inv;
+  if (lid == 0) st[(size_t)h * n + i] = (float2)(m, 0.f);
 }
-// O[r0 + i][h*64 + c] = sum_j P[h][i][j] * V[r0 + j][h*64 + c]. 64 rows x 64 dims per WG, keys in chunks of 32.
-__kernel void dattn_pv(__global const float* S, __global const float* C, int ldc, int voff, int r0, int n,
-                       __global float* O, int ldo) {
-  __local float Ps[64 * 33];
-  __local float Vs[32 * 65];
+// O[r0 + i][h*64 + c] = sum_j P[h][i][j] * V[r0 + j][h*64 + c]. 64 rows x 64 dims per WG, keys in chunks of 32,
+// same 4x4 float4 register tiling as dattn_qk (P is staged transposed [k][row]).
+__kernel void dattn_pv(__global const float* S, __global const float2* st, float scale, __global const float* C, int ldc,
+                       int voff, int r0, int n, __global float* O, int ldo) {
+  __local float Ps[32 * 64];
+  __local float Vs[32 * 64];
   const int h = get_group_id(1), tx = get_local_id(0), ty = get_local_id(1);
   const int i0 = get_group_id(0) * 64, lid = ty * 16 + tx;
   const __global float* Sh = S + (size_t)h * n * n;
-  float acc[4][4];
-  for (int a = 0; a < 4; ++a) for (int b = 0; b < 4; ++b) acc[a][b] = 0.f;
+  float4 acc0 = (float4)(0.f), acc1 = acc0, acc2 = acc0, acc3 = acc0;
+  const int r = lid & 63, g = lid >> 6;
+  const bool rok = i0 + r < n;
+  const float L2E = 1.4426950408889634f;
+  const float sl2 = scale * L2E, ml2 = rok ? st[(size_t)h * n + i0 + r].x * sl2 : 0.f;
+  float psum = 0.f;
+  __local float tot[256];
   for (int k0 = 0; k0 < n; k0 += 32) {
     barrier(CLK_LOCAL_MEM_FENCE);
-    for (int e = lid; e < 64 * 32; e += 256) {
-      const int r = e >> 5, c = e & 31;
-      Ps[r * 33 + c] = (i0 + r < n && k0 + c < n) ? Sh[(size_t)(i0 + r) * n + k0 + c] : 0.f;
-      const int vr = e >> 6, vc = e & 63;
-      Vs[vr * 65 + vc] = k0 + vr < n ? C[(size_t)(r0 + k0 + vr) * ldc + voff + h * 64 + vc] : 0.f;
+    for (int c4 = g; c4 < 8; c4 += 4) {           // P: row r, keys k0 + 4*c4 .. +3 (n is a multiple of 4)
+      const int kk = k0 + c4 * 4;
+      float4 p = (float4)(0.f);
+      if (rok && kk < n) { p = native_exp2(vload4(0, Sh + (size_t)(i0 + r) * n + kk) * sl2 - ml2); psum += p.x + p.y + p.z + p.w; }
+      Ps[(c4 * 4 + 0) * 64 + r] = p.x; Ps[(c4 * 4 + 1) * 64 + r] = p.y; Ps[(c4 * 4 + 2) * 64 + r] = p.z; Ps[(c4 * 4 + 3) * 64 + r] = p.w;
+    }
+    for (int e = lid; e < 32 * 16; e += 256) {     // V: 32 key rows x 64 dims
+      const int vr = e >> 4, vc = e & 15;
+      vstore4(k0 + vr < n ? vload4(vc, C + (size_t)(r0 + k0 + vr) * ldc + voff + h * 64) : (float4)(0.f), vc, Vs + vr * 64);
     }
     barrier(CLK_LOCAL_MEM_FENCE);
     for (int k = 0; k < 32; ++k) {
-      float pa[4], vb[4];
-      for (int a = 0; a < 4; ++a) pa[a] = Ps[(ty + 16 * a) * 33 + k];
-      for (int b = 0; b < 4; ++b) vb[b] = Vs[k * 65 + tx + 16 * b];
-      for (int a = 0; a < 4; ++a) for (int b = 0; b < 4; ++b) acc[a][b] = mad(pa[a], vb[b], acc[a][b]);
+      const float4 pa = vload4(0, Ps + k * 64 + ty * 4);
+      const float4 vb = vload4(0, Vs + k * 64 + tx * 4);
+      acc0 = mad((float4)(pa.x), vb, acc0);
+      acc1 = mad((float4)(pa.y), vb, acc1);
+      acc2 = mad((float4)(pa.z), vb, acc2);
+      acc3 = mad((float4)(pa.w), vb, acc3);
     }
   }
-  for (int a = 0; a < 4; ++a) {
-    const int i = i0 + ty + 16 * a;
-    if (i >= n) continue;
-    for (int b = 0; b < 4; ++b) O[(size_t)(r0 + i) * ldo + h * 64 + tx + 16 * b] = acc[a][b];
-  }
+  tot[g * 64 + r] = psum;
+  barrier(CLK_LOCAL_MEM_FENCE);
+#define DPV_ROW(A, ACC) { const int rr = ty * 4 + (A), i = i0 + rr; \
+    const float inv = 1.0f / (tot[rr] + tot[64 + rr] + tot[128 + rr] + tot[192 + rr]); \
+    if (i < n) vstore4(ACC * inv, 0, O + (size_t)(r0 + i) * ldo + h * 64 + tx * 4); }
+  DPV_ROW(0, acc0) DPV_ROW(1, acc1) DPV_ROW(2, acc2) DPV_ROW(3, acc3)
+#undef DPV_ROW
 }
 
 // decision scorer tail at the marker rows: out[k] = gelu_erf(O[m] + cb) . w + wb. WG per marker, LS = d/4.
@@ -1130,7 +1155,7 @@ bool init(bool verbose) {
         {&k_gmvq, "gelu_mulvec_q"}, {&k_attq2, "attention_q2"}, {&k_gmq2, "gelu_mul_q2"}, {&k_gmvq2, "gelu_mulvec_q2"},
         {&k_rowf3, "row_fused3"}, {&k_qkvp3, "qkv_post3"}, {&k_attq3, "attention_q3"}, {&k_gmq3, "gelu_mul_q3"},
         {&k_gmvq3, "gelu_mulvec_q3"}, {&k_rnq, "resid_norm_q3"}, {&k_hinq, "head_in_q3"}, {&k_convq, "conv_gate_q3"},
-        {&k_siluq, "silu_mul_q8"}, {&k_bactq, "bias_act_q8"}, {&k_badd, "bias_add"}, {&k_score, "score_out"}, {&k_attq4, "attention_q4"}, {&k_attq5, "attention_q5"}, {&k_quantq, "quant_q3"}, {&k_lngq, "ln_gather_q3"}, {&k_dqk, "dattn_qk"}, {&k_dsm, "dattn_softmax"}, {&k_dpv, "dattn_pv"}};
+        {&k_siluq, "silu_mul_q8"}, {&k_bactq, "bias_act_q8"}, {&k_badd, "bias_add"}, {&k_score, "score_out"}, {&k_attq4, "attention_q4"}, {&k_attq5, "attention_q5"}, {&k_quantq, "quant_q3"}, {&k_lngq, "ln_gather_q3"}, {&k_dqk, "dattn_qk"}, {&k_dsm, "dattn_stats"}, {&k_dpv, "dattn_pv"}};
     for (auto& k : ks) { *k.k = cl.clCreateKernel(g_prog, k.n, &err); CK(err); }
     g_ok = true;
     if (verbose) fprintf(stderr, "[gpu] %s ready (int8 DP4A GEMM TT=%d KB=%d, on-device layer loop)\n",
@@ -1476,16 +1501,29 @@ bool op_quant_q(Buf X, int T, int cols) {
 }
 // dense attention over one fully-visible segment [r0, r0+n): S scratch of nh*n*n floats, O f32 (ldo = nh*64)
 bool op_dense_attention(Buf C, int ldc, int qoff, int koff, int voff, int r0, int n, int nh, float scale, Buf S, Buf O, int ldo) {
+    static const bool prof = getenv("FERRO_TIME") != nullptr;
+    static double tt[3] = {0, 0, 0};
+    static bool reg = false;
+    if (prof && !reg) { reg = true; atexit([] { fprintf(stderr, "[gpu] dense attention: qk %.0f ms  softmax %.0f ms  pv %.0f ms\n", tt[0] * 1e3, tt[1] * 1e3, tt[2] * 1e3); }); }
+    auto t0 = std::chrono::steady_clock::now();
+    auto lap = [&](int k) { if (!prof) return; finish(); auto t = std::chrono::steady_clock::now(); tt[k] += std::chrono::duration<double>(t - t0).count(); t0 = t; };
     const size_t nt = (size_t)(n + 63) / 64;
     set_args(k_dqk, C, (cl_int)ldc, (cl_int)qoff, (cl_int)koff, (cl_int)r0, (cl_int)n, S);
     size_t g1[3] = {nt * 16, nt * 16, (size_t)nh}, l1[3] = {16, 16, 1};
     if (!launch(k_dqk, 3, g1, l1)) return false;
-    set_args(k_dsm, S, (cl_int)n, scale);
+    lap(0);
+    static Buf g_dst = nullptr; static size_t g_dstcap = 0;
+    const size_t stb = (size_t)nh * n * 8;
+    if (stb > g_dstcap) { if (g_dst) release(g_dst); g_dst = alloc(stb); g_dstcap = g_dst ? stb : 0; if (!g_dst) return false; }
+    set_args(k_dsm, S, (cl_int)n, scale, g_dst);
     size_t g2[2] = {(size_t)n * 256, (size_t)nh}, l2[2] = {256, 1};
     if (!launch(k_dsm, 2, g2, l2)) return false;
-    set_args(k_dpv, S, C, (cl_int)ldc, (cl_int)voff, (cl_int)r0, (cl_int)n, O, (cl_int)ldo);
+    lap(1);
+    set_args(k_dpv, S, g_dst, scale, C, (cl_int)ldc, (cl_int)voff, (cl_int)r0, (cl_int)n, O, (cl_int)ldo);
     size_t g3[2] = {nt * 16, (size_t)nh * 16}, l3[2] = {16, 16};
-    return launch(k_dpv, 2, g3, l3);
+    bool ok = launch(k_dpv, 2, g3, l3);
+    lap(2);
+    return ok;
 }
 bool op_ln_gather_q(Buf X, Buf src, Buf w, Buf b, int V, int cols, float eps) {
     if (cols % 32 || cols / 4 > 512) return false;
