@@ -95,15 +95,14 @@ __kernel void q8gemm(__global const uint* restrict Wp, __global const float* res
       for (int j = 0; j < TT; ++j) {
         const __local uint* xp = xq + (j * KB + bb) * 8;
         uint4 xa = vload4(0, xp), xb = vload4(1, xp);
-        int4 s = (int4)(0), u = (int4)(0);   // two independent DP4A chains (ILP)
+        int4 s = (int4)(0);
 #define STEP(A, K, XV) \
         A.s0 = dot_acc_sat_4x8packed_ss_int(w[K].s0, XV, A.s0); \
         A.s1 = dot_acc_sat_4x8packed_ss_int(w[K].s1, XV, A.s1); \
         A.s2 = dot_acc_sat_4x8packed_ss_int(w[K].s2, XV, A.s2); \
         A.s3 = dot_acc_sat_4x8packed_ss_int(w[K].s3, XV, A.s3);
-        STEP(s, 0, xa.s0) STEP(u, 4, xb.s0) STEP(s, 1, xa.s1) STEP(u, 5, xb.s1)
-        STEP(s, 2, xa.s2) STEP(u, 6, xb.s2) STEP(s, 3, xa.s3) STEP(u, 7, xb.s3)
-        s += u;
+        STEP(s, 0, xa.s0) STEP(s, 1, xa.s1) STEP(s, 2, xa.s2) STEP(s, 3, xa.s3)
+        STEP(s, 4, xb.s0) STEP(s, 5, xb.s1) STEP(s, 6, xb.s2) STEP(s, 7, xb.s3)
         acc[j] = mad(convert_float4(s), ws * xsc[j * KB + bb], acc[j]);
       }
     }
@@ -146,15 +145,14 @@ __kernel void q8gemm_sw(__global const uint* restrict Wp, __global const float* 
       for (int j = 0; j < TT; ++j) {
         const __local uint* xp = xq + (j * KB + bb) * 8;
         uint4 xa = vload4(0, xp), xb = vload4(1, xp);
-        int4 s = (int4)(0), u = (int4)(0);   // two independent DP4A chains (ILP)
+        int4 s = (int4)(0);
 #define STEP(A, K, XV) \
         A.s0 = dot_acc_sat_4x8packed_ss_int(w[K].s0, XV, A.s0); \
         A.s1 = dot_acc_sat_4x8packed_ss_int(w[K].s1, XV, A.s1); \
         A.s2 = dot_acc_sat_4x8packed_ss_int(w[K].s2, XV, A.s2); \
         A.s3 = dot_acc_sat_4x8packed_ss_int(w[K].s3, XV, A.s3);
-        STEP(s, 0, xa.s0) STEP(u, 4, xb.s0) STEP(s, 1, xa.s1) STEP(u, 5, xb.s1)
-        STEP(s, 2, xa.s2) STEP(u, 6, xb.s2) STEP(s, 3, xa.s3) STEP(u, 7, xb.s3)
-        s += u;
+        STEP(s, 0, xa.s0) STEP(s, 1, xa.s1) STEP(s, 2, xa.s2) STEP(s, 3, xa.s3)
+        STEP(s, 4, xb.s0) STEP(s, 5, xb.s1) STEP(s, 6, xb.s2) STEP(s, 7, xb.s3)
         acc[j] = mad(convert_float4(s), ws * xsc[j * KB + bb], acc[j]);
       }
     }

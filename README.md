@@ -60,14 +60,26 @@ JSON value, or `null`; `noul` criteria accept `true/false` or `yes/no`; up to 25
 calibrated with the per-type temperatures stored in the GGUF. Get the model:
 `curl -L -o models/d1-omni-600M-Q8_0.gguf https://huggingface.co/LiquidAI/d1-omni-600M-GGUF/resolve/main/d1-omni-600M-Q8_0.gguf`
 
-**Scope:** text states. Image/audio inputs (the model's `mmproj` SigLIP2 / FastConformer encoders) are
-not implemented; such requests are rejected with a clear error. Tested with the Q8_0 GGUF; the loader
-also accepts F16/BF16/F32 tensors (quantized to Q8 at load for the int8 path), but that is untested.
+**Media (image / audio):** `files` (or `images`) take data URLs; chat-message `image_url` / `input_audio`
+parts in `state` are also accepted. Either images or **one** audio clip (WAV / MP3 / FLAC, any sample rate,
+cut to 30 s), never both; remote URLs and `videos` are rejected exactly as llama.cpp does (extract frames
+with ffmpeg and send them as images). The mmproj (`models/mmproj-d1-omni-600M-Q8_0.gguf`, fetched by
+`scripts/fetch_assets.sh`) is found next to the model. Encoders: SigLIP vision tower with LFM2-VL tiling
+(whole encoder on the iGPU) and a FastConformer audio encoder (iGPU GEMMs + AVX2 conv / rel-pos attention).
+Media embeddings are computed once per request and shared by all of its questions. Like llama.cpp, media
+answers are uncalibrated (temperature 1). `ferro-embed mm-embed --mmproj M --media F --out f.bin` dumps the
+embeddings (same format as `bench/mm/mm_ref`, the libmtmd oracle). Parity vs llama-server `--mmproj`
+(`scripts/d1_parity_mm.py`, 12 requests): token counts 12/12, top answers 18/18, worst probability gap 0.019.
+Encoder embeddings match libmtmd to mean cosine >= 0.9992 (images; llama.cpp's own flash-attention vs
+non-flash outputs differ by about the same, worst token 0.97) and >= 0.9996 (audio).
+
+Tested with the Q8_0 GGUF; the loader also accepts F16/BF16/F32 tensors (quantized to Q8 at load for the
+int8 path), but that is untested.
 
 ## How the iGPU path is fast
 1. **int8 DP4A GEMMs** (`cl_khr_integer_dot_product`): Q8_0 weights resident on the GPU in a
    coalesced `[block][k][rows]` layout; activations quantized per 32-block (llama.cpp's scheme);
-   activation tile in shared local memory; 2 independent accumulator chains. **Swizzled work-group
+   activation tile in shared local memory; one accumulator chain per token. **Swizzled work-group
    order** for weight matrices larger than the LLC (each weight slice streamed from DRAM ~once).
 2. **Whole model on-device**: one upload, one tiny readback per batch (embeddings, or one logit per
    decision option).
@@ -109,12 +121,13 @@ d1: faster than llama.cpp CPU (1.5×), but ~5× slower than the iGPU — use the
 - `src/kernels*.{h,cpp}` — CPU kernels (AVX2/FMA + scalar refs) · `src/gguf.*` · `src/tokenizer.*`
 - `bench/ferro_ref.cpp`, `bench/ferro_ref_vk.cpp` — llama.cpp embedding harnesses (CPU / Vulkan)
 - `scripts/final_h2h.sh` (embeddings) · `scripts/d1_bench.py` (d1) — interleaved scoreboards
-- `scripts/d1_parity.py` — d1 answers vs llama-server + batched==alone contract · `bench/d1/` requests
+- `src/media*.{h,cpp}` (stb_image / miniaudio decode) · `src/mm_preproc.*` (tiling, Pillow resize, log-mel; ported from mtmd) · `src/mm_encoder.*` (SigLIP + FastConformer)
+- `scripts/d1_parity.py` — d1 answers vs llama-server + batched==alone contract · `scripts/d1_parity_mm.py` — media · `bench/d1/` requests
 - iGPU R&D, kernel shootouts and findings: `/opt/data/ferro-gpu/`
 
 ## Env knobs
 `FERRO_GPU=0|1` · `FERRO_HETERO=1` · `FERRO_GPU_KBENCH=1` (per-kernel device times, both models) ·
 `FERRO_GPU_SWIZZLE=0|1` · `FERRO_GPU_ATTN_NO5=1` / `FERRO_GPU_UNFUSED=1` / `FERRO_GPU_V2=1` (older kernel
 paths, for A/B) · `FERRO_DECISION_BATCH=N` (tokens per d1 forward, default 4096) ·
-`FERRO_DECISION_DUMP=1` (rendered d1 prompts + token ids) · `FERRO_DEBUG_LAYERS=1` · `FERRO_TIME=1` ·
+`FERRO_MM_GPU=0` / `FERRO_MM_DENSE=0` (media encoder fallbacks) · `FERRO_DECISION_DUMP=1` (rendered d1 prompts + token ids) · `FERRO_DEBUG_LAYERS=1` · `FERRO_TIME=1` ·
 `FERRO_LOW_MEM=1` · `FERRO_DBGDIR=/path` (CPU stage dumps for golden diffing)

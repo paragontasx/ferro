@@ -79,7 +79,7 @@ and glslc from `/opt/data/ferro-gpu/third_party`); harness `bench/ferro_ref_vk.c
 
 Model: `LiquidAI/d1-omni-600M-GGUF` Q8_0 (sha256 cd94463f…), arch `lfm2` + 2-layer decision head
 (16 LFM2 trunk layers: 10 short-conv + 6 GQA attention, d=1024, ffn 4608). ~0.9 GFLOP per token
-(≈3.6× EmbeddingGemma). Text states only (no mmproj image/audio encoders).
+(≈3.6× EmbeddingGemma). Image/audio inputs: see the media section below.
 
 ## Scoreboard — `scripts/d1_bench.py bench/d1/tickets16.json 2`
 16 support tickets × 3 questions (noul + 5-way choice + 4-level score) = 48 decision sequences,
@@ -120,6 +120,36 @@ asked type.
 - chunk-wise online softmax made answers depend on batch packing (up to 4% on near-ties) — per-key rescale.
 
 ## Not done / limits
-- Image and audio inputs (SigLIP2 vision tower, FastConformer audio encoder in the mmproj GGUF).
+- Not covered: F16/BF16 weights, video (frames must be extracted by the caller).
 - Long states are attention-bound on the iGPU (2×2.25k-token sequences: ~40 s per request).
 - CPU path ~70 tok/s: usable, but the iGPU is ~5× faster.
+
+
+## d1 media encoders (2026-10-20/21, N100, nothing else running)
+Embeddings vs llama.cpp libmtmd (`bench/mm/mm_ref` + `cmp.py`); end-to-end answers vs llama-server
+`--mmproj` (`scripts/d1_parity_mm.py`): 12/12 token counts, 18/18 top answers, worst |dprob| 0.019.
+
+| Input | Tokens | Encode time (iGPU) | Mean cosine vs libmtmd |
+|---|---|---|---|
+| 640x480 photo | 234 | 1.5 s | 0.9993 |
+| 100x80 image | 72 | 0.4 s | 0.9973 |
+| 1920x1080 (8 tiles + thumbnail) | 2,300 | 14.1 s | 0.9991 |
+| 11 s audio | 138 | 0.8 s | >= 0.9996 |
+| 30 s audio (cap) | 375 | 2.0 s | 0.99996 |
+
+Per-token worst cosine is 0.97-0.99 for images; llama.cpp's own flash vs non-flash attention differ by the
+same amount, so mean cosine is the meaningful gate. llama.cpp's media-encode speed was not benchmarked.
+What moved the numbers (photo 7.2 s -> 1.5 s; 1080p 94 s CPU -> 14 s; 30 s audio 3.8 s -> 2.0 s): whole vision
+encoder on the iGPU; dense float4-register-tiled attention (no materialized softmax; a dynamically indexed
+private accumulator array had been spilling); AVX2 audio conv stack (982 -> 224 ms) and rel-pos attention
+(1.2 s -> 0.47 s); a thread-pool int overflow that crashed big images.
+
+## iGPU limits measured (pure-register microkernels, `peak.py`)
+DP4A peak 435 GMAC/s, fp32 peak 109 GFMA/s (218 GFLOP/s; not 288). The Q8 GEMM runs at 134 GMAC/s (31% of
+DP4A peak) *independent of weight size* (64 KB..9 MB): it is issue-bound, not bandwidth-bound. Ablation: weight
+global loads cost ~70% of attainable throughput (ALU-generated weights: 231 GMAC/s), activation staging 4%,
+epilogue ~19%. Tried and rejected (all slower or identical): software-pipelined weight prefetch (register
+spills, 28-89 GMAC/s), wider/contiguous per-lane weight loads (55-102), uniform global activation loads (47),
+subgroup-broadcast activations (77), unroll hints and `prefetch()` (identical), TT 8/12/14 (12+ spills; TT=10
+stays). Adopted: single DP4A chain per token (+2.9% end-to-end, 3/3 interleaved rounds).
+Open idea (unproven): SLM-staged weights with split loads interleaved between token iterations.
