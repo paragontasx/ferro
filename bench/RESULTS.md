@@ -125,17 +125,17 @@ asked type.
 - CPU path ~70 tok/s: usable, but the iGPU is ~5× faster.
 
 
-## d1 media encoders (2026-10-20/21, N100, nothing else running)
+## d1 media encoders (2026-10-21, N100, nothing else running; after the 32-bit GEMM fix)
 Embeddings vs llama.cpp libmtmd (`bench/mm/mm_ref` + `cmp.py`); end-to-end answers vs llama-server
 `--mmproj` (`scripts/d1_parity_mm.py`): 12/12 token counts, 18/18 top answers, worst |dprob| 0.019.
 
 | Input | Tokens | Encode time (iGPU) | Mean cosine vs libmtmd |
 |---|---|---|---|
-| 640x480 photo | 234 | 1.5 s | 0.9993 |
-| 100x80 image | 72 | 0.4 s | 0.9973 |
-| 1920x1080 (8 tiles + thumbnail) | 2,300 | 14.1 s | 0.9991 |
-| 11 s audio | 138 | 0.8 s | >= 0.9996 |
-| 30 s audio (cap) | 375 | 2.0 s | 0.99996 |
+| 640x480 photo | 234 | 1.2 s | 0.9993 |
+| 100x80 image | 72 | 0.28 s | 0.9973 |
+| 1920x1080 (8 tiles + thumbnail) | 2,300 | 11.5 s | 0.9987 |
+| 11 s audio | 138 | 0.70 s | 0.99996 |
+| 30 s audio (cap) | 375 | 2.07 s | 0.99996 |
 
 Per-token worst cosine is 0.97-0.99 for images; llama.cpp's own flash vs non-flash attention differ by the
 same amount, so mean cosine is the meaningful gate. llama.cpp's media-encode speed was not benchmarked.
