@@ -1,6 +1,8 @@
 // mm_gemma4.cpp — see mm_gemma4.h. CPU reference forward (GEMMs route to the iGPU when weights are resident).
 #include "mm_gemma4.h"
 #include "mm_util.h"
+#include "mm_clin.h"
+#include "mm_gemma4_impl.h"
 #include "threadpool.h"
 #include "gpu_cl.h"
 
@@ -15,67 +17,7 @@
 
 namespace ferro {
 
-namespace {
-// Gemma4ClippableLinear: clamp(x, in) -> W x -> clamp(., out); limits are 1-element tensors next to the weight
-struct CLin {
-    Lin w;
-    float imin = -FLT_MAX, imax = FLT_MAX, omin = -FLT_MAX, omax = FLT_MAX;
-};
-float scalar_or(const GgufFile& g, const std::string& name, float dflt) {
-    if (!g.tensor(name)) return dflt;
-    return tf32(g, name).at(0);
-}
-CLin clin(const GgufFile& g, const std::string& wname) {
-    CLin c;
-    c.w = lin(g, wname);
-    const std::string base = wname.substr(0, wname.size() - strlen(".weight"));
-    c.imin = scalar_or(g, base + ".input_min", -FLT_MAX);
-    c.imax = scalar_or(g, base + ".input_max", FLT_MAX);
-    c.omin = scalar_or(g, base + ".output_min", -FLT_MAX);
-    c.omax = scalar_or(g, base + ".output_max", FLT_MAX);
-    return c;
-}
-void clamp_buf(float* x, size_t n, float lo, float hi) {
-    if (lo <= -FLT_MAX && hi >= FLT_MAX) return;
-    Pool::get().parallel_for((int)((n + 8191) / 8192), [&](int a, int b) {
-        const size_t i1 = std::min(n, (size_t)b * 8192);
-        for (size_t i = (size_t)a * 8192; i < i1; ++i) x[i] = std::min(hi, std::max(lo, x[i]));
-    });
-}
-// Y[T][rows]; X is clamped in place only when limits exist (callers pass a scratch copy)
-void capply(const CLin& c, const float* X, int T, float* Y, std::vector<float>& scratch) {
-    const float* xin = X;
-    if (c.imin > -FLT_MAX || c.imax < FLT_MAX) {
-        scratch.assign(X, X + (size_t)T * c.w.cols);
-        clamp_buf(scratch.data(), scratch.size(), c.imin, c.imax);
-        xin = scratch.data();
-    }
-    apply(c.w, xin, T, Y);
-    clamp_buf(Y, (size_t)T * c.w.rows, c.omin, c.omax);
-}
-struct VLayer {
-    std::vector<float> ln1, ln2, qn, kn, post_attn, post_ffn;
-    CLin q, k, v, o, gate, up, down;
-};
-}  // namespace
-
-struct Gemma4Proj::Impl {
-    int d = 768, layers = 16, heads = 12, hd = 64, ps = 16, merge = 3, ffn = 3072, proj = 512;
-    float eps = 1e-6f, theta = 100.0f;
-    std::vector<float> patch_w, pos_tbl;   // patch_w [768][3*16*16]; pos_tbl [2][10240][768]
-    int pos_size = 10240;
-    std::vector<VLayer> vl;
-    CLin mm_proj;                          // 768 -> 512
-    // ---- iGPU state (upload_gpu)
-    struct GL { WMat qkv, gu; gpu::Buf ln1 = nullptr, ln2 = nullptr, qn = nullptr, kn = nullptr, pa = nullptr, pf = nullptr; };
-    std::vector<GL> gl;
-    WMat patch_q;
-    int patch_slot = -1, qkv_slot_ = -1;
-    gpu::Buf invf = nullptr, pos_x = nullptr, pos_y = nullptr, bX = nullptr, bC = nullptr, bD = nullptr, bG = nullptr, bT = nullptr;
-    gpu::Buf bS = nullptr, bsrc = nullptr, ones = nullptr, bxs = nullptr, bys = nullptr, blo = nullptr, bhi = nullptr;
-    size_t cap = 0, capS = 0, capm = 0;
-    bool gpu_ok = false;
-};
+void load_audio_weights(const GgufFile& g, Gemma4Proj::Impl& I);   // mm_gemma4a.cpp
 
 bool Gemma4Proj::load(const std::string& path, std::string* err) {
     try {
@@ -101,7 +43,7 @@ bool Gemma4Proj::load(const std::string& path, std::string* err) {
             I.vl.resize(I.layers);
             for (int i = 0; i < I.layers; ++i) {
                 const std::string b = "v.blk." + std::to_string(i) + ".";
-                VLayer& L = I.vl[i];
+                G4VLayer& L = I.vl[i];
                 L.ln1 = tf32(g_, b + "ln1.weight"); L.ln2 = tf32(g_, b + "ln2.weight");
                 L.qn = tf32(g_, b + "attn_q_norm.weight"); L.kn = tf32(g_, b + "attn_k_norm.weight");
                 L.post_attn = tf32(g_, b + "attn_post_norm.weight"); L.post_ffn = tf32(g_, b + "ffn_post_norm.weight");
@@ -113,6 +55,11 @@ bool Gemma4Proj::load(const std::string& path, std::string* err) {
             I.mm_proj = clin(g_, "mm.input_projection.weight");
             n_out_ = I.mm_proj.w.rows;
             v_ok_ = true;
+        }
+        if (g_.get_bool("clip.has_audio_encoder") && g_.get_str("clip.audio.projector_type") == "gemma4a") {
+            load_audio_weights(g_, I);                          // mm_gemma4a.cpp
+            a_ok_ = true;
+            if (!n_out_) n_out_ = I.a_mm_proj.w.rows;
         }
         return true;
     } catch (const std::exception& e) { *err = e.what(); return false; }
@@ -170,7 +117,7 @@ void Gemma4Proj::upload_gpu() {
     slot(I.patch_q);
     I.gl.assign(I.vl.size(), Impl::GL());
     for (size_t i = 0; ok && i < I.vl.size(); ++i) {
-        VLayer& L = I.vl[i]; auto& g = I.gl[i];
+        G4VLayer& L = I.vl[i]; auto& g = I.gl[i];
         g.qkv = pack_concat({&L.q.w.q, &L.k.w.q, &L.v.w.q}, "g4.qkv");
         g.gu = pack_concat({&L.gate.w.q, &L.up.w.q}, "g4.gate_up");
         slot(g.qkv); slot(g.gu); slot(L.o.w.q); slot(L.down.w.q);
@@ -272,7 +219,7 @@ static bool encode_image_gpu(Gemma4Proj::Impl& I, const VisionInput& in, std::ve
         if (ok && !r) { ok = false; stage = id; }
         return r; };
     for (int l = 0; ok && l < I.layers; ++l) {
-        const VLayer& L = I.vl[l]; const auto& g = I.gl[l];
+        const G4VLayer& L = I.vl[l]; const auto& g = I.gl[l];
         step(1, gpu::op_gemm_q(g.qkv.gpu_slot, T, C));
         step(2, gpu::op_qkv_post_g4(C, rowc, T, H, H, hd, g.qn, g.kn, I.invf, I.pos_x, I.pos_y, eps));
         step(3, dense ? (gpu::op_dense_attention(C, rowc, 0, d, 2 * d, 0, T, H, 1.0f, I.bS, D, d) && gpu::op_quant_q(D, T, d))
@@ -366,7 +313,7 @@ std::vector<float> Gemma4Proj::encode_image(const VisionInput& in) {
     std::vector<float> G((size_t)T * I.ffn), U((size_t)T * I.ffn), scratch;
     std::vector<int> seg(T, 0);
     for (int l = 0; l < I.layers; ++l) {
-        const VLayer& L = I.vl[l];
+        const G4VLayer& L = I.vl[l];
         rmsnorm_q(X.data(), T, d, L.ln1.data(), I.eps, xn.data());
         capply(L.q, xn.data(), T, Q.data(), scratch);
         capply(L.k, xn.data(), T, K.data(), scratch);

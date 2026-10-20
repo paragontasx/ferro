@@ -90,7 +90,8 @@ bool MmEmbedder::embed(const std::vector<EmbedItem>& items, const MmEmbedOptions
         push_tok(end);
         return true;
     };
-    constexpr int IMG_BEG = 255999, IMG_END = 258882;
+    constexpr int IMG_BEG = 255999, IMG_END = 258882;       // ids looked up from the vocab (<|image> <image|>)
+    constexpr int AUD_BEG = 256000, AUD_END = 258883;       //                                (<|audio> <audio|>)
     auto image = [&](const uint8_t* rgb, int nx, int ny) {
         if (!proj_.has_vision()) { *err = "no vision encoder loaded (pass --mmproj)"; return false; }
         VisionInput in = gemma4_preprocess_image(rgb, nx, ny, proj_.vision_params());
@@ -111,7 +112,18 @@ bool MmEmbedder::embed(const std::vector<EmbedItem>& items, const MmEmbedOptions
                 if (m.is_audio) { *err = "expected an image: " + it.value; return false; }
                 if (!image(m.rgb.data(), m.nx, m.ny)) return false;
             } else if (it.kind == EmbedItem::AUDIO) {
-                *err = "audio input is not implemented yet"; return false;
+                if (!proj_.has_audio()) { *err = "no audio encoder loaded (pass --mmproj)"; return false; }
+                MediaItem m = decode_media(bytes, 16000);
+                if (!m.is_audio) { *err = "expected audio: " + it.value; return false; }
+                std::vector<Mel> mels;
+                if (!gemma4a_audio_mel(m.pcm.data(), m.pcm.size(), 128, mels)) { *err = "audio is too short to encode: " + it.value; return false; }
+                // mtmd adds <|audio> once, then every 30 s chunk's embeddings, then <audio|> once (verified: 44 s -> 1104 tokens)
+                std::vector<float> all; int n_all = 0;
+                for (const Mel& mel : mels) {
+                    std::vector<float> e = proj_.encode_audio(mel);
+                    all.insert(all.end(), e.begin(), e.end()); n_all += gemma4a_tokens(mel.n_len);
+                }
+                if (!push_media(all, n_all, AUD_BEG, AUD_END)) return false;
             } else {
                 VideoFrames vf;
                 if (!decode_video_frames(it.value, it.bytes, opt.video_fps, vf, err)) return false;

@@ -233,7 +233,24 @@ static int run_mm_embed_g4(const std::string& mmproj, const std::string& media, 
     std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
     MediaItem it = decode_media(bytes, 16000);
     std::vector<std::vector<float>> chunks;
-    if (it.is_audio) { fprintf(stderr, "gemma4 audio encoder not implemented yet\n"); return 1; }
+    if (it.is_audio) {
+        if (!mm.has_audio()) { fprintf(stderr, "mmproj has no audio encoder\n"); return 1; }
+        std::vector<Mel> mels;
+        if (!gemma4a_audio_mel(it.pcm.data(), it.pcm.size(), 128, mels)) { fprintf(stderr, "audio mel failed\n"); return 1; }
+        auto ta = clk::now();
+        for (auto& m : mels) {
+            chunks.push_back(mm.encode_audio(m));
+            fprintf(stderr, "[mm] audio chunk: %d frames -> %d tokens\n", m.n_len, gemma4a_tokens(m.n_len));
+        }
+        fprintf(stderr, "[mm] audio encoded in %.1f ms\n", std::chrono::duration<double, std::milli>(clk::now() - ta).count());
+        FILE* o = fopen(outp.c_str(), "wb");
+        if (!o) return 1;
+        int32_t nc = (int32_t)chunks.size(), ne = mm.n_embd_out();
+        fwrite(&nc, 4, 1, o);
+        for (auto& c : chunks) { int32_t n = (int32_t)(c.size() / ne); fwrite(&n, 4, 1, o); fwrite(&ne, 4, 1, o); fwrite(c.data(), 4, c.size(), o); }
+        fclose(o);
+        return 0;
+    }
     VisionInput in = gemma4_preprocess_image(it.rgb.data(), it.nx, it.ny, mm.vision_params());
     if (getenv("FERRO_MM_WARM")) {                       // steady-state timing: first call pays kernel build + buffer allocation
         auto w0 = clk::now(); (void)mm.encode_image(in);
