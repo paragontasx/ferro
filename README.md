@@ -17,24 +17,28 @@ GPU-less hosts. Native GGUF loading and native tokenizers (Gemma SPM-BPE; LFM2 b
 
 | Engine | 16 seqs / 188 tok | 64 seqs / 752 tok |
 |---|---|---|
-| **ferro-embed (iGPU, default)** | **297 ms · 627 tok/s** | **1089 ms · 687 tok/s** |
-| ferro-embed `--hetero` (CPU ‖ iGPU) | 247–284 ms · up to 683 tok/s | ~1000 ms · up to 690 tok/s |
-| llama.cpp Vulkan (same iGPU) | 461 ms · 408 tok/s | 1757 ms · 428 tok/s |
-| llama.cpp CPU (`llama_encode`, 2 t) | 586 ms · 320 tok/s | 2214 ms · 340 tok/s |
+| **ferro-embed (iGPU, default)** | **219 ms · 839 tok/s** | **796 ms · 938 tok/s** |
+| llama.cpp Vulkan (same iGPU)¹ | 461 ms · 408 tok/s | 1757 ms · 428 tok/s |
+| llama.cpp CPU (`llama_encode`, 2 t)¹ | 586 ms · 320 tok/s | 2214 ms · 340 tok/s |
 | ferro-embed `--cpu` | ~900–1000 ms · ~175–206 tok/s | ~4000 ms · ~174 tok/s |
+
+¹ llama.cpp rows measured on 2026-10-20 (not re-run after ferro's 2026-10-21 GEMM fix, which took ferro from
+627 to ~840–940 tok/s: about 2.1× Vulkan, 2.7× CPU against those numbers). `--hetero` (CPU ‖ iGPU) is not
+re-measured after the fix.
 
 **d1-omni-600M Q8_0** (16 support tickets × 3 questions = 48 decision sequences, 2,989 tokens;
 llama.cpp = `llama-server /v1/systemone`):
 
 | Engine | all 16 at once | one request at a time |
 |---|---|---|
-| **ferro-embed (iGPU, default)** | **8.46 s · 353 tok/s** | **8.95 s · 334 tok/s (0.56 s/request)** |
-| llama.cpp Vulkan (same iGPU, `-np 8`) | 11.08 s · 270 tok/s | 13.74 s · 218 tok/s |
-| ferro-embed `--cpu` | 40.7 s · 73 tok/s | 42.4 s · 71 tok/s |
-| llama.cpp CPU (2 t, `-np 8`) | 61.2 s · 49 tok/s | 61.4 s · 49 tok/s |
+| **ferro-embed (iGPU, default)** | **5.77 s · 518 tok/s** | **5.99 s · 499 tok/s (0.37 s/request)** |
+| llama.cpp Vulkan (same iGPU, `-np 8`) | 10.98 s · 272 tok/s | 13.74 s · 217 tok/s |
+| ferro-embed `--cpu` | 41.3 s · 72 tok/s | 42.1 s · 71 tok/s |
+| llama.cpp CPU (2 t, `-np 8`) | 62.9 s · 48 tok/s | 60.1 s · 50 tok/s |
 
-d1 iGPU: **1.31–1.54× llama.cpp's own iGPU backend, ~7× llama.cpp CPU**; ferro's CPU path is also
-1.45–1.5× llama.cpp CPU here. Answers match llama.cpp: identical prompt tokens on 15/15 requests, same top
+d1 iGPU: **1.9× (all at once) / 2.3× (one at a time) llama.cpp's own iGPU backend, 10–11× llama.cpp CPU**
+(interleaved scoreboard 2026-10-21, `bench/d1/scoreboard_2026-10-21.log`); ferro's CPU path is also
+1.4–1.5× llama.cpp CPU here. Answers match llama.cpp: identical prompt tokens on 15/15 requests, same top
 answer 23/23, and every answer is bit-identical whether a request runs alone or batched.
 Details: `bench/RESULTS.md`.
 
@@ -79,7 +83,8 @@ int8 path), but that is untested.
 ## How the iGPU path is fast
 1. **int8 DP4A GEMMs** (`cl_khr_integer_dot_product`): Q8_0 weights resident on the GPU in a
    coalesced `[block][k][rows]` layout; activations quantized per 32-block (llama.cpp's scheme);
-   activation tile in shared local memory; one accumulator chain per token. **Swizzled work-group
+   activation tile in shared local memory; one accumulator chain per token; **32-bit typed weight indexing**
+   (Xe-LP emulates 64-bit integer multiplies; they were costing a third of GEMM throughput). **Swizzled work-group
    order** for weight matrices larger than the LLC (each weight slice streamed from DRAM ~once).
 2. **Whole model on-device**: one upload, one tiny readback per batch (embeddings, or one logit per
    decision option).
@@ -109,7 +114,7 @@ Container: pass `--device /dev/dri`. Mesa rusticl is enough (no Intel compute-ru
 AVX2 fp32: load-time Q8_0→f32 planes, 4-row × 16-token register-tiled GEMM, 2 spin-pinned threads
 (power-capped N100: 2 cores at 2.9 GHz beat 4 at 1.3 GHz), vectorized erf-GELU / SiLU, FTZ/DAZ.
 Embeddings: slower than llama.cpp's CPU path (AVX-VNNI int8; a VNNI GEMM is the open CPU item).
-d1: faster than llama.cpp CPU (1.5×), but ~5× slower than the iGPU — use the default.
+d1: faster than llama.cpp CPU (1.5×), but ~7× slower than the iGPU — use the default.
 
 ## Layout
 - `src/gpu_cl.{h,cpp}` — dlopen'd OpenCL backend: DP4A GEMM + all fused layer kernels (both models)

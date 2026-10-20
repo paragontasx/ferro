@@ -153,3 +153,27 @@ spills, 28-89 GMAC/s), wider/contiguous per-lane weight loads (55-102), uniform 
 subgroup-broadcast activations (77), unroll hints and `prefetch()` (identical), TT 8/12/14 (12+ spills; TT=10
 stays). Adopted: single DP4A chain per token (+2.9% end-to-end, 3/3 interleaved rounds).
 Open idea (unproven): SLM-staged weights with split loads interleaved between token iterations.
+
+## 2026-10-21 update: 32-bit GEMM indexing (+45-50% on both models)
+The Q8 DP4A GEMM computed weight addresses with 64-bit multiplies (`(size_t)b * 8 * rows + ...`), which Xe-LP
+emulates. Typed `uint4*` indexing with 32-bit offsets took the micro-benchmark from 134 to 210 GMAC/s (48% of the
+435 GMAC/s DP4A peak) with no other change (this was the "weight loads cost 70%" seen in the ablations above:
+the loads were fine, the address math was not). Also: `native_exp2` in SwiGLU and flash attention (attention
+-11%, parity improved). TT=10 stays optimal (TT>=11 spills); KB=32 would add ~3% but does not divide 4608.
+
+Scoreboard `scripts/d1_bench.py bench/d1/tickets16.json 2` (log: `bench/d1/scoreboard_2026-10-21.log`; best of 2
+interleaved rounds, 10 s cooldowns):
+
+| Engine | all 16 at once | one request at a time |
+|---|---|---|
+| **ferro iGPU** | **5,774 ms · 518 tok/s** | **5,985 ms · 499 tok/s** |
+| llama.cpp Vulkan (same iGPU) | 10,977 ms · 272 tok/s | 13,744 ms · 217 tok/s |
+| ferro CPU (2 t) | 41,327 ms · 72 tok/s | 42,094 ms · 71 tok/s |
+| llama.cpp CPU (2 t) | 62,882 ms · 48 tok/s | 60,084 ms · 50 tok/s |
+
+ferro iGPU vs llama.cpp Vulkan: 1.90x / 2.30x; vs llama.cpp CPU: 10.9x / 10.0x. ferro CPU vs llama.cpp CPU:
+1.52x / 1.43x. Parity after the change: 15/15 token counts, 23/23 top answers, worst |dprob| 0.039, batched==alone
+0.00. EmbeddingGemma: 16 seqs 219 ms (839 tok/s), 64 seqs 796 ms (938 tok/s), cosine vs reference >= 0.9995.
+EmbeddingGemma llama.cpp rows were not re-run (still the 2026-10-20 numbers).
+d1 kernel profile now (T=2,989, 5.6 s device): ffn gate|up 2.19 s, ffn down 1.20 s, conv.in 0.46 s, attention
+0.47 s, SwiGLU 0.25 s; GEMMs are ~75% of the forward.
