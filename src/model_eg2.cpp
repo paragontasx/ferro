@@ -215,7 +215,7 @@ static bool layers_gpu(const EG2Model& m, const int* seg, const int* pos, int T,
             ok = ok && gpu::op_gemm_q(L.wqkv.gpu_slot, T, bC)
                     && gpu::op_qkv_post(bC, rowc, T, nq, nkv, hd, g.q_norm, g.k_norm, cb, sb, bpos, rt.rot / 2, eps)
                     && (use_dense
-                            ? (gpu::op_dense_attention_h(bC, rowc, 0, qsz, qsz + ksz, T, nq, nkv, hd, 1.0f, bS, bOB, qsz, L.is_swa ? m.swa_window : -1)
+                            ? (gpu::op_dense_attention_h(bC, rowc, 0, qsz, qsz + ksz, T, nq, nkv, hd, 1.0f, bS, bOB, qsz, L.is_swa ? m.swa_window : -1, capS)
                                && gpu::op_quant_q(bOB, T, qsz))
                             : gpu::op_attention_q(bC, rowc, 0, qsz, qsz + ksz, T, nq, nkv, hd, blo, bhi,
                                                   L.is_swa ? m.swa_window : -1, 1.0f))

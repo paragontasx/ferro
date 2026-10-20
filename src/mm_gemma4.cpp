@@ -199,8 +199,11 @@ static bool encode_image_gpu(Gemma4Proj::Impl& I, const VisionInput& in, std::ve
     std::vector<int> seg_lo(dense ? 0 : T, 0), seg_hi(dense ? 0 : T, T - 1);
     if (!dense && (!gpu::write(I.blo, seg_lo.data(), (size_t)T * 4) || !gpu::write(I.bhi, seg_hi.data(), (size_t)T * 4)))
         return bail("seg bounds");
-    if (dense && (size_t)H * t * t > I.capS) {                        // dense attention scores S[h][i][j]
-        gpu::release(I.bS); I.capS = (size_t)H * t * t; I.bS = gpu::alloc(I.capS * 4);
+    // dense attention scores: tile the queries so the scratch is bounded (64 MB) however many patches there are
+    // (a 1920x1080 photo is 8280 patches: nh*T*T floats would be 3.3 GB and the device refuses the allocation)
+    static const size_t kScratchFloats = (size_t)16 << 20;
+    if (dense && I.capS < std::min((size_t)H * t * t, kScratchFloats)) {
+        gpu::release(I.bS); I.capS = std::min((size_t)H * t * t, kScratchFloats); I.bS = gpu::alloc(I.capS * 4);
         if (!I.bS) { I.capS = 0; return bail("score scratch alloc"); }
     }
     gpu::Buf X = I.bX, C = I.bC, D = I.bD, G = I.bG;
@@ -233,7 +236,7 @@ static bool encode_image_gpu(Gemma4Proj::Impl& I, const VisionInput& in, std::ve
         const G4VLayer& L = I.vl[l]; const auto& g = I.gl[l];
         step(1, gpu::op_gemm_q(g.qkv.gpu_slot, T, C));
         step(2, gpu::op_qkv_post_g4(C, rowc, T, H, H, hd, g.qn, g.kn, I.invf, I.pos_x, I.pos_y, eps));
-        step(3, dense ? (gpu::op_dense_attention(C, rowc, 0, d, 2 * d, 0, T, H, 1.0f, I.bS, D, d) && gpu::op_quant_q(D, T, d))
+        step(3, dense ? (gpu::op_dense_attention_h(C, rowc, 0, d, 2 * d, T, H, H, hd, 1.0f, I.bS, D, d, -1, I.capS) && gpu::op_quant_q(D, T, d))
                       : gpu::op_attention_q(C, rowc, 0, d, 2 * d, T, H, H, hd, I.blo, I.bhi, 0, 1.0f));
         step(4, gpu::op_gemm_q(L.o.w.q.gpu_slot, T, G));
         step(5, gpu::op_row_fused(X, G, g.pa, 1.0f, X, g.ln2, true, true, T, d, eps));

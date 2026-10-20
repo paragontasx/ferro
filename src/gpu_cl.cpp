@@ -1105,20 +1105,21 @@ __kernel void qkv_post_g4(__global float* C, int rowc, int nq, int nkv, int hd, 
 
 
 // dattn_stats with a band mask: only keys with |i - j| < window (window <= 0: all keys) take part in the row max
-__kernel void dattn_stats_w(__global const float* S, int n, float scale, __global float2* st, int window) {
+__kernel void dattn_stats_w(__global const float* S, int n, float scale, __global float2* st, int window, int q0, int nr) {
   __local float red[32];
   const int i = get_group_id(0), h = get_group_id(1), lid = get_local_id(0);
-  const __global float* row = S + ((size_t)h * n + i) * n;
-  const int jlo = window > 0 ? max(0, i - window + 1) : 0, jhi = window > 0 ? min(n - 1, i + window - 1) : n - 1;
+  const __global float* row = S + ((size_t)h * nr + i) * n;
+  const int gi = q0 + i;
+  const int jlo = window > 0 ? max(0, gi - window + 1) : 0, jhi = window > 0 ? min(n - 1, gi + window - 1) : n - 1;
   float m = -1e30f;
   for (int j = jlo + lid; j <= jhi; j += 256) m = fmax(m, row[j]);
   m = wg_max(m, red);
-  if (lid == 0) st[(size_t)h * n + i] = (float2)(m, 0.f);
+  if (lid == 0) st[(size_t)h * nr + i] = (float2)(m, 0.f);
 }
 
 // ---- head-dim generic dense attention (hd multiple of 64), grouped-query: head h reads kv head h / (nq/nkv).
 // QK: identical tile layout to dattn_qk; the 64-wide dot is repeated over hd/64 dim chunks, accumulating in registers.
-__kernel void dattn_qk_h(__global const float* C, int ldc, int qoff, int koff, int n, int hd, int grp, __global float* S) {
+__kernel void dattn_qk_h(__global const float* C, int ldc, int qoff, int koff, int n, int hd, int grp, __global float* S, int q0, int nr) {
   __local float As[64 * 64];
   __local float Bs[64 * 64];
   const int h = get_group_id(2), tx = get_local_id(0), ty = get_local_id(1);
@@ -1129,8 +1130,8 @@ __kernel void dattn_qk_h(__global const float* C, int ldc, int qoff, int koff, i
     barrier(CLK_LOCAL_MEM_FENCE);
     {
       const int r = lid & 63, g = lid >> 6;
-      const bool ra = i0 + r < n, rb = j0 + r < n;
-      const __global float* qa = C + (size_t)(i0 + r) * ldc + qoff + h * hd + d0;
+      const bool ra = i0 + r < nr, rb = j0 + r < n;
+      const __global float* qa = C + (size_t)(q0 + i0 + r) * ldc + qoff + h * hd + d0;
       const __global float* kb = C + (size_t)(j0 + r) * ldc + koff + kvh * hd + d0;
       for (int c4 = g; c4 < 16; c4 += 4) {
         const float4 a = ra ? vload4(c4, qa) : (float4)(0.f);
@@ -1149,9 +1150,9 @@ __kernel void dattn_qk_h(__global const float* C, int ldc, int qoff, int koff, i
       acc3 = mad((float4)(qa.w), kb, acc3);
     }
   }
-  __global float* Sh = S + (size_t)h * n * n;
+  __global float* Sh = S + (size_t)h * nr * n;
   const int jj = j0 + tx * 4;
-#define DQKH_ROW(A, ACC) { const int i = i0 + ty * 4 + (A); if (i < n) { \
+#define DQKH_ROW(A, ACC) { const int i = i0 + ty * 4 + (A); if (i < nr) { \
     if (jj + 3 < n && (n & 3) == 0) vstore4(ACC, 0, Sh + (size_t)i * n + jj); \
     else { if (jj < n) Sh[(size_t)i * n + jj] = ACC.x; if (jj + 1 < n) Sh[(size_t)i * n + jj + 1] = ACC.y; \
            if (jj + 2 < n) Sh[(size_t)i * n + jj + 2] = ACC.z; if (jj + 3 < n) Sh[(size_t)i * n + jj + 3] = ACC.w; } } }
@@ -1160,18 +1161,18 @@ __kernel void dattn_qk_h(__global const float* C, int ldc, int qoff, int koff, i
 }
 // PV: O[i][h*hd + c0 + col] = sum_j P[h][i][j] V[j][kvh*hd + c0 + col]; one WG per (64 rows, head, 64-wide output column block).
 __kernel void dattn_pv_h(__global const float* S, __global const float2* st, float scale, __global const float* C, int ldc,
-                         int voff, int n, int hd, int grp, __global float* O, int ldo, int window) {
+                         int voff, int n, int hd, int grp, __global float* O, int ldo, int window, int q0, int nr) {
   __local float Ps[32 * 64];
   __local float Vs[32 * 64];
   const int hb = get_group_id(1), tx = get_local_id(0), ty = get_local_id(1);
   const int nblk = hd / 64, h = hb / nblk, cb = hb % nblk, kvh = h / grp;
   const int i0 = get_group_id(0) * 64, lid = ty * 16 + tx;
-  const __global float* Sh = S + (size_t)h * n * n;
+  const __global float* Sh = S + (size_t)h * nr * n;
   float4 acc0 = (float4)(0.f), acc1 = acc0, acc2 = acc0, acc3 = acc0;
   const int r = lid & 63, g = lid >> 6;
-  const bool rok = i0 + r < n;
+  const bool rok = i0 + r < nr;
   const float L2E = 1.4426950408889634f;
-  const float sl2 = scale * L2E, ml2 = rok ? st[(size_t)h * n + i0 + r].x * sl2 : 0.f;
+  const float sl2 = scale * L2E, ml2 = rok ? st[(size_t)h * nr + i0 + r].x * sl2 : 0.f;
   float psum = 0.f;
   __local float tot[256];
   for (int k0 = 0; k0 < n; k0 += 32) {
@@ -1187,7 +1188,7 @@ __kernel void dattn_pv_h(__global const float* S, __global const float2* st, flo
         if (kk + 2 < n) p.z = native_exp2(sr[2] * sl2 - ml2);
       }
       if (window > 0 && rok) {                        // band mask: keys with |i - j| >= window contribute nothing
-        const int gi = i0 + r;
+        const int gi = q0 + i0 + r;
         if (abs(gi - (kk + 0)) >= window) p.x = 0.f;
         if (abs(gi - (kk + 1)) >= window) p.y = 0.f;
         if (abs(gi - (kk + 2)) >= window) p.z = 0.f;
@@ -1214,7 +1215,7 @@ __kernel void dattn_pv_h(__global const float* S, __global const float2* st, flo
   barrier(CLK_LOCAL_MEM_FENCE);
 #define DPVH_ROW(A, ACC) { const int rr = ty * 4 + (A), i = i0 + rr; \
     const float inv = 1.0f / (tot[rr] + tot[64 + rr] + tot[128 + rr] + tot[192 + rr]); \
-    if (i < n) vstore4(ACC * inv, 0, O + (size_t)i * ldo + h * hd + cb * 64 + tx * 4); }
+    if (i < nr) vstore4(ACC * inv, 0, O + (size_t)(q0 + i) * ldo + h * hd + cb * 64 + tx * 4); }
   DPVH_ROW(0, acc0) DPVH_ROW(1, acc1) DPVH_ROW(2, acc2) DPVH_ROW(3, acc3)
 #undef DPVH_ROW
 }
@@ -1483,22 +1484,39 @@ bool op_qkv_post_g4(Buf C, int rowc, int T, int nq, int nkv, int hd, Buf qw, Buf
 
 // head-dim generic dense attention for one fully visible segment of n tokens (hd multiple of 64): f32 output O[n][nq*hd].
 // S: scratch of nq*n*n floats. The softmax max reuses dattn_stats (dimension independent).
-bool op_dense_attention_h(Buf C, int ldc, int qoff, int koff, int voff, int n, int nq, int nkv, int hd, float scale, Buf S, Buf O, int ldo, int window) {
+bool op_dense_attention_h(Buf C, int ldc, int qoff, int koff, int voff, int n, int nq, int nkv, int hd, float scale, Buf S, Buf O, int ldo, int window, size_t s_floats) {
     if (hd % 64 || hd > 512 || nq % nkv) return false;
     const int grp = nq / nkv;
-    const size_t nt = (size_t)(n + 63) / 64;
-    set_args(k_dqkh, C, (cl_int)ldc, (cl_int)qoff, (cl_int)koff, (cl_int)n, (cl_int)hd, (cl_int)grp, S);
-    size_t g1[3] = {nt * 16, nt * 16, (size_t)nq}, l1[3] = {16, 16, 1};
-    if (!launch(k_dqkh, 3, g1, l1)) return false;
+    // query tile: the score scratch holds nq * rows * n floats
+    int rows = (int)std::min<size_t>((size_t)n, s_floats / ((size_t)nq * n));
+    rows = std::max(64, rows & ~63);                                 // whole 64-row tiles
+    if ((size_t)nq * rows * n > s_floats) return false;
     static Buf g_dst = nullptr; static size_t g_dstcap = 0;
-    const size_t stb = (size_t)nq * n * 8;
+    const size_t stb = (size_t)nq * rows * 8;
     if (stb > g_dstcap) { if (g_dst) release(g_dst); g_dst = alloc(stb); g_dstcap = g_dst ? stb : 0; if (!g_dst) return false; }
-    set_args(k_dsmw, S, (cl_int)n, scale, g_dst, (cl_int)window);
-    size_t g2[2] = {(size_t)n * 256, (size_t)nq}, l2[2] = {256, 1};
-    if (!launch(k_dsmw, 2, g2, l2)) return false;
-    set_args(k_dpvh, S, g_dst, scale, C, (cl_int)ldc, (cl_int)voff, (cl_int)n, (cl_int)hd, (cl_int)grp, O, (cl_int)ldo, (cl_int)window);
-    size_t g3[2] = {nt * 16, (size_t)nq * (hd / 64) * 16}, l3[2] = {16, 16};
-    return launch(k_dpvh, 2, g3, l3);
+    static const bool aprof = getenv("FERRO_TIME") != nullptr;   // ATTNH_PROF
+    static double at[3] = {0, 0, 0}; static bool areg = false;
+    if (aprof && !areg) { areg = true; atexit([] { fprintf(stderr, "[gpu] dense attention_h: qk %.0f ms  stats %.0f ms  pv %.0f ms\n", at[0] * 1e3, at[1] * 1e3, at[2] * 1e3); }); }
+    auto lapa = [&](int k, std::chrono::steady_clock::time_point& t0) { if (!aprof) return; finish(); auto t = std::chrono::steady_clock::now(); at[k] += std::chrono::duration<double>(t - t0).count(); t0 = t; };
+    for (int q0 = 0; q0 < n; q0 += rows) {
+        auto ta0 = std::chrono::steady_clock::now();
+        const int nr = std::min(rows, n - q0);
+        const size_t qt = (size_t)(nr + 63) / 64, kt = (size_t)(n + 63) / 64;
+        set_args(k_dqkh, C, (cl_int)ldc, (cl_int)qoff, (cl_int)koff, (cl_int)n, (cl_int)hd, (cl_int)grp, S, (cl_int)q0, (cl_int)nr);
+        size_t g1[3] = {kt * 16, qt * 16, (size_t)nq}, l1[3] = {16, 16, 1};
+        if (!launch(k_dqkh, 3, g1, l1)) return false;
+        lapa(0, ta0);
+        set_args(k_dsmw, S, (cl_int)n, scale, g_dst, (cl_int)window, (cl_int)q0, (cl_int)nr);
+        size_t g2[2] = {(size_t)nr * 256, (size_t)nq}, l2[2] = {256, 1};
+        if (!launch(k_dsmw, 2, g2, l2)) return false;
+        lapa(1, ta0);
+        set_args(k_dpvh, S, g_dst, scale, C, (cl_int)ldc, (cl_int)voff, (cl_int)n, (cl_int)hd, (cl_int)grp, O, (cl_int)ldo, (cl_int)window, (cl_int)q0, (cl_int)nr);
+        size_t g3[2] = {qt * 16, (size_t)nq * (hd / 64) * 16}, l3[2] = {16, 16};
+        if (!launch(k_dpvh, 2, g3, l3)) return false;
+        lapa(2, ta0);
+        if (q0 + rows < n && !finish()) return false;                 // bounded submissions (i915 watchdog); also orders the scratch reuse
+    }
+    return true;
 }
 
 bool op_qkv_post(Buf C, int rowc, int T, int nq, int nkv, int hd, Buf qw, Buf kw, Buf cosb, Buf sinb, Buf pos, int hlf, float eps, bool norm_v) {
