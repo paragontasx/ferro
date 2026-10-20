@@ -30,7 +30,11 @@ using clk = std::chrono::steady_clock;
 static void usage() {
     fprintf(stderr,
         "usage: ferro-embed embed|bench --model EMB.gguf [--in f|--tokens f] [--out f] [--threads N] [--max-tokens T] [--reps R] [--int8] [--cpu|--gpu|--hetero]\n"
-        "       ferro-embed decide --model D1.gguf --request req.json|- [--mmproj P.gguf] [--out f] [--threads N] [--reps R] [--cpu|--gpu]\n");
+        "       ferro-embed decide --model D1.gguf --request req.json|- [--mmproj P.gguf] [--out f] [--threads N] [--reps R] [--cpu|--gpu]\n"
+        "       ferro-embed embed-media --model EG2.gguf [--mmproj P.gguf] --item text:STR|image:F|audio:F|video:F ... [--fps N] [--out f.bin]\n"
+        "                   (multimodal EmbeddingGemma 2: items are interleaved in order into one 768-d embedding; vision/audio encoders on the iGPU)\n"
+        "       ferro-embed mm-embed --mmproj P.gguf --media image|audio --out f.bin     (per-chunk encoder output, mm_ref format)\n"
+        "       ferro-embed mel-dump --media in.f32 --out mel.bin                        (Gemma 4 audio log-mel frontend only)\n");
     exit(2);
 }
 

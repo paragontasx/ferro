@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <chrono>
 #include <immintrin.h>
 #include <stdexcept>
 
@@ -83,23 +84,27 @@ static std::vector<float> sscp(const Gemma4Proj::Impl& I, const Mel& mel, int& n
     const int couts[2] = {128, 32};
     for (int li = 0; li < 2; ++li) {
         const int Co = couts[li], Ho = (H - 1) / 2 + 1, Wo = (W - 1) / 2 + 1;
-        const float* w = I.a_conv_w[li].data();                  // [Co][C][3][3], KW along mel, KH along time
-        std::vector<float> out((size_t)Co * Ho * Wo);
+        // im2col [Ho*Wo][C*9] (patch order c, kh, kw = the weight's [Co][C][3][3] order) then one GEMM: out[pos][Co]
+        const int K = C * 9, NP = Ho * Wo;
+        std::vector<float> col((size_t)NP * K), gem((size_t)NP * Co);
         Pool::get().parallel_for(Ho, [&](int lo, int hi) {
             for (int y = lo; y < hi; ++y)
-                for (int xx = 0; xx < Wo; ++xx)
-                    for (int o = 0; o < Co; ++o) {
-                        float acc = 0;
-                        for (int c = 0; c < C; ++c)
-                            for (int kh = 0; kh < 3; ++kh) {
-                                const int iy = 2 * y - 1 + kh; if (iy < 0 || iy >= H) continue;
-                                for (int kw = 0; kw < 3; ++kw) {
-                                    const int ix = 2 * xx - 1 + kw; if (ix < 0 || ix >= W) continue;
-                                    acc += w[(((size_t)o * C + c) * 3 + kh) * 3 + kw] * cur[((size_t)c * H + iy) * W + ix];
-                                }
+                for (int xx = 0; xx < Wo; ++xx) {
+                    float* o = col.data() + ((size_t)y * Wo + xx) * K;
+                    for (int c = 0; c < C; ++c)
+                        for (int kh = 0; kh < 3; ++kh) {
+                            const int iy = 2 * y - 1 + kh;
+                            for (int kw = 0; kw < 3; ++kw) {
+                                const int ix = 2 * xx - 1 + kw;
+                                *o++ = (iy < 0 || iy >= H || ix < 0 || ix >= W) ? 0.0f : cur[((size_t)c * H + iy) * W + ix];
                             }
-                        out[((size_t)o * Ho + y) * Wo + xx] = acc;
-                    }
+                        }
+                }
+        });
+        gemm_f32(I.a_conv_w[li].data(), Co, K, col.data(), NP, gem.data(), Co);
+        std::vector<float> out((size_t)Co * NP);                 // back to [Co][Ho][Wo]
+        Pool::get().parallel_for(Co, [&](int lo, int hi) {
+            for (int o = lo; o < hi; ++o) for (int p = 0; p < NP; ++p) out[(size_t)o * NP + p] = gem[(size_t)p * Co + o];
         });
         // LayerNorm over channels at every (y, x): weight, no bias, eps 1e-6; then ReLU; round for the next conv's im2col
         const float* nw = I.a_conv_norm[li].data();
@@ -133,7 +138,11 @@ std::vector<float> Gemma4Proj::encode_audio(const Mel& mel) {
     if (!a_ok_) throw std::runtime_error("mmproj has no gemma4a audio encoder");
     Impl& I = *impl_;
     int N = 0;
+    static const bool tm = getenv("G4A_TIME") != nullptr;     // phase timing (ms): sscp | ffn | attention | conv module | tail
+    double tp[5] = {0, 0, 0, 0, 0}; auto t0 = std::chrono::steady_clock::now();
+    auto lap = [&](int k) { if (!tm) return; auto t = std::chrono::steady_clock::now(); tp[k] += std::chrono::duration<double, std::milli>(t - t0).count(); t0 = t; };
     std::vector<float> X = sscp(I, mel, N);                      // [N][d]
+    lap(0);
     const int d = I.a_d, H = I.a_heads, hd = I.a_hd, ffn = I.a_ffn;
     const float eps = 1e-6f;
     constexpr int C = 12, P = 12, S = C + P, R = P + 1;
@@ -160,6 +169,7 @@ std::vector<float> Gemma4Proj::encode_audio(const Mel& mel) {
     for (int l = 0; l < I.a_layers; ++l) {
         auto& L = I.al[l];
         ffn_block(L.ffn_up, L.ffn_down, L.ffn_norm, L.ffn_post_norm);
+        lap(1);
         // ---- chunked local self-attention with relative position bias
         rms_rows(X.data(), N, d, L.attn_pre_norm.data(), eps, xn.data());
         capply(L.q, xn.data(), N, Q.data(), scratch); capply(L.k, xn.data(), N, K.data(), scratch); capply(L.v, xn.data(), N, V.data(), scratch);
@@ -222,6 +232,7 @@ std::vector<float> Gemma4Proj::encode_audio(const Mel& mel) {
         capply(L.o, O.data(), N, Y.data(), scratch);
         rms_rows(Y.data(), N, d, L.attn_post_norm.data(), eps, Y.data());
         for (size_t i = 0; i < (size_t)N * d; ++i) X[i] += Y[i];
+        lap(2);
         // ---- convolution module: RMS norm -> pw1 -> GLU -> causal depthwise conv (k = 5) -> RMS norm -> SiLU -> pw2
         rms_rows(X.data(), N, d, L.norm_conv.data(), eps, xn.data());
         std::vector<float> G2((size_t)N * 2 * d), Gl((size_t)N * d), Dw((size_t)N * d);
@@ -237,9 +248,11 @@ std::vector<float> Gemma4Proj::encode_audio(const Mel& mel) {
         for (size_t i = 0; i < Dw.size(); ++i) Dw[i] = silu(Dw[i]);
         capply(L.pw2, Dw.data(), N, Y.data(), scratch);
         for (size_t i = 0; i < (size_t)N * d; ++i) X[i] += Y[i];
+        lap(3);
         // ---- second half-step FFN, then the layer output norm
         ffn_block(L.ffn_up1, L.ffn_down1, L.ffn_norm1, L.ffn_post_norm1);
         rms_rows(X.data(), N, d, L.ln2.data(), eps, X.data());
+        lap(1);
     }
     // ---- tail: output projection (+bias) -> weightless RMSNorm -> mm.a.input_projection
     const int d2 = I.a_out_proj.w.rows;
@@ -249,6 +262,8 @@ std::vector<float> Gemma4Proj::encode_audio(const Mel& mel) {
     rms_rows(T1.data(), N, d2, nullptr, eps, T1.data());
     std::vector<float> out((size_t)N * I.a_mm_proj.w.rows);
     capply(I.a_mm_proj, T1.data(), N, out.data(), scratch);
+    lap(4);
+    if (tm) fprintf(stderr, "[g4a-time] N=%d  sscp %.0f  ffn %.0f  attention %.0f  conv module %.0f  tail %.0f ms\n", N, tp[0], tp[1], tp[2], tp[3], tp[4]);
     return out;
 }
 

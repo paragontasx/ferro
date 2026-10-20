@@ -102,11 +102,22 @@ static void g4_dump(const char* pfx, int layer, const float* x, size_t n) {
 static gpu::Buf up_vec(const std::vector<float>& v) { return gpu::upload(v.data(), v.size() * 4); }
 
 void Gemma4Proj::upload_gpu() {
-    if (!v_ok_ || !impl_) return;
+    if (!impl_ || (!v_ok_ && !a_ok_)) return;
     Impl& I = *impl_;
     const char* env = getenv("FERRO_MM_GPU");
     if (env && atoi(env) == 0) return;
     if (!gpu::available()) return;
+    if (a_ok_) {                                  // audio: every Q8 linear resident on the device; apply() routes the GEMMs there
+        const char* ae = getenv("FERRO_MM_AUDIO_GPU");
+        if (!ae || atoi(ae) != 0) {
+            int up = 0, tot = 0;
+            auto slot = [&](CLin& c) { ++tot; if (!c.w.q.empty() && c.w.q.gpu_slot < 0) { c.w.q.gpu_slot = gpu::upload_q8(c.w.q); } up += c.w.q.gpu_slot >= 0; };
+            for (auto& L : I.al) for (CLin* c : {&L.ffn_up, &L.ffn_down, &L.ffn_up1, &L.ffn_down1, &L.q, &L.k, &L.v, &L.o, &L.k_rel, &L.pw1, &L.pw2}) slot(*c);
+            slot(I.a_out_proj); slot(I.a_mm_proj);
+            if (getenv("FERRO_VERBOSE")) fprintf(stderr, "[g4a] %d/%d audio linears resident on the iGPU\n", up, tot);
+        }
+    }
+    if (!v_ok_) return;
     bool ok = true;
     auto slot = [&](WMat& W) { if (W.gpu_slot < 0) W.gpu_slot = gpu::upload_q8(W); ok = ok && W.gpu_slot >= 0; };
     for (auto& L : I.vl) if (L.q.w.q.empty() || L.gate.w.q.empty()) ok = false;       // f32 weights: not supported on-device

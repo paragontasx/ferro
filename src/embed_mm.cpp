@@ -4,6 +4,7 @@
 #include "threadpool.h"
 #include "gpu_cl.h"
 
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -145,6 +146,8 @@ bool MmEmbedder::embed(const std::vector<EmbedItem>& items, const MmEmbedOptions
         }
         if (tok_.eos_id() >= 0) push_tok(tok_.eos_id());
     } catch (const std::exception& e) { *err = e.what(); return false; }
+    static const bool tm = getenv("EMB_TIME") != nullptr;   // EMB_TIME=1: split media encode vs text-model time
+    const auto t_enc_end = std::chrono::steady_clock::now();
     const int T = (int)ids.size();
     if (n_tokens) *n_tokens = T;
     if (T > 8192) { *err = "input is " + std::to_string(T) + " tokens; the model context is 8192"; return false; }
@@ -152,6 +155,7 @@ bool MmEmbedder::embed(const std::vector<EmbedItem>& items, const MmEmbedOptions
     for (int t = 0; t < T; ++t) pos[t] = t;
     out.assign(eng_.dim_out(), 0.0f);
     eng_.encode_mm(ids.data(), seg.data(), pos.data(), T, 1, out.data(), rows.data(), midx.data());
+    if (tm) fprintf(stderr, "[emb-time] text model over %d tokens: %.0f ms\n", T, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_enc_end).count());
     return true;
 }
 

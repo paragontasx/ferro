@@ -114,8 +114,6 @@ def main():
     worst, rows, fails = 1.0, [], 0
     for name, items in CASES:
         if ONLY and name not in ONLY: continue
-        if any(k == "video" for k, _ in items):
-            rows.append((name, "-", "-", "SKIP (video reference handled by --video-ref)")); continue
         try: ref = ref_embed(marker, items, cache)
         except Exception as e:
             rows.append((name, "-", "-", f"REF FAIL {e}")); fails += 1; continue
