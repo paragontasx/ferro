@@ -756,7 +756,7 @@ __kernel void silu_mul_q8(__global const float* G, int FF, __global uint* Xp, __
   const int t = get_group_id(0), lid = get_local_id(0);
   const __global float* g = G + (size_t)t * 2 * FF;
   const float8 x = vload8(lid, g);
-  quant_lane8(x / (1.0f + exp(-x)) * vload8(lid, g + FF), am, Xp, Xs, t, FF);
+  quant_lane8(x / (1.0f + native_exp2(x * -1.4426950408889634f)) * vload8(lid, g + FF), am, Xp, Xs, t, FF);
 }
 // act(G + b) -> int8. act: 0 none, 1 relu, 2 gelu (tanh approximation), 3 gelu (erf). WG per token, LS = cols/8.
 __kernel void bias_act_q8(__global const float* G, __global const float* b, int act, __global uint* Xp, __global float* Xs, int cols) {
@@ -905,7 +905,7 @@ __kernel void attention_q5(__global const float* C, int ldc, int qoff, int koff,
   for (int i = 0; i < QT5; ++i) { ptlo = min(ptlo, rmin[i]); pthi = max(pthi, rmax[i]); }
   const int otlo = seg_lo[t0], othi = seg_hi[min(t0 + QT5 - 1, T - 1)];
   const __global float* qr = C + (size_t)t * ldc + qoff + h * 64;
-  for (int i = 0; i < 16; ++i) vstore4(vload4(i, qr) * scale, i, Qs + lid * 68);
+  for (int i = 0; i < 16; ++i) vstore4(vload4(i, qr) * (scale * 1.4426950408889634f), i, Qs + lid * 68);
   float4 acc[16];
   for (int i = 0; i < 16; ++i) acc[i] = (float4)(0.f);
   float m = -1e30f, l = 0.f;
@@ -936,11 +936,11 @@ __kernel void attention_q5(__global const float* C, int ldc, int qoff, int koff,
       const float sj = sc[j];
       if (sj < -1e29f) continue;
       if (sj > m) {
-        const float a = exp(m - sj);
+        const float a = native_exp2(m - sj);
         for (int i = 0; i < 16; ++i) acc[i] *= a;
         l *= a; m = sj;
       }
-      const float p = exp(sj - m);
+      const float p = native_exp2(sj - m);
       l += p;
       for (int i = 0; i < 16; ++i) acc[i] = mad((float4)(p), vload4(i, Vs + j * 64), acc[i]);
     }
