@@ -151,7 +151,12 @@ static bool layers_gpu(const EG2Model& m, const int* seg, const int* pos, int T,
         for (int k = t; k <= u; ++k) { lo[k] = t; hi[k] = u; }
         maxseg = std::max(maxseg, u - t + 1); t = u + 1;
     }
-    if (maxseg > gpu::attn_max_seg()) return false;
+    // the lane-per-key kernels cap a segment at ATTN_MAXS; the dense kernels do not (their cost is the T x T score scratch,
+    // nq*T*T floats, capped at 128 MB here ~ T <= 2900) -- decide that first
+    static const bool dense_off0 = getenv("FERRO_GPU_DENSE_TEXT") && atoi(getenv("FERRO_GPU_DENSE_TEXT")) == 0;
+    int max_nq0 = 0; for (auto& L : m.layers) max_nq0 = std::max(max_nq0, L.n_head);
+    const bool dense_fits = !dense_off0 && maxseg == T && (size_t)max_nq0 * (size_t)T * T * 4 <= (128u << 20);
+    if (maxseg > gpu::attn_max_seg() && !dense_fits) return false;
     if (T > Tcap) {
         for (gpu::Buf* b : {&bA, &bB, &bC, &bOB, &bD, &bE, &bG, &bF, &bI, &bH, &bpos, &blo, &bhi}) { gpu::release(*b); *b = nullptr; }
         const size_t t = (size_t)std::max(T, 64);
@@ -168,7 +173,7 @@ static bool layers_gpu(const EG2Model& m, const int* seg, const int* pos, int T,
     static const bool dense_off = getenv("FERRO_GPU_DENSE_TEXT") && atoi(getenv("FERRO_GPU_DENSE_TEXT")) == 0;
     static const int dense_min = getenv("FERRO_GPU_DENSE_MIN") ? atoi(getenv("FERRO_GPU_DENSE_MIN")) : 96;
     const bool single_seg = (maxseg == T);
-    const bool dense_text = !dense_off && single_seg && T >= dense_min;
+    const bool dense_text = !dense_off && single_seg && T >= dense_min && dense_fits;
     if (dense_text) {
         int max_nq = 0; for (auto& L : m.layers) max_nq = std::max(max_nq, L.n_head);
         const size_t need = (size_t)max_nq * T * T;
