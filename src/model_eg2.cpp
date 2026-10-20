@@ -136,6 +136,7 @@ static bool layers_gpu(const EG2Model& m, const int* seg, const int* pos, int T,
     const int E0 = m.n_embd, FF = m.n_ff, NPL = m.n_pl;
     static int Tcap = 0;
     static gpu::Buf bA, bB, bC, bOB, bD, bE, bG, bF, bI, bH, bpos, blo, bhi;
+    static gpu::Buf bS = nullptr; static size_t capS = 0;     // dense-attention scores [nq][T][T] (long single sequences)
     static std::vector<int> lo, hi;
     int max_rowc = 0, max_qsz = 0;
     for (auto& L : m.layers) {
@@ -162,6 +163,19 @@ static bool layers_gpu(const EG2Model& m, const int* seg, const int* pos, int T,
         for (gpu::Buf b : {bA, bB, bC, bOB, bD, bE, bG, bF, bI, bH, bpos, blo, bhi}) if (!b) { Tcap = 0; return false; }
         Tcap = (int)t;
     }
+    // Long single sequences: the lane-per-key attention kernels are O(T) serial per query (660 tokens = 90% of the forward).
+    // Use the head-dim generic dense kernels when ONE segment covers all tokens and the sliding window cannot cut anything.
+    static const bool dense_off = getenv("FERRO_GPU_DENSE_TEXT") && atoi(getenv("FERRO_GPU_DENSE_TEXT")) == 0;
+    static const int dense_min = getenv("FERRO_GPU_DENSE_MIN") ? atoi(getenv("FERRO_GPU_DENSE_MIN")) : 96;
+    const bool single_seg = (maxseg == T);
+    const bool dense_text = !dense_off && single_seg && T >= dense_min;
+    if (dense_text) {
+        int max_nq = 0; for (auto& L : m.layers) max_nq = std::max(max_nq, L.n_head);
+        const size_t need = (size_t)max_nq * T * T;
+        if (need > capS) { gpu::release(bS); capS = need; bS = gpu::alloc(capS * 4); if (!bS) capS = 0; }
+    }
+    const bool use_dense = dense_text && bS != nullptr;
+    if (getenv("FERRO_VERBOSE")) fprintf(stderr, "[gpu] text attention: T=%d single_seg=%d swa_window=%d min=%d -> %s\n", T, (int)single_seg, m.swa_window, dense_min, use_dense ? "dense" : "lane-per-key");
     bool ok = gpu::write(bA, A, (size_t)T * E0 * 4) &&
               gpu::write(bpos, pos, (size_t)T * 4) && gpu::write(blo, lo.data(), (size_t)T * 4) &&
               gpu::write(bhi, hi.data(), (size_t)T * 4);
@@ -195,8 +209,11 @@ static bool layers_gpu(const EG2Model& m, const int* seg, const int* pos, int T,
             const bool last = (il + 1 == m.n_layer);
             ok = ok && gpu::op_gemm_q(L.wqkv.gpu_slot, T, bC)
                     && gpu::op_qkv_post(bC, rowc, T, nq, nkv, hd, g.q_norm, g.k_norm, cb, sb, bpos, rt.rot / 2, eps)
-                    && gpu::op_attention_q(bC, rowc, 0, qsz, qsz + ksz, T, nq, nkv, hd, blo, bhi,
-                                           L.is_swa ? m.swa_window : -1, 1.0f)
+                    && (use_dense
+                            ? (gpu::op_dense_attention_h(bC, rowc, 0, qsz, qsz + ksz, T, nq, nkv, hd, 1.0f, bS, bOB, qsz, L.is_swa ? m.swa_window : -1)
+                               && gpu::op_quant_q(bOB, T, qsz))
+                            : gpu::op_attention_q(bC, rowc, 0, qsz, qsz + ksz, T, nq, nkv, hd, blo, bhi,
+                                                  L.is_swa ? m.swa_window : -1, 1.0f))
                     && gpu::op_gemm_q(L.wo.gpu_slot, T, bD)
                     && gpu::op_row_fused(bA, bD, g.attn_post_norm, 1.0f, bE, g.ffn_norm, true, true, T, E0, eps)
                     && gpu::op_gemm_q(L.ffn_gateup.gpu_slot, T, bG)
