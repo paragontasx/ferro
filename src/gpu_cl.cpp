@@ -75,7 +75,10 @@ __kernel void q8gemm(__global const uint* restrict Wp, __global const float* res
   const int nb = cols / 32, cw = cols / 4;
   float4 acc[TT];
   for (int j = 0; j < TT; ++j) acc[j] = (float4)(0.f);
+  const int R4 = rows >> 2, gx = r4 >> 2;
   for (int b0 = 0; b0 < nb; b0 += KB) {
+    const __global uint4* Wb = (const __global uint4*)Wp + (size_t)(b0 * 8) * R4 + gx;
+    const __global float4* Sb = (const __global float4*)Ws + (size_t)b0 * R4 + gx;
     barrier(CLK_LOCAL_MEM_FENCE);
     for (int i = lid; i < TT * KB * 8; i += LW) {
       int j = i / (KB * 8), rem = i - j * (KB * 8); int t = min(t0 + j, T - 1);
@@ -88,10 +91,10 @@ __kernel void q8gemm(__global const uint* restrict Wp, __global const float* res
     barrier(CLK_LOCAL_MEM_FENCE);
     for (int bb = 0; bb < KB; ++bb) {
       const int b = b0 + bb;
-      const __global uint* wp = Wp + (size_t)b * 8 * rows + r4;
+      // 32-bit typed indexing: 64-bit address multiplies are emulated on Xe-LP and cost ~1/3 of GEMM throughput
       uint4 w[8];
-      for (int k = 0; k < 8; ++k) w[k] = vload4(0, wp + (size_t)k * rows);
-      const float4 ws = vload4(0, Ws + (size_t)b * rows + r4);
+      for (int k = 0; k < 8; ++k) w[k] = Wb[(bb * 8 + k) * R4];
+      const float4 ws = Sb[bb * R4];
       for (int j = 0; j < TT; ++j) {
         const __local uint* xp = xq + (j * KB + bb) * 8;
         uint4 xa = vload4(0, xp), xb = vload4(1, xp);
@@ -125,7 +128,10 @@ __kernel void q8gemm_sw(__global const uint* restrict Wp, __global const float* 
   const int nb = cols / 32, cw = cols / 4;
   float4 acc[TT];
   for (int j = 0; j < TT; ++j) acc[j] = (float4)(0.f);
+  const int R4 = rows >> 2, gx = r4 >> 2;
   for (int b0 = 0; b0 < nb; b0 += KB) {
+    const __global uint4* Wb = (const __global uint4*)Wp + (size_t)(b0 * 8) * R4 + gx;
+    const __global float4* Sb = (const __global float4*)Ws + (size_t)b0 * R4 + gx;
     barrier(CLK_LOCAL_MEM_FENCE);
     for (int i = lid; i < TT * KB * 8; i += LW) {
       int j = i / (KB * 8), rem = i - j * (KB * 8); int t = min(t0 + j, T - 1);
@@ -138,10 +144,10 @@ __kernel void q8gemm_sw(__global const uint* restrict Wp, __global const float* 
     barrier(CLK_LOCAL_MEM_FENCE);
     for (int bb = 0; bb < KB; ++bb) {
       const int b = b0 + bb;
-      const __global uint* wp = Wp + (size_t)b * 8 * rows + r4;
+      // 32-bit typed indexing: 64-bit address multiplies are emulated on Xe-LP and cost ~1/3 of GEMM throughput
       uint4 w[8];
-      for (int k = 0; k < 8; ++k) w[k] = vload4(0, wp + (size_t)k * rows);
-      const float4 ws = vload4(0, Ws + (size_t)b * rows + r4);
+      for (int k = 0; k < 8; ++k) w[k] = Wb[(bb * 8 + k) * R4];
+      const float4 ws = Sb[bb * R4];
       for (int j = 0; j < TT; ++j) {
         const __local uint* xp = xq + (j * KB + bb) * 8;
         uint4 xa = vload4(0, xp), xb = vload4(1, xp);
