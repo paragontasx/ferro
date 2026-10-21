@@ -1,4 +1,4 @@
-# ferro-embed
+# Ferro
 
 Lightweight inference engine for Intel low-power SoCs (N100-class) that runs two models from one
 binary, **on the integrated GPU by default** (OpenCL, int8 DP4A) with automatic CPU fallback:
