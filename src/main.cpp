@@ -10,6 +10,7 @@
 #include "mm_encoder.h"
 #include "mm_gemma4.h"
 #include "embed_mm.h"
+#include "server.h"
 #include "gpu_cl.h"
 #include "tokenizer.h"
 #include "threadpool.h"
@@ -33,6 +34,8 @@ static void usage() {
         "       ferro-embed decide --model D1.gguf --request req.json|- [--mmproj P.gguf] [--out f] [--threads N] [--reps R] [--cpu|--gpu]\n"
         "       ferro-embed embed-media --model EG2.gguf [--mmproj P.gguf] --item text:STR|image:F|audio:F|video:F ... [--fps N] [--out f.bin]\n"
         "                   (multimodal EmbeddingGemma 2: items are interleaved in order into one 768-d embedding; vision/audio encoders on the iGPU)\n"
+        "       ferro-embed serve --model EG2.gguf [--mmproj P.gguf] [--host H] [--port N] [--api-key K] [--max-batch-tokens N] [--batch-wait-ms N]\n"
+        "                   (resident OpenAI-compatible server: POST /v1/embeddings with text / image_url / input_audio / video_url parts, GET /v1/models, GET /health)\n"
         "       ferro-embed mm-embed --mmproj P.gguf --media image|audio --out f.bin     (per-chunk encoder output, mm_ref format)\n"
         "       ferro-embed mel-dump --media in.f32 --out mel.bin                        (Gemma 4 audio log-mel frontend only)\n");
     exit(2);
@@ -326,6 +329,7 @@ int main(int argc, char** argv) {
     std::string model, inp, tokf, outp, reqf, mmproj, media;
     std::vector<std::string> items;   // embed-media: ordered text:/image:/audio:/video: items
     float video_fps = 4.0f;
+    ServerOptions so;                 // serve: --host --port --api-key --model-name --max-batch-tokens --batch-wait-ms --max-queue --max-body-mb
     int threads = 0, maxtok = 2048, reps = 5;  // 0 = auto: power-limited SoCs run best on 2 cores
     bool int8 = false;
     for (int i = 2; i < argc; ++i) {
@@ -346,11 +350,25 @@ int main(int argc, char** argv) {
         else if (a == "--threads") threads = atoi(next("--threads"));
         else if (a == "--max-tokens") maxtok = atoi(next("--max-tokens"));
         else if (a == "--reps") reps = atoi(next("--reps"));
+        else if (a == "--host") so.host = next("--host");
+        else if (a == "--port") so.port = atoi(next("--port"));
+        else if (a == "--api-key") so.api_key = next("--api-key");
+        else if (a == "--model-name") so.model_name = next("--model-name");
+        else if (a == "--max-batch-tokens") so.max_batch_tokens = atoi(next("--max-batch-tokens"));
+        else if (a == "--batch-wait-ms") so.batch_wait_ms = atoi(next("--batch-wait-ms"));
+        else if (a == "--max-queue") so.max_queue = atoi(next("--max-queue"));
+        else if (a == "--max-body-mb") so.max_body_mb = (size_t)atoll(next("--max-body-mb"));
         else if (a == "--int8") int8 = true;
         else if (a == "--cpu") setenv("FERRO_GPU", "0", 1);            // force CPU path
         else if (a == "--gpu") setenv("FERRO_GPU", "1", 1);            // iGPU (default when available)
         else if (a == "--hetero") { setenv("FERRO_GPU", "1", 1); setenv("FERRO_HETERO", "1", 1); }  // CPU+iGPU split
         else usage();
+    }
+    if (cmd == "serve") {
+        if (model.empty()) { fprintf(stderr, "serve --model EG2.gguf [--mmproj P.gguf] [--host 127.0.0.1] [--port 8080] [--api-key K]\n"); return 2; }
+        so.model = model; so.mmproj = mmproj; so.threads = threads > 0 ? threads : 2; so.video_fps = video_fps;
+        if (so.api_key.empty()) if (const char* k = getenv("FERRO_API_KEY")) so.api_key = k;
+        return run_server(so);
     }
     if (cmd == "embed-media") {
         if (model.empty() || items.empty()) { fprintf(stderr, "embed-media --model M.gguf [--mmproj P.gguf] --item text:STR|image:F|audio:F|video:F ... [--fps N] [--out f.bin]\n"); return 2; }

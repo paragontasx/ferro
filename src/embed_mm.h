@@ -31,6 +31,12 @@ public:
     bool embed(const std::vector<EmbedItem>& items, const MmEmbedOptions& opt, std::vector<float>& out, std::string* err,
                int* n_tokens = nullptr);
     int dim_out() const { return eng_.dim_out(); }
+    // Text-only batch (the serving fast path): every string becomes BOS text EOS (identical to a one-item embed()); sequences
+    // shorter than 96 tokens are packed into shared forward passes of at most max_batch_tokens tokens / 32 sequences; longer ones run
+    // alone so they take the iGPU dense-attention path (and stay on the GPU beyond 1024 tokens). Per-sequence failures (too long) are reported in errs[i] (out[i] empty,
+    // n_tokens[i] = length); every other sequence still completes.
+    void embed_text_batch(const std::vector<std::string>& texts, int max_batch_tokens, std::vector<std::vector<float>>& out,
+                          std::vector<int>& n_tokens, std::vector<std::string>& errs);
 private:
     Engine eng_;
     GgufFile tokf_;

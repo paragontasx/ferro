@@ -159,4 +159,42 @@ bool MmEmbedder::embed(const std::vector<EmbedItem>& items, const MmEmbedOptions
     return true;
 }
 
+void MmEmbedder::embed_text_batch(const std::vector<std::string>& texts, int max_batch_tokens, std::vector<std::vector<float>>& out,
+                                  std::vector<int>& n_tokens, std::vector<std::string>& errs) {
+    const size_t n = texts.size();
+    out.assign(n, {}); n_tokens.assign(n, 0); errs.assign(n, std::string());
+    std::vector<std::vector<int>> toks(n);
+    std::vector<size_t> shortq, longq;
+    for (size_t i = 0; i < n; ++i) {
+        std::vector<int>& ids = toks[i];
+        if (tok_.bos_id() >= 0) ids.push_back(tok_.bos_id());
+        for (int id : tok_.tokenize(texts[i], false)) ids.push_back(id);
+        if (tok_.eos_id() >= 0) ids.push_back(tok_.eos_id());
+        n_tokens[i] = (int)ids.size();
+        if (ids.size() > 8192) { errs[i] = "input is " + std::to_string(ids.size()) + " tokens; the model context is 8192"; ids.clear(); continue; }
+        // >= 96 tokens alone: a single segment takes the dense attention kernels (FERRO_GPU_DENSE_MIN, default 96), which beat packing it
+        // into a multi-segment pass (lane-per-key attention) - measured 562 vs ~400 tok/s on 156-token texts
+        (ids.size() >= 96 ? longq : shortq).push_back(i);
+    }
+    const int D = eng_.dim_out();
+    for (size_t i : longq) {                                    // single segment: dense attention, no 1024-token lane-kernel cap
+        std::vector<int> seg(toks[i].size(), 0), pos(toks[i].size());
+        for (size_t t = 0; t < pos.size(); ++t) pos[t] = (int)t;
+        out[i].assign(D, 0.0f);
+        eng_.encode(toks[i].data(), seg.data(), pos.data(), (int)toks[i].size(), 1, out[i].data());
+    }
+    size_t k = 0;
+    while (k < shortq.size()) {                                 // greedy packing, original order
+        std::vector<int> ids, seg, pos; std::vector<size_t> members;
+        while (k < shortq.size() && members.size() < 32 && (members.empty() || (int)(ids.size() + toks[shortq[k]].size()) <= max_batch_tokens)) {
+            const size_t i = shortq[k++];
+            for (size_t t = 0; t < toks[i].size(); ++t) { ids.push_back(toks[i][t]); seg.push_back((int)members.size()); pos.push_back((int)t); }
+            members.push_back(i);
+        }
+        std::vector<float> buf(members.size() * (size_t)D);
+        eng_.encode(ids.data(), seg.data(), pos.data(), (int)ids.size(), (int)members.size(), buf.data());
+        for (size_t m = 0; m < members.size(); ++m) out[members[m]].assign(buf.begin() + m * D, buf.begin() + (m + 1) * D);
+    }
+}
+
 }  // namespace ferro
