@@ -7,6 +7,7 @@
 // (16 x 188 tokens: 850 tok/s; one short sequence at a time is several times slower per token). Image / audio / video jobs run
 // alone, in arrival order.
 #include "server.h"
+#include "gpu_cl.h"
 #include "decision_service.h"
 #include "embed_mm.h"
 #include "chat_template.h"
@@ -162,6 +163,9 @@ struct GenJob {
     LmSeq seq;
     std::unique_ptr<Sampler> sampler;
     std::vector<int> hist;
+    bool cache_prompt = true;                     // request field (llama.cpp name): false = neither use nor create prefix-cache entries
+    int prefix_hint = 0;                          // tokens of the system message when it is an exact prefix of the prompt (a natural cache boundary)
+    int cached = 0;                               // prompt tokens restored from the prefix cache instead of prefilled
     int next = 0, n_gen = 0, mode = 0;            // mode: 0 = content, 1 = reasoning (inside <think>)
     std::string pend;                             // decoded text not yet emitted (incomplete UTF-8 / possible stop-string prefix)
     double prompt_ms = 0, gen_ms = 0;
@@ -184,6 +188,9 @@ struct DecJob {
     std::mutex m; std::condition_variable cv; bool done = false;
 };
 
+// A cached prompt prefix: the device state of the LM after `toks` (K/V rows + conv state). Worker-thread only.
+struct PrefixEntry { std::vector<int> toks; std::shared_ptr<LmPrefix> px; uint64_t used = 0; };
+
 // ---------------------------------------------------------------- server state
 struct Server {
     ServerOptions o;
@@ -202,6 +209,10 @@ struct Server {
     std::vector<std::shared_ptr<GenJob>> active;  // worker only
     std::atomic<int> n_active{0};
     std::vector<float> lg;                        // worker only: logits [slots][vocab]
+    // prompt-prefix cache (worker only, except the atomics)
+    std::vector<PrefixEntry> pcache; size_t pc_bytes = 0; uint64_t pc_tick = 0;
+    std::deque<std::vector<int>> recent;          // last prompts, to learn shared prefixes
+    std::atomic<uint64_t> pc_hits{0}, pc_miss{0}, pc_saved{0}, pc_evict{0}, pc_entries{0}, pc_used{0};
     std::atomic<uint64_t> n_gen_req{0}, n_gen_tok{0}, n_prompt_tok{0};
     std::atomic<uint64_t> gen_us{0}, pp_us{0};
     std::string model_name;
@@ -280,6 +291,29 @@ static void gen_finish(Server& S, const std::shared_ptr<GenJob>& jp, const char*
     { std::lock_guard<std::mutex> g(j.m); if (err) { j.err = err; j.status = status; } j.done = true; }
     j.cv.notify_all();
 }
+static bool pc_starts(const std::vector<int>& full, const std::vector<int>& pre) { return pre.size() <= full.size() && std::equal(pre.begin(), pre.end(), full.begin()); }
+static PrefixEntry* pc_longest(Server& S, const std::vector<int>& prompt) {          // longest cached prefix that leaves >= 1 token to prefill (we need its logits)
+    PrefixEntry* best = nullptr;
+    for (auto& e : S.pcache) if (e.toks.size() < prompt.size() && (!best || e.toks.size() > best->toks.size()) && pc_starts(prompt, e.toks)) best = &e;
+    return best;
+}
+static bool pc_has(Server& S, const std::vector<int>& prompt, int c) {
+    for (auto& e : S.pcache) if ((int)e.toks.size() == c && pc_starts(prompt, e.toks)) return true;
+    return false;
+}
+static void pc_store(Server& S, const std::vector<int>& prompt, std::shared_ptr<LmPrefix> px) {
+    const size_t budget = (size_t)S.o.prefix_cache_mb << 20;
+    if (!px || px->bytes > budget) return;
+    while (!S.pcache.empty() && S.pc_bytes + px->bytes > budget) {                 // evict least recently used
+        size_t k = 0; for (size_t i = 1; i < S.pcache.size(); ++i) if (S.pcache[i].used < S.pcache[k].used) k = i;
+        S.pc_bytes -= S.pcache[k].px->bytes; S.pcache.erase(S.pcache.begin() + (long)k); S.pc_evict++;
+    }
+    PrefixEntry e; e.toks.assign(prompt.begin(), prompt.begin() + px->n); e.used = ++S.pc_tick; S.pc_bytes += px->bytes; e.px = std::move(px);
+    S.pcache.push_back(std::move(e));
+    S.pc_entries = S.pcache.size(); S.pc_used = S.pc_bytes;
+}
+
+static void gpu_sync_for_debug() { gpu::finish(); }
 static void gen_start(Server& S, const std::shared_ptr<GenJob>& jp) {
     GenJob& j = *jp;
     const int V = S.lm.n_vocab();
@@ -288,10 +322,40 @@ static void gen_start(Server& S, const std::shared_ptr<GenJob>& jp) {
     std::string err;
     const auto t0 = clk::now();
     const int n = (int)j.prompt.size();
-    bool ok = false;
-    try { ok = S.lm.step({&j.seq}, {j.prompt.data()}, {n}, S.lg.data(), &err); } catch (const std::exception& e) { err = e.what(); }
+    bool ok = true;
+    int pos = 0;
+    const bool pc_on = S.o.prefix_cache_mb > 0 && j.cache_prompt && S.lm.on_gpu();
+    std::vector<int> cuts;                                                          // where to leave a new cache entry behind while prefilling
+    if (pc_on) {
+        if (PrefixEntry* e = pc_longest(S, j.prompt)) {
+            if (S.lm.restore(j.seq, *e->px)) { pos = e->px->n; e->used = ++S.pc_tick; S.pc_hits++; S.pc_saved += (uint64_t)pos; }
+            else S.lm.reset(j.seq);                                                // a failed restore may have left partial conv state: start clean
+        } else S.pc_miss++;
+        j.cached = pos;
+        int learned = 0;                                                            // longest common prefix with a recent prompt = a prefix this workload repeats
+        for (const auto& r : S.recent) { int l = 0; const int m = (int)std::min(r.size(), j.prompt.size()); while (l < m && r[l] == j.prompt[l]) ++l; learned = std::max(learned, l); }
+        for (int c : {j.prefix_hint, learned}) {
+            if (c < S.o.prefix_min_tokens || c <= pos + 8 || c > n - 1) continue;
+            if (std::find(cuts.begin(), cuts.end(), c) != cuts.end() || pc_has(S, j.prompt, c)) continue;
+            if (S.lm.prefix_bytes(c) > ((size_t)S.o.prefix_cache_mb << 20)) continue;
+            cuts.push_back(c);
+        }
+        std::sort(cuts.begin(), cuts.end());
+    }
+    try {
+        for (int c : cuts) {                                                        // prefill up to each boundary, leave a snapshot, go on
+            ok = ok && S.lm.step({&j.seq}, {j.prompt.data() + pos}, {c - pos}, S.lg.data(), &err);
+            if (!ok) break;
+            pos = c;
+            const auto ts = clk::now();
+            pc_store(S, j.prompt, S.lm.snapshot(j.seq));
+            if (getenv("FERRO_PC_DEBUG")) { gpu_sync_for_debug(); fprintf(stderr, "[prefix] snapshot of %d tokens took %.1f ms (alloc+copy, synced)\n", c, ms_since(ts)); }
+        }
+        if (ok) ok = S.lm.step({&j.seq}, {j.prompt.data() + pos}, {n - pos}, S.lg.data(), &err);
+    } catch (const std::exception& e) { err = e.what(); ok = false; }
     j.prompt_ms = ms_since(t0);
     if (!ok) { gen_finish(S, jp, (err.empty() ? "prefill failed" : err).c_str()); return; }
+    if (pc_on) { S.recent.push_back(j.prompt); if (S.recent.size() > 8) S.recent.pop_front(); }
     j.hist = j.prompt;
     j.sampler.reset(new Sampler(j.sp));
     const int tok = j.sampler->sample(S.lg.data(), V, j.hist);
@@ -583,11 +647,12 @@ static std::string health_json(Server& S) {
     std::string out = b;
     if (S.has_lm) {
         size_t gq; { std::lock_guard<std::mutex> g(S.qm); gq = S.gq.size(); }
-        char l[512];
+        char l[900];
         const double tg = S.gen_us.load() > 0 ? (double)S.n_gen_tok.load() / (S.gen_us.load() / 1e6) : 0;
-        snprintf(l, sizeof l, ",\"lm\":{\"model\":\"%s\",\"device\":\"%s\",\"slots\":%d,\"active\":%d,\"queued\":%zu,\"ctx\":%d,\"requests\":%llu,\"prompt_tokens\":%llu,\"generated_tokens\":%llu,\"tokens_per_s_busy\":%.2f}}",
+        snprintf(l, sizeof l, ",\"lm\":{\"model\":\"%s\",\"device\":\"%s\",\"slots\":%d,\"active\":%d,\"queued\":%zu,\"ctx\":%d,\"requests\":%llu,\"prompt_tokens\":%llu,\"generated_tokens\":%llu,\"tokens_per_s_busy\":%.2f,\"prefix_cache\":{\"entries\":%llu,\"mb\":%.1f,\"hits\":%llu,\"misses\":%llu,\"cached_tokens\":%llu,\"evictions\":%llu}}}",
                  jesc(S.lm_name).c_str(), S.lm.on_gpu() ? "igpu" : "cpu", S.lm.n_slots(), S.n_active.load(), gq, S.lm.max_ctx(), (unsigned long long)S.n_gen_req.load(),
-                 (unsigned long long)S.n_prompt_tok.load(), (unsigned long long)S.n_gen_tok.load(), tg);
+                 (unsigned long long)S.n_prompt_tok.load(), (unsigned long long)S.n_gen_tok.load(), tg,
+                 (unsigned long long)S.pc_entries.load(), S.pc_used.load() / 1048576.0, (unsigned long long)S.pc_hits.load(), (unsigned long long)S.pc_miss.load(), (unsigned long long)S.pc_saved.load(), (unsigned long long)S.pc_evict.load());
         out.pop_back(); out += l;
     }
     if (S.has_d1) {
@@ -629,6 +694,19 @@ static std::shared_ptr<GenJob> parse_gen_request(Server& S, const std::string& t
     }
     j->prompt = S.ltok.tokenize(rendered, true);
     if (j->prompt.empty()) throw BadRequest("empty prompt");
+    if (const Json* cp = b.find("cache_prompt")) j->cache_prompt = !(cp->t == Json::Bool && !cp->b);
+    if (chat && j->cache_prompt && S.o.prefix_cache_mb > 0) {      // natural cache boundary: the end of a leading system message (checked, not assumed, to be an exact prefix)
+        const Json& m0 = b.find("messages")->arr[0];
+        const Json* role = m0.is_object() ? m0.find("role") : nullptr;
+        if (role && role->is_string() && role->s == "system") {
+            try {
+                Json one = Json::array(); one.push(m0);
+                ChatTemplateOptions o = S.chat_opt; o.add_generation_prompt = false;
+                const std::vector<int> pre = S.ltok.tokenize(lfm_chat_render(one, b.find("tools"), o), true);
+                if (!pre.empty() && pre.size() < j->prompt.size() && std::equal(pre.begin(), pre.end(), j->prompt.begin())) j->prefix_hint = (int)pre.size();
+            } catch (const std::exception&) {}
+        }
+    }
     const int ctx = S.lm.max_ctx();
     if ((int)j->prompt.size() >= ctx) throw BadRequest("prompt is " + std::to_string(j->prompt.size()) + " tokens but the context is " + std::to_string(ctx) + " (start with --lm-ctx N)");
     if (const Json* n = b.find("n")) if (jnum(n, 1) != 1) throw BadRequest("only n = 1 is supported");
@@ -656,10 +734,11 @@ static std::shared_ptr<GenJob> parse_gen_request(Server& S, const std::string& t
 }
 
 static std::string usage_json(const GenJob& j) {
-    char b[512];
-    const double pp = j.prompt_ms > 0 ? j.prompt.size() / (j.prompt_ms / 1000.0) : 0, tg = j.gen_ms - j.prompt_ms > 0 ? (j.n_gen > 1 ? (j.n_gen - 1) / ((j.gen_ms - j.prompt_ms) / 1000.0) : 0) : 0;
-    snprintf(b, sizeof b, "\"usage\":{\"prompt_tokens\":%zu,\"completion_tokens\":%d,\"total_tokens\":%zu},\"timings\":{\"prompt_ms\":%.1f,\"prompt_per_second\":%.1f,\"predicted_ms\":%.1f,\"predicted_per_second\":%.2f}",
-             j.prompt.size(), j.n_gen, j.prompt.size() + (size_t)j.n_gen, j.prompt_ms, pp, j.gen_ms - j.prompt_ms, tg);
+    char b[640];
+    const size_t fresh = j.prompt.size() - (size_t)j.cached;                 // tokens actually prefilled (the rest came from the prefix cache)
+    const double pp = j.prompt_ms > 0 ? fresh / (j.prompt_ms / 1000.0) : 0, tg = j.gen_ms - j.prompt_ms > 0 ? (j.n_gen > 1 ? (j.n_gen - 1) / ((j.gen_ms - j.prompt_ms) / 1000.0) : 0) : 0;
+    snprintf(b, sizeof b, "\"usage\":{\"prompt_tokens\":%zu,\"completion_tokens\":%d,\"total_tokens\":%zu,\"prompt_tokens_details\":{\"cached_tokens\":%d}},\"timings\":{\"cache_n\":%d,\"prompt_ms\":%.1f,\"prompt_per_second\":%.1f,\"predicted_ms\":%.1f,\"predicted_per_second\":%.2f}",
+             j.prompt.size(), j.n_gen, j.prompt.size() + (size_t)j.n_gen, j.cached, j.cached, j.prompt_ms, pp, j.gen_ms - j.prompt_ms, tg);
     return b;
 }
 
@@ -688,7 +767,10 @@ static int handle_generate(Server& S, int fd, bool keep, const std::string& text
         return j->done;
     };
     auto finish_str = [&] { return j->finish; };
-    auto summary = [&] { char b[160]; snprintf(b, sizeof b, "prompt=%zu gen=%d finish=%s pp=%.0ftok/s", j->prompt.size(), j->n_gen, j->finish.c_str(), j->prompt_ms > 0 ? j->prompt.size() / (j->prompt_ms / 1000.0) : 0.0); return std::string(b); };
+    auto summary = [&] {                                  // pp = prefill speed over the tokens actually prefilled; cached = restored from the prefix cache
+        char b[200]; const size_t fresh = j->prompt.size() - (size_t)j->cached;
+        snprintf(b, sizeof b, "prompt=%zu%s gen=%d finish=%s pp=%.0ftok/s", j->prompt.size(), j->cached ? (" cached=" + std::to_string(j->cached)).c_str() : "", j->n_gen, j->finish.c_str(), j->prompt_ms > 0 ? fresh / (j->prompt_ms / 1000.0) : 0.0);
+        return std::string(b); };
     std::deque<Delta> ev;
     if (!j->stream) {
         std::string content, reasoning;
@@ -928,7 +1010,7 @@ int run_server(const ServerOptions& opt) {
         auto mb = [](const std::string& path) { struct stat st; return !path.empty() && stat(path.c_str(), &st) == 0 ? st.st_size / 1048576.0 : 0.0; };
         double w_mb = mb(opt.model) + mb(opt.mmproj) + mb(opt.lm) + mb(opt.d1) + (S.has_d1 ? mb(S.d1.mmproj_path()) : 0.0);
         double kv_mb = 0; if (S.has_lm) { const LmModel& lm = S.lm.model(); kv_mb = (double)lm.n_attn_layers * S.lm.n_slots() * S.lm.max_ctx() * 2 * lm.n_kv * lm.head_dim * 4 / 1048576.0; }
-        const double need_mb = 700 + 1.3 * w_mb + kv_mb;
+        const double need_mb = 700 + 1.3 * w_mb + kv_mb + (S.has_lm ? (double)opt.prefix_cache_mb : 0.0);      // + the prefix cache at its full budget
         if (lim_mb > 0 && need_mb > lim_mb)
             fprintf(stderr, "[serve] WARNING: ~%.0f MB needed (weights %.0f MB + KV %.0f MB + runtime) vs a %.0f MB container limit -> drop a model, or lower --lm-slots / --lm-ctx\n", need_mb, w_mb, kv_mb, lim_mb);
         else if (lim_mb > 0 && need_mb > 0.8 * lim_mb)

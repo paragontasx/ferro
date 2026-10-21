@@ -343,6 +343,51 @@ void LmEngine::reset(LmSeq& s) const {
     s.conv.assign(m_.n_conv_layers, std::vector<float>(2 * (size_t)m_.n_embd, 0.0f));
 }
 
+LmPrefix::~LmPrefix() { for (void* b : kv) if (b) gpu::release(b); for (void* b : cst) if (b) gpu::release(b); }
+
+size_t LmEngine::prefix_bytes(int n_tokens) const {
+    return (size_t)n_tokens * 2 * m_.n_kv * m_.head_dim * 4 * m_.n_attn_layers + (size_t)2 * m_.n_embd * 4 * m_.n_conv_layers;
+}
+
+std::shared_ptr<LmPrefix> LmEngine::snapshot(const LmSeq& s) const {
+    if (!impl_ || !impl_->g.ok || s.gpu_slot < 0 || s.n_past <= 0) return nullptr;
+    auto& g = impl_->g;
+    const size_t kvw = (size_t)2 * m_.n_kv * m_.head_dim, d = (size_t)m_.n_embd;
+    auto p = std::make_shared<LmPrefix>();
+    p->n = s.n_past;
+    const size_t rows = (size_t)s.n_past * kvw * 4;
+    for (size_t l = 0; l < g.kv.size(); ++l) {
+        gpu::Buf b = gpu::alloc(rows);
+        if (!b) return nullptr;
+        p->kv.push_back(b);
+        if (!gpu::copy(b, 0, g.kv[l], (size_t)s.gpu_slot * g.cap * kvw * 4, rows)) return nullptr;
+    }
+    for (size_t l = 0; l < g.cst.size(); ++l) {
+        gpu::Buf b = gpu::alloc(2 * d * 4);
+        if (!b) return nullptr;
+        p->cst.push_back(b);
+        if (!gpu::copy(b, 0, g.cst[l], (size_t)s.gpu_slot * 2 * d * 4, 2 * d * 4)) return nullptr;
+    }
+    p->bytes = prefix_bytes(s.n_past);
+    return p;
+}
+
+bool LmEngine::restore(LmSeq& s, const LmPrefix& p) const {
+    if (!impl_ || !impl_->g.ok || p.n <= 0 || p.n >= max_ctx_) return false;
+    auto& g = impl_->g;
+    if (p.kv.size() != g.kv.size() || p.cst.size() != g.cst.size()) return false;
+    const size_t kvw = (size_t)2 * m_.n_kv * m_.head_dim, d = (size_t)m_.n_embd;
+    if (s.gpu_slot < 0) {
+        if (g.free_slots.empty()) return false;
+        s.gpu_slot = g.free_slots.back(); g.free_slots.pop_back();
+    }
+    bool ok = true;
+    for (size_t l = 0; l < g.kv.size(); ++l) ok = ok && gpu::copy(g.kv[l], (size_t)s.gpu_slot * g.cap * kvw * 4, p.kv[l], 0, (size_t)p.n * kvw * 4);
+    for (size_t l = 0; l < g.cst.size(); ++l) ok = ok && gpu::copy(g.cst[l], (size_t)s.gpu_slot * 2 * d * 4, p.cst[l], 0, 2 * d * 4);
+    if (ok) s.n_past = p.n;
+    return ok;
+}
+
 bool LmEngine::step(const std::vector<LmSeq*>& seqs, const std::vector<const int*>& toks, const std::vector<int>& n, float* logits, std::string* err) {
     int T = 0;
     for (size_t i = 0; i < seqs.size(); ++i) {

@@ -179,7 +179,15 @@ curl localhost:8088/v1/embeddings -d '{"input":"hello"}'
 `<think>..</think>` output is returned as `reasoning_content` (`--reasoning-format none` keeps it inline). Generation is continuously batched over `--lm-slots`
 device slots (each holds `--lm-ctx` tokens of KV cache, ~25 MB per 1k tokens); embedding requests are served between decode steps (a short text embedding
 measured 0.12-1.8 s while 4 streams were generating - it waits for the decode step or prefill in progress); a closed client connection frees its slot within a step; 503 when the queue is full; Bearer `--api-key`
-(or `FERRO_API_KEY`). Not implemented: tool-call *parsing* of model output (tools are only rendered into the prompt), `n > 1`, logprobs, image input to the LM, prefix caching.
+(or `FERRO_API_KEY`). Not implemented: tool-call *parsing* of model output (tools are only rendered into the prompt), `n > 1`, logprobs, image input to the LM.
+
+**Prompt-prefix cache (`--prefix-cache-mb`, default 128, 0 = off).** Digest-style workloads send the same long system prompt every time. The server snapshots the LM state (K/V rows + conv state) at the end of a leading system
+message (and at any prefix a request shares with a recent one - plain `/v1/completions` prompts too), keeps the snapshots on the device in an LRU cache, and later requests restore the longest matching snapshot into their slot and prefill only the rest.
+It is exact (causal state only, restore == prefill within the usual chunking noise; greedy answers identical in the tests) and visible: `usage.prompt_tokens_details.cached_tokens` (also `timings.cache_n`, `cached=N` in the log, `/health` `lm.prefix_cache`).
+Measured on a 1400-token system prompt + 8 different ~30-token digests (24 generated tokens each): per request 4.3 s -> 1.1 s on the 350M (3.9x warm, 2.8x over all 8 incl. the cold first) and 12.4 s -> 2.3 s on the 1.2B (5.5x, 3.5x over 8);
+the restored part costs a device-side copy (writing a 732-token snapshot measured 10-17 ms) instead of ~2.9 s of prefill. Costs: ~25 KB of device memory per cached token (a 1400-token prompt = 33 MB), and the first request of each new prefix pays ~4% for writing the snapshot (workloads that never
+repeat a prefix: turn it off or lower the budget). Per request `"cache_prompt": false` neither reads nor writes the cache (llama.cpp's field name). Boundaries are exact token prefixes, so the cached part must be byte-identical:
+same system text, same tools, same template variant.
 
 **Decisions over HTTP (`--d1`).** `POST /v1/systemone` takes exactly the request documented in "Using d1-omni" (single object or array) and returns the same JSON; text decisions of ~3 questions take ~0.25 s, and they stay at
 ~0.14 s while three chat streams decode (the worker interleaves them). **Regions:** a frame plus a detector box needs no client-side crop / JPEG re-encode. Any image entry (`files` / `images` item or `image_url` part) can be an object:
@@ -206,7 +214,7 @@ container that leaves too little headroom for multimodal embedding bursts (the a
 
 The server prints the KV size and warns when it approaches a container limit. Tests: `scripts/test_serve.py` (embeddings), `scripts/test_serve_lm.py`
 (chat: usage accounting, seeds, stream == non-stream, stop strings, UTF-8, errors, cancellation, concurrency, template parity with `--llama URL`),
-`scripts/test_serve_d1.py` (decisions: CLI parity, media, crop == pre-cropped image, error cases, concurrency / pass sharing), `scripts/bench_lm_serve.py` (concurrency scaling), `scripts/bench_serve.py` (embeddings).
+`scripts/test_serve_prefix.py` (prefix cache: cold vs warm, exactness vs `cache_prompt:false`, tools, learned prefixes, streaming usage, concurrency, LRU eviction), `scripts/test_serve_d1.py` (decisions: CLI parity, media, crop == pre-cropped image, error cases, concurrency / pass sharing), `scripts/bench_lm_serve.py` (concurrency scaling), `scripts/bench_serve.py` (embeddings).
 
 ## How the iGPU path is fast
 1. **int8 DP4A GEMMs** (`cl_khr_integer_dot_product`): Q8_0 weights resident on the GPU in a

@@ -364,3 +364,15 @@ d1 is compute-bound at ~500 tok/s: 18 concurrent requests merged into one pass t
 Memory (cgroup anon+shmem, includes ~0.35 GB of other processes): d1+mmproj 1.9 GB, 350M chat 1.7, EG2+mmproj 2.3, d1+chat 2.1, EG2mm+d1 2.1, all four 3.4 GB; the all-four server was OOM-killed (4 GiB cap) on its first
 multimodal embedding request, so the startup check now sums every loaded GGUF (700 MB + 1.3 x files + KV) and prints a headroom note above 80% of the container limit.
 Tests: `scripts/test_serve_d1.py` (50+ checks: server == one-shot CLI, image / audio / image_url parts, crop {x,y,w,h} == {x1,y1,x2,y2} == normalised == a pre-cropped PNG, pad, clipping, crops lists, include_full, 12 error cases, 18-way concurrency).
+
+### LM prompt-prefix cache (2026-10-22)
+`LmEngine::snapshot / restore` copy the K/V rows [0,P) of every attention layer and the conv state (device to device, ~23.5 KB per token on LFM2.5: 6 attention layers x 8 kv heads x 64 x 2 x 4 B, plus 80 KB of conv state);
+the server keeps them in an LRU cache (`--prefix-cache-mb`, default 128) and `gen_start` restores the longest cached prefix of the prompt (always leaving >= 1 token to prefill for the logits). Cut points: the end of a leading system
+message (verified to be an exact token prefix of the full prompt) and the longest common prefix with the last 8 prompts (learns prefixes of plain completions: miss, miss + learn, hit).
+Exactness (`FERRO_LM_SELFCHECK`, 350M and 1.2B): restore into a different slot + prefill the rest vs one prefill: cos 0.9998-1.0 (bit-identical when the suffix chunk shape matches; the rest is the known chunking noise), a decode step after the
+restore == the donor's decode (max|diff| 0), the snapshot survives the donor advancing and can be restored again. Server: greedy answers with / without the cache identical on 6 digests and under 6-way concurrency; tools in the system block are part of the key.
+Speed (system prompt 1396 tokens + a ~30-token digest, 24 generated tokens, `cache_prompt` true vs false on the same server): 350M 4265 -> 1083 ms per request after the first (3.9x; 8 requests 34.1 s -> 12.0 s = 2.8x),
+1.2B 12447 -> 2268 ms (5.5x; 99.7 s -> 28.6 s = 3.5x). Prefill of a 714-token cached prefix: 1603 ms cold -> 129 ms warm (12x; the warm 129 ms covers the restore, the 32 uncached tokens and the first sampled token; writing a 732-token snapshot measured 10-17 ms).
+Cost of caching on a cold request: +4.5% (350M 1519 -> 1590 ms, 1.2B 5494 -> 5748 ms for a 741-token prompt); the snapshot is 10-17 ms of that, the rest is the extra prefill chunk boundary. Memory: 16.8 MB for 714 tokens;
+the budget is enforced by LRU eviction (8 MB test: 9 evictions, never above budget) and is included in the startup memory estimate.
+Not done: a snapshot at the end of every prompt (would give multi-turn chats a hit one turn earlier at the price of churn), prefix caching for d1's question prompts (compute-bound at ~500 tok/s with ~40-token questions, so little to save).

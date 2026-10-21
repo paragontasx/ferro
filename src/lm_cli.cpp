@@ -21,7 +21,7 @@ int run_generate(const GenArgs& a) {
     auto secs = [](clk::time_point t) { return std::chrono::duration<double>(clk::now() - t).count(); };
     auto t0 = clk::now();
     LmEngine eng; std::string err;
-    if (!eng.init(a.lm, a.threads, a.ctx, &err)) { fprintf(stderr, "init failed: %s\n", err.c_str()); return 1; }
+    if (!eng.init(a.lm, a.threads, a.ctx, &err, getenv("FERRO_LM_SELFCHECK") ? 3 : 1)) { fprintf(stderr, "init failed: %s\n", err.c_str()); return 1; }
     BpeTokenizer tok;
     if (!tok.load(eng.model().gguf, &err)) { fprintf(stderr, "tokenizer: %s\n", err.c_str()); return 1; }
     fprintf(stderr, "[lm] %d layers (%d conv + %d attention), d=%d, vocab %d, loaded in %.2fs, device=%s\n", eng.model().n_layer, eng.model().n_conv_layers,
@@ -87,6 +87,31 @@ int run_generate(const GenArgs& a) {
         for (int i = 0; i < N; ++i) eng.step({&s2}, {ids.data() + i}, {1}, cur.data(), &err);
         eng.release(s2);
         cmp("token-by-token decode", cur);
+        // prefix cache: snapshot after `split` tokens, restore into ANOTHER slot (the original keeps running), finish the prompt; then continue by decode on both
+        for (int split : {2, N / 2, N - 1}) {
+            if (split <= 1 || split >= N || eng.n_slots() < 2) continue;
+            LmSeq a; eng.reset(a);
+            eng.step({&a}, {ids.data()}, {split}, cur.data(), &err);
+            auto px = eng.snapshot(a);
+            if (!px) { fprintf(stderr, "[selfcheck] snapshot unavailable (CPU path?)\n"); break; }
+            LmSeq pad; eng.reset(pad);                                        // occupy slot 0/1 differently so the restore lands in a different slot
+            LmSeq b; b.n_past = 0;
+            if (!eng.restore(b, *px)) { fprintf(stderr, "[selfcheck] restore failed\n"); return 1; }
+            eng.step({&b}, {ids.data() + split}, {N - split}, cur.data(), &err);
+            char nm[64]; snprintf(nm, sizeof nm, "restore@%d (slot %d->%d) + prefill", split, a.gpu_slot, b.gpu_slot); cmp(nm, cur);
+            // the snapshot must be unaffected by what the donor did afterwards, and reusable: restore again after the donor advanced
+            eng.step({&a}, {ids.data() + split}, {N - split}, cur.data(), &err);
+            eng.release(b);
+            LmSeq c; if (!eng.restore(c, *px)) { fprintf(stderr, "[selfcheck] 2nd restore failed\n"); return 1; }
+            eng.step({&c}, {ids.data() + split}, {N - split}, cur.data(), &err);
+            snprintf(nm, sizeof nm, "restore@%d again (donor advanced)", split); cmp(nm, cur);
+            const int nxt = 1098;                                              // one decode step after the restored prefill == after the donor's
+            std::vector<float> d1(V), d2(V);
+            eng.step({&c}, {&nxt}, {1}, d1.data(), &err); eng.step({&a}, {&nxt}, {1}, d2.data(), &err);
+            double mx = 0; for (int i = 0; i < V; ++i) mx = std::max(mx, (double)std::fabs(d1[i] - d2[i]));
+            fprintf(stderr, "[selfcheck] %-34s max|diff| %.4g\n", "decode after restore vs donor", mx);
+            eng.release(a); eng.release(c); eng.release(pad);
+        }
         return 0;
     }
     LmSeq seq; eng.reset(seq);

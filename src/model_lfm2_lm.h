@@ -47,6 +47,17 @@ struct LmSeq {
     int gpu_slot = -1;                               // device-resident state slot (iGPU path), -1 = none
 };
 
+// Device-resident snapshot of a sequence's state after n tokens (K/V rows [0,n) of every attention layer + the conv state): a cached prompt prefix.
+// Produced by LmEngine::snapshot, consumed by LmEngine::restore (any slot, any number of times). Owns its device buffers.
+struct LmPrefix {
+    int n = 0;
+    std::vector<void*> kv, cst;                       // per attention layer: n * kvw floats; per conv layer: 2 * d floats
+    size_t bytes = 0;
+    LmPrefix() = default;
+    LmPrefix(const LmPrefix&) = delete; LmPrefix& operator=(const LmPrefix&) = delete;
+    ~LmPrefix();
+};
+
 class LmEngine {
 public:
     struct Impl;
@@ -62,6 +73,11 @@ public:
     // LAST token: logits[i * n_vocab ...]. Prefill (n large) and decode (n == 1) steps can be mixed in one call.
     bool step(const std::vector<LmSeq*>& seqs, const std::vector<const int*>& toks, const std::vector<int>& n, float* logits, std::string* err);
     bool on_gpu() const;
+    // Prefix caching (iGPU path only; null / false on the CPU path). snapshot: copy the state of `s` after s.n_past tokens; restore: make `s`
+    // (taking a device slot if it has none) continue from a snapshot, so only the tokens after it need prefill. Exact: causal state only.
+    std::shared_ptr<LmPrefix> snapshot(const LmSeq& s) const;
+    bool restore(LmSeq& s, const LmPrefix& p) const;
+    size_t prefix_bytes(int n_tokens) const;          // device bytes a snapshot of n_tokens takes
 
 private:
     LmModel m_;
