@@ -352,3 +352,15 @@ The iGPU drifts +-1.5 ms between runs, so every claim below is a median of >= 4-
    work-groups (`lm_head` has 256-1024), which is why the idea does not pay on a 24-EU GPU where only ~21 work-groups are resident at once.
 **Conclusion:** single-stream decode now runs at ~75% of the weight-streaming limit on both models (350M: 19.7 ms ideal vs 26.1 ms; 1.2B: 1.17 GB at 25.9 GB/s = 45 ms ideal vs 59 ms). The remaining ~25% is the ~70 small launches (~3 ms)
 plus GEMV tail effects; the lever left is fewer weight bytes (Q4, or fp16 scales: the fp32 scales are 11% of the traffic), not more fusion.
+
+### d1 over HTTP: `POST /v1/systemone` + server-side crops (2026-10-22)
+`decide` was CLI-only; `serve --d1 d1-omni.gguf [--d1-mmproj ...]` now answers llama.cpp's `/v1/systemone` contract from the resident worker (the pipeline moved out of `main.cpp` into `DecisionService`:
+prepare -> infer -> format; the CLI uses it too and its output is byte-identical to before on text / batch / PNG / JPEG / audio requests).
+Latency, server-side (`prep` = parse + decode + crop + preprocess, `run` = encoders + one packed forward): text, 3 questions / 118 tokens **240 ms**, 1 question **110 ms**; 400x400 crop of a 1080p frame (593 tokens) **1.25 s**
+(prep 10-50 ms, nearly all the rest is the vision tower); whole 1080p frame (6986 tokens) **21.8 s**. A frame + `crop` field costs 1293 ms vs 1250 ms for the same region uploaded pre-cropped (the 43 ms is the 1080p JPEG decode) and
+1287 ms for a client that decodes, crops and re-encodes itself - i.e. the field saves the client work and the 17x between crop and whole frame is why detector boxes should always be sent as regions.
+d1 is compute-bound at ~500 tok/s: 18 concurrent requests merged into one pass took 8.7 s, the same as running them back to back (batching changes the order of completion, not throughput), so the pass budget defaults to 2048 tokens
+(`ServerOptions::d1_batch_tokens`) to stop short requests waiting behind a large batch. With 3 chat streams decoding, a 1-question decision takes 143 ms instead of 110 ms.
+Memory (cgroup anon+shmem, includes ~0.35 GB of other processes): d1+mmproj 1.9 GB, 350M chat 1.7, EG2+mmproj 2.3, d1+chat 2.1, EG2mm+d1 2.1, all four 3.4 GB; the all-four server was OOM-killed (4 GiB cap) on its first
+multimodal embedding request, so the startup check now sums every loaded GGUF (700 MB + 1.3 x files + KV) and prints a headroom note above 80% of the container limit.
+Tests: `scripts/test_serve_d1.py` (50+ checks: server == one-shot CLI, image / audio / image_url parts, crop {x,y,w,h} == {x1,y1,x2,y2} == normalised == a pre-cropped PNG, pad, clipping, crops lists, include_full, 12 error cases, 18-way concurrency).

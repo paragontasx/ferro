@@ -5,7 +5,7 @@ CL_INC ?= ../ferro-gpu/third_party/OpenCL-Headers
 override CPPFLAGS += -I$(CL_INC)
 
 SRC = src/gpu_cl.cpp src/gguf.cpp src/kernels.cpp src/kernels_fma.cpp src/threadpool.cpp src/model_eg2.cpp src/server.cpp src/tokenizer.cpp \
-      src/tokenizer_bpe.cpp src/json.cpp src/decision.cpp src/model_lfm2.cpp src/model_lfm2_lm.cpp src/chat_template.cpp src/sampler.cpp src/lm_cli.cpp \
+      src/tokenizer_bpe.cpp src/json.cpp src/decision.cpp src/decision_service.cpp src/model_lfm2.cpp src/model_lfm2_lm.cpp src/chat_template.cpp src/sampler.cpp src/lm_cli.cpp \
       src/media.cpp src/media_impl.cpp src/mm_preproc.cpp src/mm_encoder.cpp src/mm_gemma4.cpp src/mm_gemma4a.cpp src/embed_mm.cpp \
       third_party/llama_unicode/unicode.cpp third_party/llama_unicode/unicode-data.cpp
 OBJ = $(SRC:.cpp=.o)

@@ -161,10 +161,10 @@ activations to int8 like llama.cpp and lands on the same TV. Debug knobs: `FERRO
 Fusion / timing-experiment knobs: `FERRO_LM_FUSE=0` (unfused launches), `=2` (opt-in prologue-fused GEMVs, break-even on this GPU), `FERRO_PRO_MASK`, `FERRO_LM_ABL=op,..` / `FERRO_LM_DUP=op,..` (skip / double ops to measure their cost), `FERRO_LM_NOEOS=1`.
 
 ## Serving over HTTP (`ferro-embed serve`)
-One resident process, OpenAI-compatible, embeddings and/or language model on the same iGPU (one worker thread owns the device):
+One resident process, OpenAI-compatible, embeddings and/or language model and/or the d1 decision model on the same iGPU (one worker thread owns the device):
 ```sh
 ./ferro-embed serve --model models/embeddinggemma-2-Q8_0.gguf --mmproj models/mmproj-embeddinggemma-2-Q8_0.gguf \
-                    --lm models/LFM2.5-1.2B-Thinking-Q8_0.gguf --port 8088 [--lm-slots 4] [--lm-ctx 4096] [--api-key K] [--host 0.0.0.0]
+                    --lm models/LFM2.5-1.2B-Thinking-Q8_0.gguf --d1 models/d1-omni-600M-Q8_0.gguf --port 8088 [--lm-slots 4] [--lm-ctx 4096] [--api-key K] [--host 0.0.0.0]
 curl localhost:8088/v1/chat/completions -d '{"messages":[{"role":"user","content":"What is 17*23?"}],"stream":true}'
 curl localhost:8088/v1/embeddings -d '{"input":"hello"}'
 ```
@@ -172,6 +172,7 @@ curl localhost:8088/v1/embeddings -d '{"input":"hello"}'
 |---|---|
 | `POST /v1/embeddings` | text / `image_url` / `input_audio` / `video_url` parts (data URLs), `dimensions`, `encoding_format: base64`; concurrent text requests share packed forward passes |
 | `POST /v1/chat/completions`, `POST /v1/completions` | `messages` (+`tools` are rendered into the prompt), `max_tokens`, `temperature`, `top_p`, `top_k`, `min_p`, `repetition_penalty`, `seed`, `stop`, `stream` (SSE) + `stream_options.include_usage`; `usage` and llama.cpp-style `timings` in every response |
+| `POST /v1/systemone` | d1-omni typed decisions (choice / score / noul) over a text, image or audio state - llama.cpp's contract, answers identical to `ferro-embed decide`; queued requests share one forward pass; `crop` / `crops` regions (below) |
 | `POST /apply-template` | rendered chat prompt (same contract as llama.cpp) |
 | `GET /v1/models`, `GET /health` | capabilities / context / slots; queue, active slots, throughput counters |
 
@@ -179,6 +180,17 @@ curl localhost:8088/v1/embeddings -d '{"input":"hello"}'
 device slots (each holds `--lm-ctx` tokens of KV cache, ~25 MB per 1k tokens); embedding requests are served between decode steps (a short text embedding
 measured 0.12-1.8 s while 4 streams were generating - it waits for the decode step or prefill in progress); a closed client connection frees its slot within a step; 503 when the queue is full; Bearer `--api-key`
 (or `FERRO_API_KEY`). Not implemented: tool-call *parsing* of model output (tools are only rendered into the prompt), `n > 1`, logprobs, image input to the LM, prefix caching.
+
+**Decisions over HTTP (`--d1`).** `POST /v1/systemone` takes exactly the request documented in "Using d1-omni" (single object or array) and returns the same JSON; text decisions of ~3 questions take ~0.25 s, and they stay at
+~0.14 s while three chat streams decode (the worker interleaves them). **Regions:** a frame plus a detector box needs no client-side crop / JPEG re-encode. Any image entry (`files` / `images` item or `image_url` part) can be an object:
+```json
+{"state": "Camera 3 motion event", "questions": {"person": {"type": "noul", "instructions": "Is there a person?"}},
+ "files": [{"url": "data:image/jpeg;base64,...1080p frame...",
+            "crop": {"x": 900, "y": 300, "w": 400, "h": 400, "pad": 0.1}}]}
+```
+`crop` = `{x,y,w,h}` or `{x1,y1,x2,y2}`, `"unit": "px"` (default) or `"norm"` (0..1), `pad` = fraction of the box added on every side; boxes are clipped to the frame. `crops: [..]` sends several boxes of one frame as separate images,
+`include_full: true` adds the whole frame as well (crops count towards the 8-image limit; audio rejects them). The crop is cut from the decoded pixels before the encoder, so it is identical to sending that region as its own PNG
+(tested). It is also the fast path: a 400x400 crop of a 1080p frame answers in 1.3 s, the whole frame in 21.8 s (7000 vision tokens) - the server-side crop costs ~45 ms (JPEG decode) over a pre-cropped upload.
 **Memory** (iGPU buffers are system RAM and not swappable - size `--lm-slots` x `--lm-ctx` to your limit; measured via cgroup, device buffers show as shmem):
 
 | Process | anon | device (shmem) |
@@ -187,10 +199,14 @@ measured 0.12-1.8 s while 4 streams were generating - it waits for the decode st
 | `--lm` only, 1 slot | ~0.8 GB | 1.5 GB |
 | `--model` + `--mmproj` | ~1.6 GB | 0.8 GB |
 | EG2 text only | ~0.9 GB | 0.2 GB |
+| `--d1` (+ its mmproj) | ~0.9 GB | 0.7 GB |
+
+Combinations (anon + shmem, incl. ~0.35 GB of other processes in the container): d1 1.9 GB, chat 350M 1.7 GB, EG2+mmproj 2.3 GB, d1 + chat 2.1 GB, EG2mm + d1 2.1 GB, **all four 3.4 GB**: inside a 4 GiB
+container that leaves too little headroom for multimodal embedding bursts (the all-four server was OOM-killed on its first video/image embeddings) - the startup log now says so. Pair two or three models per container, or give it more RAM.
 
 The server prints the KV size and warns when it approaches a container limit. Tests: `scripts/test_serve.py` (embeddings), `scripts/test_serve_lm.py`
 (chat: usage accounting, seeds, stream == non-stream, stop strings, UTF-8, errors, cancellation, concurrency, template parity with `--llama URL`),
-`scripts/bench_lm_serve.py` (concurrency scaling), `scripts/bench_serve.py` (embeddings).
+`scripts/test_serve_d1.py` (decisions: CLI parity, media, crop == pre-cropped image, error cases, concurrency / pass sharing), `scripts/bench_lm_serve.py` (concurrency scaling), `scripts/bench_serve.py` (embeddings).
 
 ## How the iGPU path is fast
 1. **int8 DP4A GEMMs** (`cl_khr_integer_dot_product`): Q8_0 weights resident on the GPU in a

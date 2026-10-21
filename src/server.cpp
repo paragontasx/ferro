@@ -7,6 +7,7 @@
 // (16 x 188 tokens: 850 tok/s; one short sequence at a time is several times slower per token). Image / audio / video jobs run
 // alone, in arrival order.
 #include "server.h"
+#include "decision_service.h"
 #include "embed_mm.h"
 #include "chat_template.h"
 #include "json.h"
@@ -173,6 +174,16 @@ struct GenJob {
     std::atomic<bool> cancelled{false};
 };
 
+// A decision request (POST /v1/systemone). The worker does everything (parse, decode + crop media, encode, score) so the CPU-side work of
+// several queued requests is done back to back and their questions share one forward pass.
+struct DecJob {
+    std::string body;
+    std::string out, err; int status = 200;
+    double queue_ms = 0, run_ms = 0, prep_ms = 0; size_t n_tok = 0, n_q = 0; int n_img = 0;
+    clk::time_point enq = clk::now();
+    std::mutex m; std::condition_variable cv; bool done = false;
+};
+
 // ---------------------------------------------------------------- server state
 struct Server {
     ServerOptions o;
@@ -181,6 +192,10 @@ struct Server {
     // language model
     LmEngine lm; BpeTokenizer ltok;
     bool has_lm = false;
+    // decision model (d1-omni)
+    DecisionService d1; bool has_d1 = false; std::string d1_name;
+    std::deque<std::shared_ptr<DecJob>> dq;       // guarded by qm
+    std::atomic<uint64_t> n_d1_req{0}, n_d1_q{0}, n_d1_tok{0}, n_d1_pass{0}, d1_us{0};
     ChatTemplateOptions chat_opt;                 // template variant, detected from the GGUF
     std::string lm_name; int think_open = -1, think_close = -1, eos_id = 7;
     std::deque<std::shared_ptr<GenJob>> gq;       // waiting for a slot (guarded by qm)
@@ -321,6 +336,43 @@ static void gen_iteration(Server& S) {
 }
 
 // ---------------------------------------------------------------- inference worker
+// One scheduler step for decision requests: take the queued ones (up to the token budget), prepare each (a bad request only fails itself),
+// run ONE packed forward over all their questions, answer them.
+static void d1_iteration(Server& S) {
+    std::vector<std::shared_ptr<DecJob>> jobs; std::vector<DecisionPrepared> preps; std::vector<std::shared_ptr<DecJob>> ok_jobs;
+    size_t budget = 0;
+    const auto t0 = clk::now();
+    while (jobs.size() < 32 && (int)budget < S.o.d1_batch_tokens) {
+        std::shared_ptr<DecJob> j;
+        { std::lock_guard<std::mutex> g(S.qm); if (S.dq.empty()) break; j = S.dq.front(); S.dq.pop_front(); }
+        jobs.push_back(j);
+        j->queue_ms = ms_since(j->enq);
+        try {
+            DecisionPrepared P = S.d1.prepare(json_parse(j->body));
+            j->prep_ms = P.prep_ms; j->n_tok = P.n_tok; j->n_q = P.seqs.size(); j->n_img = P.n_images;
+            budget += P.n_tok;
+            preps.push_back(std::move(P)); ok_jobs.push_back(j);
+        } catch (const std::invalid_argument& e) { j->err = e.what(); j->status = 400; }
+        catch (const std::exception& e) { j->err = std::string("invalid request: ") + e.what(); j->status = e.what()[0] == 'm' && std::string(e.what()).rfind("mmproj", 0) == 0 ? 500 : 400; }
+    }
+    if (jobs.empty()) return;
+    if (!ok_jobs.empty()) {
+        std::vector<DecisionPrepared*> ptrs; for (auto& p : preps) ptrs.push_back(&p);
+        std::vector<std::vector<std::vector<float>>> scores; std::string err;
+        const bool ok = S.d1.infer(ptrs, scores, &err);
+        for (size_t i = 0; i < ok_jobs.size(); ++i) {
+            DecJob& j = *ok_jobs[i];
+            if (!ok) { j.err = err.empty() ? "decision inference failed" : err; j.status = 500; continue; }
+            try { j.out = json_dump(S.d1.format(preps[i], scores[i])); S.n_d1_req++; S.n_d1_q += j.n_q; S.n_d1_tok += j.n_tok; }
+            catch (const std::exception& e) { j.err = std::string("decision failed: ") + e.what(); j.status = 500; }
+        }
+        S.n_d1_pass++;
+    }
+    const double run = ms_since(t0);
+    S.d1_us += (uint64_t)(run * 1000); S.busy_us += (uint64_t)(run * 1000);
+    for (auto& j : jobs) { j->run_ms = run; { std::lock_guard<std::mutex> g(j->m); j->done = true; } j->cv.notify_all(); }
+}
+
 static void worker_loop(Server& S, std::promise<std::string>& ready) {
     {
         std::string err;
@@ -332,6 +384,7 @@ static void worker_loop(Server& S, std::promise<std::string>& ready) {
             S.think_open = S.ltok.token_id("<think>"); S.think_close = S.ltok.token_id("</think>"); S.eos_id = S.lm.model().eos_id;
             S.lg.assign((size_t)S.lm.n_slots() * (size_t)S.lm.n_vocab(), 0.0f);
         }
+        if (S.has_d1 && !S.d1.init(S.o.d1, S.o.d1_mmproj, S.o.threads, &err, true)) { ready.set_value(err.empty() ? "decision model init failed" : "decision model: " + err); return; }
         ready.set_value(std::string());
     }
     MmEmbedOptions mo;
@@ -339,8 +392,8 @@ static void worker_loop(Server& S, std::promise<std::string>& ready) {
         std::vector<std::shared_ptr<Job>> batch;
         {
             std::unique_lock<std::mutex> lk(S.qm);
-            S.qcv.wait(lk, [&] { return S.stop || !S.q.empty() || !S.gq.empty() || S.n_active.load() > 0; });
-            if (S.stop && S.q.empty() && S.gq.empty() && S.n_active.load() == 0) break;
+            S.qcv.wait(lk, [&] { return S.stop || !S.q.empty() || !S.gq.empty() || !S.dq.empty() || S.n_active.load() > 0; });
+            if (S.stop && S.q.empty() && S.gq.empty() && S.dq.empty() && S.n_active.load() == 0) break;
             if (!S.q.empty()) {
                 batch.push_back(S.q.front()); S.q.pop_front();
                 if (batch[0]->text_only) {
@@ -397,6 +450,7 @@ static void worker_loop(Server& S, std::promise<std::string>& ready) {
                 j->cv.notify_all();
             }
         }
+        if (S.has_d1) d1_iteration(S);
         if (S.has_lm) gen_iteration(S);
     }
     // shutting down: fail whatever is still queued
@@ -405,6 +459,8 @@ static void worker_loop(Server& S, std::promise<std::string>& ready) {
     S.q.clear();
     for (auto& j : S.gq) { std::lock_guard<std::mutex> g(j->m); j->err = "server is shutting down"; j->status = 503; j->done = true; j->cv.notify_all(); }
     S.gq.clear();
+    for (auto& j : S.dq) { std::lock_guard<std::mutex> g(j->m); j->err = "server is shutting down"; j->status = 503; j->done = true; j->cv.notify_all(); }
+    S.dq.clear();
 }
 
 // ---------------------------------------------------------------- HTTP
@@ -510,6 +566,9 @@ static std::string models_json(const Server& S) {
     if (S.has_lm)
         d += std::string(d.empty() ? "" : ",") + "{\"id\":\"" + jesc(S.lm_name) + "\",\"object\":\"model\",\"created\":0,\"owned_by\":\"ferro\",\"capabilities\":[\"chat\",\"completions\"],\"modalities\":[\"text\"]," +
              "\"context_length\":" + std::to_string(S.lm.max_ctx()) + ",\"slots\":" + std::to_string(S.lm.n_slots()) + "}";
+    if (S.has_d1)
+        d += std::string(d.empty() ? "" : ",") + "{\"id\":\"" + jesc(S.d1_name) + "\",\"object\":\"model\",\"created\":0,\"owned_by\":\"ferro\",\"capabilities\":[\"decision\"],\"endpoint\":\"/v1/systemone\",\"modalities\":[\"text\"" +
+             (S.d1.has_vision() ? ",\"image\"" : "") + (S.d1.has_audio() ? ",\"audio\"" : "") + "]}";
     return "{\"object\":\"list\",\"data\":[" + d + "]}";
 }
 static std::string health_json(Server& S) {
@@ -529,6 +588,14 @@ static std::string health_json(Server& S) {
         snprintf(l, sizeof l, ",\"lm\":{\"model\":\"%s\",\"device\":\"%s\",\"slots\":%d,\"active\":%d,\"queued\":%zu,\"ctx\":%d,\"requests\":%llu,\"prompt_tokens\":%llu,\"generated_tokens\":%llu,\"tokens_per_s_busy\":%.2f}}",
                  jesc(S.lm_name).c_str(), S.lm.on_gpu() ? "igpu" : "cpu", S.lm.n_slots(), S.n_active.load(), gq, S.lm.max_ctx(), (unsigned long long)S.n_gen_req.load(),
                  (unsigned long long)S.n_prompt_tok.load(), (unsigned long long)S.n_gen_tok.load(), tg);
+        out.pop_back(); out += l;
+    }
+    if (S.has_d1) {
+        size_t dq; { std::lock_guard<std::mutex> g(S.qm); dq = S.dq.size(); }
+        char l[400];
+        snprintf(l, sizeof l, ",\"d1\":{\"model\":\"%s\",\"device\":\"%s\",\"queued\":%zu,\"requests\":%llu,\"questions\":%llu,\"tokens\":%llu,\"passes\":%llu,\"busy_s\":%.2f,\"image\":%s,\"audio\":%s}}",
+                 jesc(S.d1_name).c_str(), S.d1.on_gpu() ? "igpu" : "cpu", dq, (unsigned long long)S.n_d1_req.load(), (unsigned long long)S.n_d1_q.load(), (unsigned long long)S.n_d1_tok.load(),
+                 (unsigned long long)S.n_d1_pass.load(), S.d1_us.load() / 1e6, S.d1.has_vision() ? "true" : "false", S.d1.has_audio() ? "true" : "false");
         out.pop_back(); out += l;
     }
     return out;
@@ -750,6 +817,20 @@ static int handle_embeddings(Server& S, const std::string& text, std::string& bo
     return 200;
 }
 
+static int handle_systemone(Server& S, const std::string& text, std::string& body, std::string& logline) {
+    auto job = std::make_shared<DecJob>(); job->body = text;
+    { std::lock_guard<std::mutex> g(S.qm);
+      if ((int)S.dq.size() >= S.o.max_queue) { body = err_json("server is busy (queue full), retry shortly", "server_error"); logline = "queue full"; return 503; }
+      S.dq.push_back(job); }
+    S.qcv.notify_all();
+    { std::unique_lock<std::mutex> lk(job->m); job->cv.wait(lk, [&] { return job->done; }); }
+    if (!job->err.empty()) { body = err_json(job->err, job->status >= 500 ? "server_error" : "invalid_request_error"); logline = job->err; return job->status; }
+    body = job->out;
+    char lg[200]; snprintf(lg, sizeof lg, "q=%zu tok=%zu%s queue=%.1fms prep=%.0fms run=%.0fms", job->n_q, job->n_tok, job->n_img ? (" img=" + std::to_string(job->n_img)).c_str() : "", job->queue_ms, job->prep_ms, job->run_ms);
+    logline = lg;
+    return 200;
+}
+
 static void handle_conn(Server* Sp, int fd) {
     Server& S = *Sp;
     struct timeval tv; tv.tv_sec = 60; tv.tv_usec = 0;
@@ -767,7 +848,7 @@ static void handle_conn(Server* Sp, int fd) {
         if (!authed) { status = 401; body = err_json("invalid or missing API key", "authentication_error"); }
         else if (r.path == "/health" || r.path == "/v1/health") body = health_json(S);
         else if (r.path == "/v1/models" || r.path == "/models") body = models_json(S);
-        else if (r.path == "/") body = "{\"name\":\"ferro-embed\",\"endpoints\":[\"POST /v1/embeddings\",\"POST /v1/chat/completions\",\"POST /v1/completions\",\"GET /v1/models\",\"GET /health\"]}";
+        else if (r.path == "/") body = "{\"name\":\"ferro-embed\",\"endpoints\":[\"POST /v1/embeddings\",\"POST /v1/systemone\",\"POST /v1/chat/completions\",\"POST /v1/completions\",\"GET /v1/models\",\"GET /health\"]}";
         else if (r.path == "/apply-template" || r.path == "/v1/apply-template") {              // same contract as llama.cpp: {"messages": [...], "tools": [...]} -> {"prompt": "..."}
             try {
                 if (r.method != "POST") throw BadRequest("use POST");
@@ -788,6 +869,11 @@ static void handle_conn(Server* Sp, int fd) {
                 }
             }
         }
+        else if (r.path == "/v1/systemone" || r.path == "/systemone") {
+            if (r.method != "POST") { status = 405; body = err_json("use POST", "invalid_request_error"); }
+            else if (!S.has_d1) { status = 404; body = err_json("no decision model loaded (start the server with --d1 d1-omni.gguf)", "invalid_request_error"); }
+            else status = handle_systemone(S, r.body, body, logline);
+        }
         else if (r.path == "/v1/embeddings" || r.path == "/embeddings") {
             if (r.method != "POST") { status = 405; body = err_json("use POST", "invalid_request_error"); }
             else status = handle_embeddings(S, r.body, body, logline);
@@ -806,9 +892,10 @@ static void handle_conn(Server* Sp, int fd) {
 
 int run_server(const ServerOptions& opt) {
     Server& S = *new Server;                       // intentionally leaked: detached connection threads may outlive this function
-    S.o = opt; S.has_mm = !opt.mmproj.empty(); S.has_emb = !opt.model.empty(); S.has_lm = !opt.lm.empty(); g_srv = &S;
+    S.o = opt; S.has_mm = !opt.mmproj.empty(); S.has_emb = !opt.model.empty(); S.has_lm = !opt.lm.empty(); S.has_d1 = !opt.d1.empty(); g_srv = &S;
     std::promise<std::string> ready; auto ready_f = ready.get_future();
     fprintf(stderr, "[serve] loading%s%s%s%s ...\n", S.has_emb ? (" " + opt.model).c_str() : "", S.has_mm ? " + mmproj" : "", S.has_lm ? " and LM " : "", S.has_lm ? opt.lm.c_str() : "");
+    if (S.has_d1) fprintf(stderr, "[serve] + decision model %s\n", opt.d1.c_str());
     const auto t0 = clk::now();
     std::thread worker([&] { worker_loop(S, ready); });
     const std::string err = ready_f.get();
@@ -829,10 +916,23 @@ int run_server(const ServerOptions& opt) {
             const double kv_mb = (double)lm.n_attn_layers * S.lm.n_slots() * S.lm.max_ctx() * 2 * lm.n_kv * lm.head_dim * 4 / 1048576.0;
             double lim_mb = 0; if (FILE* f = fopen("/sys/fs/cgroup/memory.max", "r")) { unsigned long long v = 0; if (fscanf(f, "%llu", &v) == 1) lim_mb = v / 1048576.0; fclose(f); }
             fprintf(stderr, "[serve] KV cache %.0f MB (%d slot(s) x %d ctx)%s\n", kv_mb, S.lm.n_slots(), S.lm.max_ctx(), lim_mb > 0 ? (" | container memory limit " + std::to_string((long)lim_mb) + " MB").c_str() : "");
-            double w_mb = 0; { struct stat st; if (stat(opt.lm.c_str(), &st) == 0) w_mb += st.st_size / 1048576.0; if (S.has_emb && stat(opt.model.c_str(), &st) == 0) w_mb += 2.0 * st.st_size / 1048576.0; }
-            const double need_mb = kv_mb + w_mb * 1.15 + 700;                  // device weights + host copies/tables + runtime
-            if (lim_mb > 0 && need_mb > lim_mb) fprintf(stderr, "[serve] WARNING: ~%.0f MB needed (weights %.0f MB + KV %.0f MB + runtime) vs a %.0f MB container limit -> lower --lm-slots / --lm-ctx\n", need_mb, w_mb, kv_mb, lim_mb);
         }
+    }
+    if (S.has_d1) {
+        S.d1_name = S.d1.name();
+        fprintf(stderr, "[serve] decision model \"%s\" ready (%s, image %s, audio %s) - POST /v1/systemone\n", S.d1_name.c_str(), S.d1.on_gpu() ? "iGPU" : "CPU", S.d1.has_vision() ? "yes" : "no", S.d1.has_audio() ? "yes" : "no");
+    }
+    {   // device buffers on an iGPU are system RAM and cannot be swapped out: compare everything that is resident with any container limit.
+        // Calibrated on measurements (anon+shmem): ~700 MB runtime + 1.3 x all loaded GGUFs (incl. projectors) + the LM's KV cache.
+        double lim_mb = 0; if (FILE* f = fopen("/sys/fs/cgroup/memory.max", "r")) { unsigned long long v = 0; if (fscanf(f, "%llu", &v) == 1) lim_mb = v / 1048576.0; fclose(f); }
+        auto mb = [](const std::string& path) { struct stat st; return !path.empty() && stat(path.c_str(), &st) == 0 ? st.st_size / 1048576.0 : 0.0; };
+        double w_mb = mb(opt.model) + mb(opt.mmproj) + mb(opt.lm) + mb(opt.d1) + (S.has_d1 ? mb(S.d1.mmproj_path()) : 0.0);
+        double kv_mb = 0; if (S.has_lm) { const LmModel& lm = S.lm.model(); kv_mb = (double)lm.n_attn_layers * S.lm.n_slots() * S.lm.max_ctx() * 2 * lm.n_kv * lm.head_dim * 4 / 1048576.0; }
+        const double need_mb = 700 + 1.3 * w_mb + kv_mb;
+        if (lim_mb > 0 && need_mb > lim_mb)
+            fprintf(stderr, "[serve] WARNING: ~%.0f MB needed (weights %.0f MB + KV %.0f MB + runtime) vs a %.0f MB container limit -> drop a model, or lower --lm-slots / --lm-ctx\n", need_mb, w_mb, kv_mb, lim_mb);
+        else if (lim_mb > 0 && need_mb > 0.8 * lim_mb)
+            fprintf(stderr, "[serve] note: ~%.0f MB resident of a %.0f MB container limit - little headroom for request bursts (video / large images); consider fewer models or smaller --lm-ctx\n", need_mb, lim_mb);
     }
     fprintf(stderr, "[serve] ready in %.1fs\n", std::chrono::duration<double>(clk::now() - t0).count());
 

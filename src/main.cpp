@@ -6,6 +6,7 @@
 // req.json: one systemone request {"state":..., "questions":{...}} or a JSON array of them.
 #include "model_eg2.h"
 #include "model_lfm2.h"
+#include "decision_service.h"
 #include "media.h"
 #include "mm_encoder.h"
 #include "mm_gemma4.h"
@@ -37,7 +38,7 @@ static void usage() {
         "                   (multimodal EmbeddingGemma 2: items are interleaved in order into one 768-d embedding; vision/audio encoders on the iGPU)\n"
         "       ferro-embed generate --lm LFM2.5.gguf (--prompt TEXT | --messages f.json) [--n-predict N] [--temp T] [--top-k K] [--rep-penalty P] [--seed S]\n"
         "                   (text generation with an LFM2 / LFM2.5 model, e.g. LFM2.5-1.2B-Thinking; chat template + sampler built in)\n"
-        "       ferro-embed serve [--model EG2.gguf [--mmproj P.gguf]] [--lm LFM2.5.gguf [--lm-ctx N] [--lm-slots N] [--reasoning-format deepseek|none]] [--host H] [--port P] [--api-key K]\n"
+        "       ferro-embed serve [--model EG2.gguf [--mmproj P.gguf]] [--lm LFM2.5.gguf [--lm-ctx N] [--lm-slots N] [--reasoning-format deepseek|none]] [--d1 d1-omni.gguf [--d1-mmproj P.gguf]] [--host H] [--port P] [--api-key K]\n"
         "       (old form follows)  ferro-embed serve --model EG2.gguf [--mmproj P.gguf] [--host H] [--port N] [--api-key K] [--max-batch-tokens N] [--batch-wait-ms N]\n"
         "                   (resident OpenAI-compatible server: POST /v1/embeddings with text / image_url / input_audio / video_url parts, GET /v1/models, GET /health)\n"
         "       ferro-embed mm-embed --mmproj P.gguf --media image|audio --out f.bin     (per-chunk encoder output, mm_ref format)\n"
@@ -45,179 +46,47 @@ static void usage() {
     exit(2);
 }
 
-// decision models (LFM2 d1-omni): typed answers over a state, one forward pass, no generation
+// decision models (LFM2 d1-omni): typed answers over a state, one forward pass, no generation (the pipeline lives in decision_service.*)
 static int run_decide(const std::string& model, const std::string& reqf, const std::string& outp, int threads, int reps,
                       std::string mmproj_path) {
     struct PoolGuard { ~PoolGuard() { Pool::get().shutdown(); } } pool_guard;   // join workers on every exit path
-    auto t0 = clk::now();
-    DecisionEngine eng;
+    DecisionService svc;
     std::string err;
-    if (!eng.init(model, threads, &err)) { fprintf(stderr, "init failed: %s\n", err.c_str()); return 1; }
-    BpeTokenizer tok;
-    if (!tok.load(eng.gguf(), &err)) { fprintf(stderr, "tokenizer: %s\n", err.c_str()); return 1; }
-    DecisionPrompter dp;
-    if (!dp.init(eng.gguf(), &tok, &err)) { fprintf(stderr, "decision: %s\n", err.c_str()); return 1; }
-    fprintf(stderr, "[ferro] decision model %s loaded in %.2fs isa=%d threads=%d device=%s\n",
-            eng.gguf().get_str("general.name").c_str(), std::chrono::duration<double>(clk::now() - t0).count(),
-            isa_level(), threads, eng.on_gpu() ? "igpu" : "cpu");
+    if (!svc.init(model, mmproj_path, threads, &err)) { fprintf(stderr, "init failed: %s\n", err.c_str()); return 1; }
 
     std::string text;
     if (reqf == "-") { std::stringstream ss; ss << std::cin.rdbuf(); text = ss.str(); }
     else { std::ifstream f(reqf); if (!f) { fprintf(stderr, "cannot read %s\n", reqf.c_str()); return 1; } std::stringstream ss; ss << f.rdbuf(); text = ss.str(); }
 
-    std::vector<DecisionRequest> reqs;
-    bool batch = false;
-    std::vector<DecisionSeq> seqs;
-    // media: decoded + preprocessed per request (encoder inputs), encoded per run
-    struct ReqMedia { bool is_audio = false; int n_files = 0; std::vector<VisionInput> vin; Mel mel; int n_tok = 0; };
-    std::vector<ReqMedia> rmedia;
-    std::vector<int> req_media;     // request -> index into rmedia (-1 = text only)
-    MmProj mm;
-    double t_pre = 0;
+    DecisionPrepared P;
     try {
-        Json body = json_parse(text);
-        batch = body.is_array();
-        if (batch) for (auto& r : body.arr) reqs.push_back(dp.parse(r));
-        else reqs.push_back(dp.parse(body));
-        bool any_media = false;
-        for (auto& r : reqs) any_media = any_media || !r.files.empty();
-        if (any_media) {
-            if (mmproj_path.empty()) mmproj_path = find_mmproj_near(model);
-            if (mmproj_path.empty()) throw std::invalid_argument("this request has images/audio but no mmproj GGUF was given (--mmproj) or found next to the model");
-            std::string merr;
-            auto tl = clk::now();
-            if (!mm.load(mmproj_path, &merr)) throw std::runtime_error("mmproj " + mmproj_path + ": " + merr);
-            if (eng.on_gpu()) mm.upload_gpu();
-            fprintf(stderr, "[ferro] mmproj %s loaded in %.2fs (vision %s, audio %s)\n", mmproj_path.c_str(),
-                    std::chrono::duration<double>(clk::now() - tl).count(), mm.has_vision() ? "yes" : "no", mm.has_audio() ? "yes" : "no");
-        }
-        auto tp = clk::now();
-        for (auto& r : reqs) {
-            if (r.files.empty()) { req_media.push_back(-1); continue; }
-            ReqMedia rm;
-            rm.n_files = (int)r.files.size();
-            std::vector<MediaItem> items;
-            for (auto& f : r.files) items.push_back(decode_media(f, 16000));
-            for (auto& it : items) rm.is_audio = rm.is_audio || it.is_audio;
-            if (rm.is_audio && items.size() > 1) throw std::invalid_argument("a request has images or one audio clip, not both");
-            if (rm.is_audio) {
-                if (!mm.has_audio()) throw std::invalid_argument("this mmproj has no audio encoder");
-                if (!d1omni_audio_mel(items[0].pcm.data(), items[0].pcm.size(), mm.n_mel(), rm.mel)) throw std::invalid_argument("the audio clip is empty");
-                rm.n_tok = audio_tokens(rm.mel);
-            } else {
-                if (!mm.has_vision()) throw std::invalid_argument("this mmproj has no vision encoder");
-                for (auto& it : items) {
-                    auto v = d1omni_preprocess_image(it.rgb.data(), it.nx, it.ny, mm.vision_params());
-                    for (auto& x : v) { rm.n_tok += vision_tokens(x, mm.vision_params()); rm.vin.push_back(std::move(x)); }
-                }
-            }
-            req_media.push_back((int)rmedia.size());
-            rmedia.push_back(std::move(rm));
-        }
-        t_pre = std::chrono::duration<double>(clk::now() - tp).count();
-        for (size_t ri = 0; ri < reqs.size(); ++ri) {
-            DecisionMediaInfo mi;
-            if (req_media[ri] >= 0) { const auto& rm = rmedia[req_media[ri]]; mi.n_tokens = rm.n_tok; mi.is_audio = rm.is_audio; mi.n_files = rm.n_files; }
-            for (auto& q : reqs[ri].questions) {
-                DecisionSeq sq = dp.build(reqs[ri], q, mi);
-                sq.media = req_media[ri];
-                seqs.push_back(std::move(sq));
-            }
-        }
+        P = svc.prepare(json_parse(text));
     } catch (const std::exception& e) {
         fprintf(stderr, "bad request: %s\n", e.what());
         printf("{\"error\":{\"code\":400,\"message\":%s,\"type\":\"invalid_request_error\"}}\n", json_dump(Json::str(e.what())).c_str());
         return 3;
     }
-    size_t n_tok = 0, n_media_tok = 0;
-    for (auto& s : seqs) n_tok += s.tokens.size() + s.n_media;
-    for (auto& rm : rmedia) n_media_tok += rm.n_tok;
-    if (!rmedia.empty())
-        fprintf(stderr, "[ferro] %zu media request(s), %zu media tokens (decode+preprocess %.1f ms)\n", rmedia.size(), n_media_tok, t_pre * 1e3);
-    if (getenv("FERRO_DECISION_DUMP")) {
-        size_t k = 0;
-        for (size_t ri = 0; ri < reqs.size(); ++ri) for (auto& q : reqs[ri].questions) {
-            auto& r = reqs[ri];
-            DecisionMediaInfo mi;
-            if (req_media[ri] >= 0) { mi.n_tokens = rmedia[req_media[ri]].n_tok; mi.is_audio = rmedia[req_media[ri]].is_audio; mi.n_files = rmedia[req_media[ri]].n_files; }
-            fprintf(stderr, "[prompt %s] (media %d) %s\n[tokens]", q.id.c_str(), mi.n_tokens, dp.render_debug(r, q, mi).c_str());
-            for (int t : seqs[k].tokens) fprintf(stderr, " %d", t);
-            fprintf(stderr, "\n"); ++k;
-        }
-    }
-    fprintf(stderr, "[ferro] %zu request(s), %zu question sequences, %zu tokens\n", reqs.size(), seqs.size(), n_tok);
+    if (!P.rmedia.empty())
+        fprintf(stderr, "[ferro] %zu media request(s), %zu media tokens (decode+preprocess %.1f ms)\n", P.rmedia.size(), P.n_media_tok, P.prep_ms);
+    fprintf(stderr, "[ferro] %zu request(s), %zu question sequences, %zu tokens\n", P.reqs.size(), P.seqs.size(), P.n_tok);
 
-    std::vector<std::vector<float>> scores;
+    std::vector<std::vector<std::vector<float>>> scores;
     double best = 1e30, total = 0;
     reps = std::max(1, reps);
-    std::vector<std::vector<float>> membd(rmedia.size());
-    std::vector<DecisionMediaEmbd> media(rmedia.size());
     for (int r = 0; r < reps; ++r) {
         auto s = clk::now();
-        // media encoders (part of the request latency)
-        for (size_t i = 0; i < rmedia.size(); ++i) {
-            membd[i] = rmedia[i].is_audio ? mm.encode_audio(rmedia[i].mel) : mm.encode_vision(rmedia[i].vin);
-            if (const char* ov = getenv("FERRO_MEDIA_OVERRIDE")) {
-                // debug: replace the encoder output with a dump (bench/mm/mm_ref format) of the same length
-                FILE* f = fopen(ov, "rb");
-                int32_t nc = 0; std::vector<float> all;
-                if (f && fread(&nc, 4, 1, f) == 1)
-                    for (int c = 0; c < nc; ++c) {
-                        int32_t n = 0, ne = 0;
-                        if (fread(&n, 4, 1, f) != 1 || fread(&ne, 4, 1, f) != 1) break;
-                        std::vector<float> v((size_t)n * ne);
-                        if (fread(v.data(), 4, v.size(), f) != v.size()) break;
-                        all.insert(all.end(), v.begin(), v.end());
-                    }
-                if (f) fclose(f);
-                if (all.size() == membd[i].size()) { membd[i] = all; fprintf(stderr, "[debug] media %zu: encoder output replaced by %s\n", i, ov); }
-            }
-            media[i].embd = membd[i].data();
-            media[i].n_tok = (int)(membd[i].size() / eng.model().n_embd);
-            if (media[i].n_tok != rmedia[i].n_tok) { fprintf(stderr, "media encoder produced %d tokens, expected %d\n", media[i].n_tok, rmedia[i].n_tok); return 1; }
-        }
-        if (!rmedia.empty() && (reps > 1 || getenv("FERRO_VERBOSE")))
-            fprintf(stderr, "[ferro] media encode %.1f ms\n", std::chrono::duration<double, std::milli>(clk::now() - s).count());
-        static const bool sequential = getenv("FERRO_DECISION_SEQUENTIAL") != nullptr;   // one request per forward (latency mode)
-        if (!sequential) eng.score(seqs, scores, media);
-        else {
-            scores.clear();
-            size_t k0 = 0;
-            for (auto& rq : reqs) {
-                std::vector<DecisionSeq> part(seqs.begin() + k0, seqs.begin() + k0 + rq.questions.size());
-                std::vector<std::vector<float>> sc;
-                eng.score(part, sc, media);
-                scores.insert(scores.end(), sc.begin(), sc.end());
-                k0 += rq.questions.size();
-            }
-        }
+        if (!svc.infer({&P}, scores, &err)) { fprintf(stderr, "%s\n", err.c_str()); return 1; }
         double dt = std::chrono::duration<double>(clk::now() - s).count();
         if (r > 0 || reps == 1) { best = std::min(best, dt); total += dt; }
-        if (reps > 1) fprintf(stderr, "[ferro] rep %d: %.1f ms  (%.0f tok/s)\n", r, dt * 1e3, n_tok / dt);
+        if (reps > 1) fprintf(stderr, "[ferro] rep %d: %.1f ms  (%.0f tok/s)\n", r, dt * 1e3, P.n_tok / dt);
     }
     if (reps > 1)
         fprintf(stderr, "[ferro] BEST %.1f ms | avg(excl warmup) %.1f ms | %.0f tok/s\n",
-                best * 1e3, total / (reps - 1) * 1e3, n_tok / (total / (reps - 1)));
+                best * 1e3, total / (reps - 1) * 1e3, P.n_tok / (total / (reps - 1)));
 
-    Json all = Json::array();
-    size_t k = 0;
-    try {
-        for (size_t ri = 0; ri < reqs.size(); ++ri) {
-            auto& r = reqs[ri];
-            Json answers = Json::object();
-            int64_t ntok = 0;
-            for (auto& q : r.questions) { ntok += (int64_t)(seqs[k].tokens.size() + seqs[k].n_media); answers.set(q.id, dp.answer(q, scores[k], req_media[ri] >= 0)); ++k; }
-            Json res = Json::object();
-            res.set("model", Json::str(eng.gguf().get_str("general.name")));
-            res.set("answers", answers);
-            Json usage = Json::object();
-            usage.set("input_tokens", Json::integer(ntok));
-            usage.set("output_tokens", Json::integer(0));
-            res.set("usage", usage);
-            all.push(res);
-        }
-    } catch (const std::exception& e) { fprintf(stderr, "decision failed: %s\n", e.what()); return 1; }
-    const std::string js = json_dump(batch ? all : all.arr[0]);
+    std::string js;
+    try { js = json_dump(svc.format(P, scores[0])); }
+    catch (const std::exception& e) { fprintf(stderr, "decision failed: %s\n", e.what()); return 1; }
     if (!outp.empty()) {
         FILE* f = fopen(outp.c_str(), "w");
         if (!f) { fprintf(stderr, "cannot write %s\n", outp.c_str()); return 1; }
@@ -356,6 +225,8 @@ int main(int argc, char** argv) {
         else if (a == "--max-tokens") maxtok = atoi(next("--max-tokens"));
         else if (a == "--reps") reps = atoi(next("--reps"));
         else if (a == "--lm") ga.lm = next("--lm");
+        else if (a == "--d1") so.d1 = next("--d1");
+        else if (a == "--d1-mmproj") so.d1_mmproj = next("--d1-mmproj");
         else if (a == "--lm-ctx") so.lm_ctx = atoi(next("--lm-ctx"));
         else if (a == "--lm-slots") so.lm_slots = atoi(next("--lm-slots"));
         else if (a == "--lm-name") so.lm_name = next("--lm-name");
@@ -396,7 +267,7 @@ int main(int argc, char** argv) {
         return run_generate(ga);
     }
     if (cmd == "serve") {
-        if (model.empty() && ga.lm.empty()) { fprintf(stderr, "serve [--model EG2.gguf [--mmproj P.gguf]] [--lm LFM2.5.gguf [--lm-ctx N] [--lm-slots N]] [--host 127.0.0.1] [--port 8080] [--api-key K]\n"); return 2; }
+        if (model.empty() && ga.lm.empty() && so.d1.empty()) { fprintf(stderr, "serve [--model EG2.gguf [--mmproj P.gguf]] [--lm LFM2.5.gguf [--lm-ctx N] [--lm-slots N]] [--d1 d1-omni.gguf [--d1-mmproj P.gguf]] [--host 127.0.0.1] [--port 8080] [--api-key K]\n"); return 2; }
         if (so.lm_ctx < 256 || so.lm_slots < 1 || so.lm_slots > 32 || (so.reasoning_format != "deepseek" && so.reasoning_format != "none")) { fprintf(stderr, "bad --lm-ctx / --lm-slots / --reasoning-format (deepseek|none)\n"); return 2; }
         so.model = model; so.mmproj = mmproj; so.lm = ga.lm; so.threads = threads > 0 ? threads : 2; so.video_fps = video_fps;
         if (so.api_key.empty()) if (const char* k = getenv("FERRO_API_KEY")) so.api_key = k;

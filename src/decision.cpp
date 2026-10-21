@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <stdexcept>
 
 namespace ferro {
@@ -44,6 +45,48 @@ bool DecisionPrompter::init(const GgufFile& g, const BpeTokenizer* tok, std::str
     return true;
 }
 
+// ---------------------------------------------------------------- crops
+static double crop_num(const Json& c, const char* k, const std::string& where, bool required, double def = 0) {
+    const Json* v = c.find(k);
+    if (!v || v->is_null()) { if (required) throw std::invalid_argument(where + ": \"" + k + "\" is required"); return def; }
+    double d;
+    if (v->t == Json::Int) d = (double)v->i; else if (v->t == Json::Float) d = v->d;
+    else throw std::invalid_argument(where + ": \"" + k + "\" must be a number");
+    if (!std::isfinite(d)) throw std::invalid_argument(where + ": \"" + k + "\" must be finite");
+    return d;
+}
+static CropSpec parse_crop(const Json& c, const std::string& where) {
+    if (!c.is_object()) throw std::invalid_argument(where + ": a crop must be an object {x,y,w,h} or {x1,y1,x2,y2}");
+    CropSpec r;
+    const Json* u = c.find("unit");
+    if (u && !u->is_null()) {
+        if (!u->is_string() || (u->s != "px" && u->s != "norm")) throw std::invalid_argument(where + ": \"unit\" must be \"px\" or \"norm\"");
+        r.norm = u->s == "norm";
+    }
+    if (c.contains("x1") || c.contains("x2")) {
+        const double x1 = crop_num(c, "x1", where, true), y1 = crop_num(c, "y1", where, true), x2 = crop_num(c, "x2", where, true), y2 = crop_num(c, "y2", where, true);
+        r.x = std::min(x1, x2); r.y = std::min(y1, y2); r.w = std::fabs(x2 - x1); r.h = std::fabs(y2 - y1);
+    } else {
+        r.x = crop_num(c, "x", where, true); r.y = crop_num(c, "y", where, true); r.w = crop_num(c, "w", where, true); r.h = crop_num(c, "h", where, true);
+    }
+    r.pad = crop_num(c, "pad", where, false, 0);
+    if (r.w <= 0 || r.h <= 0) throw std::invalid_argument(where + ": the crop box must have a positive width and height");
+    if (r.pad < 0 || r.pad > 4) throw std::invalid_argument(where + ": \"pad\" must be between 0 and 4 (a fraction of the box size)");
+    return r;
+}
+bool crop_rgb(const uint8_t* rgb, int nx, int ny, const CropSpec& c, std::vector<uint8_t>& out, int& ox, int& oy, std::string* err) {
+    double x = c.x, y = c.y, w = c.w, h = c.h;
+    if (c.norm) { x *= nx; w *= nx; y *= ny; h *= ny; }
+    x -= c.pad * w; y -= c.pad * h; w *= 1 + 2 * c.pad; h *= 1 + 2 * c.pad;
+    const int x0 = std::max(0, (int)std::floor(x + 1e-9)), y0 = std::max(0, (int)std::floor(y + 1e-9));
+    const int x1 = std::min(nx, (int)std::ceil(x + w - 1e-9)), y1 = std::min(ny, (int)std::ceil(y + h - 1e-9));
+    if (x1 <= x0 || y1 <= y0) { if (err) *err = "the crop box lies outside the " + std::to_string(nx) + "x" + std::to_string(ny) + " image"; return false; }
+    ox = x1 - x0; oy = y1 - y0;
+    out.resize((size_t)ox * oy * 3);
+    for (int r = 0; r < oy; ++r) memcpy(&out[(size_t)r * ox * 3], rgb + ((size_t)(y0 + r) * nx + x0) * 3, (size_t)ox * 3);
+    return true;
+}
+
 // ---------------------------------------------------------------- request parsing
 DecisionRequest DecisionPrompter::parse(const Json& body) const {
     if (!body.is_object()) throw std::invalid_argument("request must be a JSON object");
@@ -55,16 +98,39 @@ DecisionRequest DecisionPrompter::parse(const Json& body) const {
         const Json* v = body.find("videos");
         if (v && !v->is_null() && !(v->is_array() && v->arr.empty())) throw std::invalid_argument("\"videos\" is not supported");
     }
-    auto add_file = [&](const Json& url, bool audio) {
+    // a media entry is a data-URL string, or {"url": "...", "crop": {...}, "crops": [{...}, ...], "include_full": bool}: the region fields cut
+    // the decoded image server-side. With "crops" only the crops are used unless "include_full" is true.
+    auto add_file = [&](const Json& entry, bool audio) {
+        const Json* url = &entry;
+        FileSpec spec;
+        if (entry.is_object()) {
+            url = entry.find("url");
+            if (!url) throw std::invalid_argument("an image entry needs a \"url\" (data URL)");
+            const Json* cj = entry.find("crop"); const Json* cs = entry.find("crops"); const Json* inc = entry.find("include_full");
+            const bool has_regions = (cj && !cj->is_null()) || (cs && !cs->is_null());
+            if (has_regions && audio) throw std::invalid_argument("crop / crops apply to images, not audio");
+            if (cj && !cj->is_null()) spec.crops.push_back(parse_crop(*cj, "crop"));
+            if (cs && !cs->is_null()) {
+                if (!cs->is_array() || cs->arr.empty()) throw std::invalid_argument("\"crops\" must be a non-empty array");
+                for (size_t i = 0; i < cs->arr.size(); ++i) spec.crops.push_back(parse_crop(cs->arr[i], "crops[" + std::to_string(i) + "]"));
+            }
+            spec.full = spec.crops.empty();
+            if (inc && !inc->is_null()) {
+                if (inc->t != Json::Bool) throw std::invalid_argument("\"include_full\" must be a boolean");
+                if (inc->b) spec.full = true;
+            }
+        }
         if (audio) {
-            if (!url.is_string() || url.s.rfind("http", 0) == 0 || url.s.rfind("file://", 0) == 0)
+            if (!url->is_string() || url->s.rfind("http", 0) == 0 || url->s.rfind("file://", 0) == 0)
                 throw std::invalid_argument("audio must be base64 data");
-        } else if (!url.is_string() || url.s.rfind("data:", 0) != 0) {
+        } else if (!url->is_string() || url->s.rfind("data:", 0) != 0) {
             throw std::invalid_argument("images must be data URLs (data:image/...;base64,... or data:audio/...;base64,...)");
         }
-        if (req.files.size() >= MAX_MEDIA_FILES)
-            throw std::invalid_argument(std::string("too many ") + (audio ? "media files" : "images") + ", the maximum is " + std::to_string(MAX_MEDIA_FILES));
-        req.files.push_back(media_bytes_from_url(url.s));
+        size_t used = 0; for (const auto& fs : req.file_specs) used += (size_t)fs.n_images();
+        if (used + (size_t)spec.n_images() > MAX_MEDIA_FILES)
+            throw std::invalid_argument(std::string("too many ") + (audio ? "media files" : "images") + " (crops count as images), the maximum is " + std::to_string(MAX_MEDIA_FILES));
+        req.files.push_back(media_bytes_from_url(url->s));
+        req.file_specs.push_back(spec);
     };
     for (const char* key : {"files", "images"}) {
         const Json* m = body.find(key);
@@ -87,7 +153,7 @@ DecisionRequest DecisionPrompter::parse(const Json& body) const {
                     const std::string tn = ty && ty->is_string() ? ty->s : "";
                     if (tn == "image_url" && part.contains("image_url")) {
                         const Json& iu = part.at("image_url");
-                        add_file(iu.is_object() && iu.contains("url") ? iu.at("url") : iu, false);
+                        add_file(iu, false);
                     } else if (tn == "input_audio" && part.contains("input_audio")) {
                         const Json& ia = part.at("input_audio");
                         Json d;

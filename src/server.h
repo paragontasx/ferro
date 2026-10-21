@@ -1,6 +1,7 @@
 // server.h - `ferro-embed serve`: a resident, OpenAI-compatible HTTP server.
 //   * embeddings: EmbeddingGemma 2, text / image / audio / video        (--model [--mmproj])
 //   * chat / completions: LiquidAI LFM2 / LFM2.5 language models, streaming (--lm)
+//   * decisions: LiquidAI d1-omni typed answers over text / image / audio states, llama.cpp's POST /v1/systemone contract (--d1 [--d1-mmproj])
 // Either or both can be loaded; they share the iGPU through one worker thread.
 #pragma once
 #include <string>
@@ -10,6 +11,8 @@ namespace ferro {
 struct ServerOptions {
     std::string model, mmproj;                 // EG2 text GGUF (+ optional mmproj for image / audio / video inputs); empty = no embeddings
     std::string lm;                            // LFM2 / LFM2.5 language-model GGUF (chat + completions); empty = no generation
+    std::string d1, d1_mmproj;                 // d1-omni decision GGUF (+ its mmproj for image / audio states; found next to the model when omitted); empty = no /v1/systemone
+    int d1_batch_tokens = 2048;                // queued decision requests share one forward pass up to this many tokens
     std::string lm_name;                       // id reported for the language model (default: file name)
     int lm_ctx = 4096;                         // context per sequence slot; the KV cache is allocated up front (LFM2.5-1.2B: ~25 MB per 1k tokens per slot)
     int lm_slots = 4;                          // concurrent generations (decode of all active slots runs as one batched pass)

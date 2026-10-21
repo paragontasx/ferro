@@ -23,10 +23,28 @@ struct DecisionQuestion {
     Json instructions;
     std::vector<DecisionOption> options;   // in model output order
 };
+// A region of an image, so callers can send the whole frame plus a detector box instead of encoding a crop themselves.
+//   {"x":..,"y":..,"w":..,"h":..} or {"x1":..,"y1":..,"x2":..,"y2":..}; "unit": "px" (default) | "norm" (0..1 of the width/height);
+//   "pad": fraction of the box size added on every side (default 0). The box is clipped to the image.
+struct CropSpec {
+    double x = 0, y = 0, w = 0, h = 0;   // x,y = top-left; w,h = size (already converted from x1,y1,x2,y2)
+    bool norm = false;
+    double pad = 0;
+};
+// what one entry of "files" / one image_url part turns into: the full image and/or one image per crop
+struct FileSpec {
+    bool full = true;
+    std::vector<CropSpec> crops;
+    int n_images() const { return (full ? 1 : 0) + (int)crops.size(); }
+};
+// crops one RGB image; returns false (and sets err) when the box misses the image. out is ox x oy, row-major RGB.
+bool crop_rgb(const uint8_t* rgb, int nx, int ny, const CropSpec& c, std::vector<uint8_t>& out, int& ox, int& oy, std::string* err);
+
 struct DecisionRequest {
     Json state;                                  // media parts removed
     std::vector<DecisionQuestion> questions;
     std::vector<std::vector<uint8_t>> files;     // encoded media (images or one audio), in request order
+    std::vector<FileSpec> file_specs;            // parallel to files (audio: always the default)
 };
 // what the media of a request turned into (filled by the caller after decoding/encoding)
 struct DecisionMediaInfo {
