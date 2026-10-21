@@ -36,6 +36,7 @@
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <thread>
 #include <unistd.h>
 #include <vector>
@@ -180,6 +181,7 @@ struct Server {
     // language model
     LmEngine lm; BpeTokenizer ltok;
     bool has_lm = false;
+    ChatTemplateOptions chat_opt;                 // template variant, detected from the GGUF
     std::string lm_name; int think_open = -1, think_close = -1, eos_id = 7;
     std::deque<std::shared_ptr<GenJob>> gq;       // waiting for a slot (guarded by qm)
     std::vector<std::shared_ptr<GenJob>> active;  // worker only
@@ -326,6 +328,7 @@ static void worker_loop(Server& S, std::promise<std::string>& ready) {
         if (S.has_lm) {
             if (!S.lm.init(S.o.lm, S.o.threads, S.o.lm_ctx, &err, S.o.lm_slots)) { ready.set_value(err.empty() ? "language model init failed" : "language model: " + err); return; }
             if (!S.ltok.load(S.lm.model().gguf, &err)) { ready.set_value("language model tokenizer: " + err); return; }
+            S.chat_opt.typed_content = lfm_template_is_typed(S.lm.model().gguf.get_str("tokenizer.chat_template"));
             S.think_open = S.ltok.token_id("<think>"); S.think_close = S.ltok.token_id("</think>"); S.eos_id = S.lm.model().eos_id;
             S.lg.assign((size_t)S.lm.n_slots() * (size_t)S.lm.n_vocab(), 0.0f);
         }
@@ -550,7 +553,7 @@ static std::shared_ptr<GenJob> parse_gen_request(Server& S, const std::string& t
     if (chat) {
         const Json* m = b.find("messages");
         if (!m || !m->is_array() || m->arr.empty()) throw BadRequest("\"messages\" must be a non-empty array");
-        try { rendered = lfm_chat_render(*m, b.find("tools")); } catch (const std::exception& e) { throw BadRequest(std::string("messages: ") + e.what()); }
+        try { rendered = lfm_chat_render(*m, b.find("tools"), S.chat_opt); } catch (const std::exception& e) { throw BadRequest(std::string("messages: ") + e.what()); }
     } else {
         const Json* p = b.find("prompt");
         if (p && p->is_array() && p->arr.size() == 1) p = &p->arr[0];
@@ -770,7 +773,7 @@ static void handle_conn(Server* Sp, int fd) {
                 if (r.method != "POST") throw BadRequest("use POST");
                 Json b = json_parse(r.body); const Json* m = b.is_object() ? b.find("messages") : nullptr;
                 if (!m || !m->is_array()) throw BadRequest("\"messages\" must be an array");
-                body = "{\"prompt\":" + dquote(lfm_chat_render(*m, b.find("tools"))) + "}";
+                body = "{\"prompt\":" + dquote(lfm_chat_render(*m, b.find("tools"), S.chat_opt)) + "}";
             } catch (const std::exception& e) { status = 400; body = err_json(e.what(), "invalid_request_error"); }
         }
         else if (r.path == "/v1/chat/completions" || r.path == "/chat/completions" || r.path == "/v1/completions" || r.path == "/completions") {
@@ -819,13 +822,16 @@ int run_server(const ServerOptions& opt) {
     if (S.has_lm) {
         S.lm_name = opt.lm_name;
         if (S.lm_name.empty()) { std::string f = opt.lm; const size_t sl = f.find_last_of('/'); if (sl != std::string::npos) f = f.substr(sl + 1); if (f.size() > 5 && f.compare(f.size() - 5, 5, ".gguf") == 0) f.resize(f.size() - 5); S.lm_name = f; }
-        fprintf(stderr, "[serve] language model \"%s\" ready (%d slot(s) x %d ctx, %s)\n", S.lm_name.c_str(), S.lm.n_slots(), S.lm.max_ctx(), S.lm.on_gpu() ? "iGPU" : "CPU");
+        fprintf(stderr, "[serve] language model \"%s\" ready (%d slot(s) x %d ctx, %s, chat template: %s)\n", S.lm_name.c_str(), S.lm.n_slots(), S.lm.max_ctx(), S.lm.on_gpu() ? "iGPU" : "CPU",
+                S.chat_opt.typed_content ? "typed-content variant" : "plain-content variant");
         {   // device buffers on an iGPU are system RAM and cannot be swapped out: say how much the KV cache takes and compare with any container limit
             const LmModel& lm = S.lm.model();
             const double kv_mb = (double)lm.n_attn_layers * S.lm.n_slots() * S.lm.max_ctx() * 2 * lm.n_kv * lm.head_dim * 4 / 1048576.0;
             double lim_mb = 0; if (FILE* f = fopen("/sys/fs/cgroup/memory.max", "r")) { unsigned long long v = 0; if (fscanf(f, "%llu", &v) == 1) lim_mb = v / 1048576.0; fclose(f); }
             fprintf(stderr, "[serve] KV cache %.0f MB (%d slot(s) x %d ctx)%s\n", kv_mb, S.lm.n_slots(), S.lm.max_ctx(), lim_mb > 0 ? (" | container memory limit " + std::to_string((long)lim_mb) + " MB").c_str() : "");
-            if (lim_mb > 0 && kv_mb + 2600 > lim_mb) fprintf(stderr, "[serve] WARNING: weights (~2.3 GB incl. embeddings model) + this KV cache may exceed the container limit -> lower --lm-slots / --lm-ctx\n");
+            double w_mb = 0; { struct stat st; if (stat(opt.lm.c_str(), &st) == 0) w_mb += st.st_size / 1048576.0; if (S.has_emb && stat(opt.model.c_str(), &st) == 0) w_mb += 2.0 * st.st_size / 1048576.0; }
+            const double need_mb = kv_mb + w_mb * 1.15 + 700;                  // device weights + host copies/tables + runtime
+            if (lim_mb > 0 && need_mb > lim_mb) fprintf(stderr, "[serve] WARNING: ~%.0f MB needed (weights %.0f MB + KV %.0f MB + runtime) vs a %.0f MB container limit -> lower --lm-slots / --lm-ctx\n", need_mb, w_mb, kv_mb, lim_mb);
         }
     }
     fprintf(stderr, "[serve] ready in %.1fs\n", std::chrono::duration<double>(clk::now() - t0).count());

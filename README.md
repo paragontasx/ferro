@@ -7,7 +7,7 @@ binary, **on the integrated GPU by default** (OpenCL, int8 DP4A) with automatic 
 |---|---|---|---|
 | **EmbeddingGemma-2** | `gemma-embedding2` | `embed` / `bench` | sentence embeddings |
 | **LiquidAI d1-omni-600M** | `lfm2` + `lfm2.decision.*` | `decide` / `bench` | typed answers (yes/no, choice, score) over a state, one forward pass, no generated tokens |
-| **LiquidAI LFM2 / LFM2.5** (e.g. LFM2.5-1.2B-Thinking) | `lfm2` (causal) | `generate` / `serve --lm` | text generation: chat + completions, streaming, OpenAI-compatible |
+| **LiquidAI LFM2 / LFM2.5** (LFM2.5-1.2B-Thinking, LFM2.5-350M, ...) | `lfm2` (causal) | `generate` / `serve --lm` | text generation: chat + completions, streaming, OpenAI-compatible |
 
 The model kind is detected from the GGUF metadata. libOpenCL is `dlopen`'d, so the binary also runs on
 GPU-less hosts. Native GGUF loading and native tokenizers (Gemma SPM-BPE; LFM2 byte-level BPE).
@@ -132,6 +132,17 @@ device slots, prefill uses a causal tiled attention kernel, decode batches one t
 | prefill, 762 tokens | **153 tok/s** | 11.2 tok/s |
 | decode, 1 stream | **15-19 tok/s** | 6.1 tok/s |
 | decode, aggregate over 2 / 4 streams (server) | **22 / 35 tok/s** | |
+
+**LFM2.5-350M** (`LiquidAI/LFM2.5-350M-GGUF`, Q8_0, same code path, no model-specific changes) measured the same way:
+
+| LFM2.5-350M Q8_0 | ferro iGPU | llama.cpp CPU (2 threads) |
+|---|---|---|
+| prefill, 192 / 762 / 1522 tokens | 192 / **490** / 414 tok/s | 66.7 tok/s (762 tokens) |
+| decode, 1 stream | **36-37 tok/s** | 31.8 tok/s |
+| decode, aggregate over 2 / 4 / 8 streams (server) | **58 / 98 / 132 tok/s** | |
+
+Parity vs llama.cpp Q8_0 on the same weights: top-1 12/12, mean TV 0.017 (every prompt < 0.06). This model is far more sensitive to Q8 than the 1.2B (llama.cpp's own Q8 vs F16 is TV 0.040; ferro vs F16 0.043; both flip the same near-tie on an out-of-distribution `<think>` prompt), so compare against the same-weights Q8 oracle for it. Decode here is latency-bound (0.38 GB of weights = ~15 ms at 25.9 GB/s, the step takes ~27 ms: ~190 small kernel launches/token), so it is only ~1.1x llama.cpp CPU single-stream; prefill and batched serving are where the iGPU wins.
+The chat template is read from each GGUF: the 350M template walks content arrays itself (text parts concatenated, system arrays too) while the Thinking template does not (llama.cpp's server joins parts with `\n` there); `serve` logs the detected variant and `/apply-template` is byte-identical to llama.cpp's jinja for both.
 
 Decode streams 1.17 GB of weights per token at ~22 GB/s; a pure-streaming read kernel reaches 25.9 GB/s on this iGPU, so Q8 decode is ~85% of the
 hardware limit (only a smaller weight format can go meaningfully faster). **Accuracy** (`scripts/lm_parity.py`, 12 prompts incl. chat-template,

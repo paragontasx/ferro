@@ -314,3 +314,19 @@ EG2 headline 218.6 ms (A/B with the small-tile GEMM off: 218.5 ms); d1 `bench` 5
 ### Not done / limits
 Q4 weight path (decode is bandwidth-bound: ~2x); prefix caching for multi-turn chat (conv state is only valid at the end of a sequence - needs a snapshot at the end of the prompt);
 tool-call parsing of model output; `n > 1`, logprobs; sampling is on the host (~10 ms/token); 1522-token prefill drops to 134 tok/s (attention); the CPU reference decodes at ~0.5 tok/s.
+
+### LFM2.5-350M (same engine, no model-specific code) - 2026-10-22
+`LFM2.5-350M-Q8_0.gguf` (d 1024, 16 heads x 64, 8 kv, ffn 6656, 10 conv + 6 attention), llama.cpp reference = same file on CPU (2 threads) and the F16 GGUF.
+| | ferro iGPU | llama.cpp CPU |
+|---|---|---|
+| prefill 192 / 762 / 1522 tokens | 192 / 490 / 414 tok/s | 66.7 tok/s (762) |
+| decode, 1 stream (CLI 36.6-37.0, HTTP 35.7) | 36-37 tok/s | 31.8 tok/s |
+| aggregate decode, 1 / 2 / 4 / 8 streams (8 slots, `bench_lm_serve.py`) | 35.8 / 58.3 / 97.8 / 132.1 tok/s (TTFT med 0.09 / 0.15 / 0.22 / 0.35 s) | |
+Parity (`lm_parity.py`, 12 prompts): vs llama.cpp **Q8_0** (same weights) top-1 12/12, mean TV 0.0172, max 0.0445; vs F16: llama.cpp Q8 0.0398 (11/12 top-1), ferro 0.0426 (11/12) - the 350M is ~2x more
+quantisation-sensitive than the 1.2B (0.020) and prompt #3 (an out-of-distribution `<think>` ending for a non-thinking model) flips the same near-tie (token 9266 vs 730) in llama.cpp's Q8 and in ferro.
+So for small models validate against the same-weights quantised oracle AND report the F16 noise floor.
+Decode profile (`FERRO_LM_STEPTIME`): enqueue 4-6 ms + device 21-23 ms per token; ideal at the measured 25.9 GB/s streaming ceiling is ~15 ms for 0.38 GB, so ~7-10 ms is per-kernel launch/dependency latency over ~190 launches
+(sync profile: GEMM 48%, resid_norm 15%, silu_mul 8%, conv+conv_state 10%). Fusing conv+state, qkv_post+kv_write and the residual/norm ops is the available win (~1.3x on this model); the 1.2B is bandwidth-bound and gains more from a Q4 weight path.
+**Chat template differs per model**: the 350M GGUF carries a template that handles typed content arrays itself (no "\n" join, system arrays concatenated, images -> `<image>`); the Thinking one does not. A port hard-coded
+to the Thinking template rendered multi-part content wrongly for the 350M (caught by the byte-level `/apply-template` comparison). The variant is now detected from `tokenizer.chat_template`; both verified byte-identical to llama.cpp's jinja.
+Server memory warning is now computed from the real file sizes (it hard-coded the 1.2B footprint).

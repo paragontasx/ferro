@@ -7,15 +7,15 @@
 namespace ferro {
 namespace {
 
-static std::string content_of(const Json& m, const char* who) {
+static std::string content_of(const Json& m, const char* who, bool typed) {
     const Json* c = m.find("content");
     if (!c || c->is_null()) return std::string();
     if (c->is_string()) return c->s;
-    if (c->is_array()) {                                   // OpenAI content parts: text parts are joined with "\n" (llama.cpp's server does the same)
+    if (c->is_array()) {   // OpenAI content parts: joined with "\n" (what llama.cpp's server does for the Thinking template), or concatenated (typed template)
         std::string o;
         bool first = true;
         for (const Json& p : c->arr) {
-            if (!first && (p.is_string() || p.is_object())) o += "\n";
+            if (!typed && !first && (p.is_string() || p.is_object())) o += "\n";
             first = false;
             if (p.is_string()) o += p.s;
             else if (p.is_object()) {
@@ -37,6 +37,8 @@ static std::string trim(const std::string& s) {
 
 }  // namespace
 
+bool lfm_template_is_typed(const std::string& t) { return t.find("item[\"text\"]") != std::string::npos; }
+
 std::string lfm_chat_render(const Json& messages, const Json* tools, const ChatTemplateOptions& opt) {
     if (!messages.is_array() || messages.arr.empty()) throw std::invalid_argument("\"messages\" must be a non-empty array");
     size_t first = 0;
@@ -46,7 +48,7 @@ std::string lfm_chat_render(const Json& messages, const Json* tools, const ChatT
         if (!r || !r->is_string()) throw std::invalid_argument("every message needs a string \"role\"");
         return r->s;
     };
-    if (role_of(messages.arr[0]) == "system") { sys = content_of(messages.arr[0], "system message"); first = 1; }
+    if (role_of(messages.arr[0]) == "system") { sys = content_of(messages.arr[0], "system message", opt.typed_content); first = 1; }
     if (tools && tools->is_array() && !tools->arr.empty()) {
         sys += sys.empty() ? "" : "\n";
         sys += "List of tools: [";
@@ -63,7 +65,7 @@ std::string lfm_chat_render(const Json& messages, const Json* tools, const ChatT
     for (size_t i = first; i < messages.arr.size(); ++i) {
         const Json& m = messages.arr[i];
         const std::string role = role_of(m);
-        std::string c = content_of(m, role.c_str());
+        std::string c = content_of(m, role.c_str(), opt.typed_content);
         if (role == "assistant" && !opt.keep_past_thinking && (long)i != last_assistant) {
             const size_t p = c.rfind("</think>");
             if (p != std::string::npos) c = trim(c.substr(p + 8));

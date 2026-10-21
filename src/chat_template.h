@@ -14,7 +14,12 @@ namespace ferro {
 struct ChatTemplateOptions {
     bool add_generation_prompt = true;
     bool keep_past_thinking = false;
+    // LFM2.5-350M-style template: it walks content arrays itself (text parts concatenated with NO separator). The Thinking-style template
+    // (and llama.cpp's server in front of it) joins text parts with "\n". Use lfm_template_is_typed() on the GGUF's chat template.
+    bool typed_content = false;
 };
+// true for the variant of the template that handles typed content parts itself (detected from the GGUF's tokenizer.chat_template)
+bool lfm_template_is_typed(const std::string& gguf_chat_template);
 
 // messages: JSON array of {"role", "content"} (content: string, or an array of {"type":"text","text":..} parts which are
 // joined with "\n", as llama.cpp's server does); tools: optional JSON array (each rendered with the jinja `tojson` filter). Throws std::invalid_argument.

@@ -42,6 +42,7 @@ int run_generate(const GenArgs& a) {
         }
         return 0;
     }
+    ChatTemplateOptions copt; copt.typed_content = lfm_template_is_typed(eng.model().gguf.get_str("tokenizer.chat_template"));
     std::string text;
     try {
         if (!a.messages_file.empty()) {
@@ -50,13 +51,13 @@ int run_generate(const GenArgs& a) {
             Json body = json_parse(ss.str());
             const Json* msgs = body.is_array() ? &body : body.find("messages");
             if (!msgs) throw std::invalid_argument("--messages file must be an array of messages or an object with \"messages\"");
-            text = lfm_chat_render(*msgs, body.is_object() ? body.find("tools") : nullptr);
+            text = lfm_chat_render(*msgs, body.is_object() ? body.find("tools") : nullptr, copt);
         } else if (a.raw) text = "<|startoftext|>" + a.prompt;
         else {
             Json msgs = Json::array();
             if (!a.system.empty()) { Json m = Json::object(); m.set("role", Json::str("system")); m.set("content", Json::str(a.system)); msgs.push(m); }
             Json u = Json::object(); u.set("role", Json::str("user")); u.set("content", Json::str(a.prompt)); msgs.push(u);
-            text = lfm_chat_render(msgs, nullptr);
+            text = lfm_chat_render(msgs, nullptr, copt);
         }
     } catch (const std::exception& e) { fprintf(stderr, "bad prompt: %s\n", e.what()); return 2; }
     std::vector<int> ids = tok.tokenize(text, true);
