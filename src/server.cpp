@@ -7,6 +7,8 @@
 // (16 x 188 tokens: 850 tok/s; one short sequence at a time is several times slower per token). Image / audio / video jobs run
 // alone, in arrival order.
 #include "server.h"
+#include "memplan.h"
+#include <malloc.h>
 #include "gpu_cl.h"
 #include "decision_service.h"
 #include "embed_mm.h"
@@ -231,6 +233,9 @@ struct Server {
     // stats
     std::atomic<uint64_t> n_req{0}, n_err{0}, n_tok{0}, n_emb{0}, n_batches{0};
     std::atomic<uint64_t> busy_us{0};
+    std::mutex mem_m; double mem_inflight = 0;     // MB reserved by admitted media requests that are not finished
+    std::atomic<uint64_t> n_mem_rejected{0};
+    std::atomic<bool> trim_pending{false};         // a media request ran: return freed heap to the OS when the worker is idle
     clk::time_point t_start = clk::now();
 };
 static Server* g_srv = nullptr;
@@ -562,6 +567,10 @@ static void worker_loop(Server& S, std::promise<std::string>& ready) {
         }
         if (S.has_d1) d1_iteration(S);
         if (S.has_lm) gen_iteration(S);
+        if (S.trim_pending.load() && S.n_active.load() == 0 && S.n_prefill.load() == 0) {      // a media request ran: give its freed heap back while idle
+            std::lock_guard<std::mutex> lk(S.qm);
+            if (S.q.empty() && S.dq.empty() && S.gq.empty()) { S.trim_pending = false; malloc_trim(0); }
+        }
     }
     // shutting down: fail whatever is still queued
     std::lock_guard<std::mutex> lk(S.qm);
@@ -708,6 +717,13 @@ static std::string health_json(Server& S) {
                  jesc(S.d1_name).c_str(), S.d1.on_gpu() ? "igpu" : "cpu", dq, (unsigned long long)S.n_d1_req.load(), (unsigned long long)S.n_d1_q.load(), (unsigned long long)S.n_d1_tok.load(),
                  (unsigned long long)S.n_d1_pass.load(), S.d1_us.load() / 1e6, S.d1.has_vision() ? "true" : "false", S.d1.has_audio() ? "true" : "false");
         out.pop_back(); out += l;
+    }
+    {   // container memory: what is resident now vs the limit, and what admitted media requests have reserved
+        double inflight; { std::lock_guard<std::mutex> g(S.mem_m); inflight = S.mem_inflight; }
+        const double lim = cgroup_limit_mb(), used = cgroup_used_mb();
+        char l[300];
+        snprintf(l, sizeof l, ",\"memory\":{\"limit_mb\":%.0f,\"used_mb\":%.0f,\"headroom_mb\":%.0f,\"reserved_mb\":%.0f,\"rejected\":%llu}", lim, used, lim > 0 ? lim - used : 0.0, inflight, (unsigned long long)S.n_mem_rejected.load());
+        out.pop_back(); out += l; out += '}';
     }
     return out;
 }
@@ -877,7 +893,35 @@ static int handle_generate(Server& S, int fd, bool keep, const std::string& text
 }
 
 // POST /v1/embeddings. Returns the HTTP status; `body` is the response body.
+// Admit a request that carries media only if its estimated transient memory fits the container headroom right now (reserved while it is in flight),
+// instead of letting the allocation push the whole container into the OOM killer.
+struct MemReserve {
+    Server* S = nullptr; double mb = 0;
+    ~MemReserve() { if (S && mb > 0) { std::lock_guard<std::mutex> g(S->mem_m); S->mem_inflight -= mb; } }
+};
+static int mem_admit(Server& S, const std::string& text, MemReserve& res, std::string& body, std::string& logline) {
+    const double est = media_cost_mb(text);
+    if (est <= 0) return 0;
+    const double lim = cgroup_limit_mb();
+    if (lim > 0) {
+        const double used = cgroup_used_mb(), reserve = 96;
+        std::lock_guard<std::mutex> g(S.mem_m);
+        if (used + S.mem_inflight + est + reserve > lim) {
+            const bool never = S.mem_inflight <= 0;                 // nothing else in flight: waiting will not help
+            S.n_mem_rejected++;
+            char b[400]; snprintf(b, sizeof b, "not enough memory for this request: it needs ~%.0f MB, %.0f MB of the %.0f MB container limit is free%s. %s",
+                                  est, std::max(0.0, lim - used - S.mem_inflight - reserve), lim, never ? "" : " (other requests are in flight)",
+                                  never ? "Send a smaller image (downscale), a crop, fewer frames, or a shorter clip." : "Retry shortly.");
+            body = err_json(b, "server_error"); logline = "rejected: memory"; return never ? 413 : 503;
+        }
+        S.mem_inflight += est; res.S = &S; res.mb = est;
+    }
+    S.trim_pending = true;
+    return 0;
+}
+
 static int handle_embeddings(Server& S, const std::string& text, std::string& body, std::string& logline) {
+    MemReserve mem_res; if (int st = mem_admit(S, text, mem_res, body, logline)) return st;
     if (!S.has_emb) { body = err_json("no embedding model loaded (start the server with --model EG2.gguf)", "invalid_request_error"); return 404; }
     struct Inflight { std::atomic<int>& c; Inflight(std::atomic<int>& c_) : c(c_) { c++; } ~Inflight() { c--; } } inflight_guard(S.inflight);
     auto job = std::make_shared<Job>();
@@ -956,6 +1000,7 @@ static int handle_embeddings(Server& S, const std::string& text, std::string& bo
 }
 
 static int handle_systemone(Server& S, const std::string& text, std::string& body, std::string& logline) {
+    MemReserve mem_res; if (int st = mem_admit(S, text, mem_res, body, logline)) return st;
     auto job = std::make_shared<DecJob>(); job->body = text;
     { std::lock_guard<std::mutex> g(S.qm);
       if ((int)S.dq.size() >= S.o.max_queue) { body = err_json("server is busy (queue full), retry shortly", "server_error"); logline = "queue full"; return 503; }
@@ -1029,6 +1074,16 @@ static void handle_conn(Server* Sp, int fd) {
 }  // namespace
 
 int run_server(const ServerOptions& opt) {
+    {   // memory plan BEFORE anything is loaded: an iGPU's buffers are non-swappable system RAM, and an over-committed container is OOM-killed
+        const MemPlan plan = plan_memory(opt);
+        if (opt.plan_only) { fprintf(stderr, "[plan] memory for this configuration:\n"); print_plan(plan, stderr); return plan.fits ? 0 : 3; }
+        if (!plan.fits) {
+            fprintf(stderr, "[serve] memory plan: ~%.0f MB needed vs a %.0f MB container limit\n", plan.need_mb, plan.limit_mb); print_plan(plan, stderr);
+            if (!opt.no_memory_check) { fprintf(stderr, "[serve] refusing to start (an over-committed container is OOM-killed). Pass --no-memory-check to start anyway.\n"); return 1; }
+            fprintf(stderr, "[serve] --no-memory-check: starting anyway\n");
+        } else if (plan.limit_mb > 0 && plan.need_mb > 0.85 * plan.limit_mb)
+            fprintf(stderr, "[serve] note: ~%.0f MB resident of a %.0f MB container limit; large image/video requests are admitted only while they fit\n", plan.need_mb, plan.limit_mb);
+    }
     Server& S = *new Server;                       // intentionally leaked: detached connection threads may outlive this function
     S.o = opt; S.has_mm = !opt.mmproj.empty(); S.has_emb = !opt.model.empty(); S.has_lm = !opt.lm.empty(); S.has_d1 = !opt.d1.empty(); g_srv = &S;
     std::promise<std::string> ready; auto ready_f = ready.get_future();
@@ -1059,18 +1114,6 @@ int run_server(const ServerOptions& opt) {
     if (S.has_d1) {
         S.d1_name = S.d1.name();
         fprintf(stderr, "[serve] decision model \"%s\" ready (%s, image %s, audio %s) - POST /v1/systemone\n", S.d1_name.c_str(), S.d1.on_gpu() ? "iGPU" : "CPU", S.d1.has_vision() ? "yes" : "no", S.d1.has_audio() ? "yes" : "no");
-    }
-    {   // device buffers on an iGPU are system RAM and cannot be swapped out: compare everything that is resident with any container limit.
-        // Calibrated on measurements (anon+shmem): ~700 MB runtime + 1.3 x all loaded GGUFs (incl. projectors) + the LM's KV cache.
-        double lim_mb = 0; if (FILE* f = fopen("/sys/fs/cgroup/memory.max", "r")) { unsigned long long v = 0; if (fscanf(f, "%llu", &v) == 1) lim_mb = v / 1048576.0; fclose(f); }
-        auto mb = [](const std::string& path) { struct stat st; return !path.empty() && stat(path.c_str(), &st) == 0 ? st.st_size / 1048576.0 : 0.0; };
-        double w_mb = mb(opt.model) + mb(opt.mmproj) + mb(opt.lm) + mb(opt.d1) + (S.has_d1 ? mb(S.d1.mmproj_path()) : 0.0);
-        double kv_mb = 0; if (S.has_lm) { const LmModel& lm = S.lm.model(); kv_mb = (double)lm.n_attn_layers * S.lm.n_slots() * S.lm.max_ctx() * 2 * lm.n_kv * lm.head_dim * (S.lm.kv_int8() ? 1.125 : 4.0) / 1048576.0; }
-        const double need_mb = 700 + 1.3 * w_mb + kv_mb + (S.has_lm ? (double)opt.prefix_cache_mb : 0.0);      // + the prefix cache at its full budget
-        if (lim_mb > 0 && need_mb > lim_mb)
-            fprintf(stderr, "[serve] WARNING: ~%.0f MB needed (weights %.0f MB + KV %.0f MB + runtime) vs a %.0f MB container limit -> drop a model, or lower --lm-slots / --lm-ctx\n", need_mb, w_mb, kv_mb, lim_mb);
-        else if (lim_mb > 0 && need_mb > 0.8 * lim_mb)
-            fprintf(stderr, "[serve] note: ~%.0f MB resident of a %.0f MB container limit - little headroom for request bursts (video / large images); consider fewer models or smaller --lm-ctx\n", need_mb, lim_mb);
     }
     fprintf(stderr, "[serve] ready in %.1fs\n", std::chrono::duration<double>(clk::now() - t0).count());
 

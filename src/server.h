@@ -16,6 +16,8 @@ struct ServerOptions {
     std::string lm_name;                       // id reported for the language model (default: file name)
     int lm_ctx = 4096;                         // context per sequence slot; the KV cache is allocated up front (LFM2.5-1.2B: ~25 MB per 1k tokens per slot)
     int prefix_cache_mb = 128;                 // LM prompt-prefix cache budget (device memory, LRU); 0 = off. A snapshot costs ~25 KB per cached token (LFM2.5, 6 attention layers)
+    bool plan_only = false;                    // `ferro-embed plan`: print the memory plan and exit
+    bool no_memory_check = false;              // start even when the plan says the configuration does not fit the container limit
     bool kv_int8 = false;                       // --kv-dtype int8: KV cache as int8 + one fp32 scale per 32 values (3.6x smaller; same scheme as llama.cpp's q8_0 KV; small accuracy cost, see README)
     int thinking_budget = -1;                  // default cap on reasoning tokens per reply (-1 = none); the reply field `thinking_budget` overrides it
     int prefill_slice_ms = 250;                // while other work waits (decode streams, d1, embeddings) a long prompt is prefilled in slices of about this many ms
