@@ -170,6 +170,7 @@ struct GenJob {
     int prefix_hint = 0;                          // tokens of the system message when it is an exact prefix of the prompt (a natural cache boundary)
     int cached = 0;                               // prompt tokens restored from the prefix cache instead of prefilled
     int pf_pos = 0; std::vector<int> pf_cuts; bool pc_on = false; double pf_ms = 0;   // resumable prefill: next prompt position, snapshot boundaries still to leave, compute time so far
+    bool spec = true; int spec_fail = 0, spec_skip = 0; uint64_t spec_d = 0, spec_a = 0; double spec_acc = 0.55;     // speculative decoding: allowed, back-off state, drafted / accepted tokens
     double ttft_ms = -1;                          // time from enqueue to the first generated token
     int think_budget = -1, think_n = 0; bool in_think = false, forced_close = false, ignore_eos = false;   // reasoning-token cap and tracker (independent of reasoning_format)
     int next = 0, n_gen = 0, mode = 0;            // mode: 0 = content, 1 = reasoning (inside <think>)
@@ -274,6 +275,8 @@ struct Server {
     std::atomic<uint64_t> busy_us{0};
     std::mutex mem_m; double mem_inflight = 0;     // MB reserved by admitted media requests that are not finished
     std::atomic<uint64_t> n_mem_rejected{0};
+    std::atomic<uint64_t> spec_drafted{0}, spec_accepted{0}, spec_steps{0};
+    std::vector<float> lg_spec;                    // worker only: logits of every row of a verification window
     std::unique_ptr<PrefixStore> pstore;           // on-disk prefix snapshots (null = off)
     std::atomic<uint64_t> ps_hits{0};              // requests that restored a snapshot from disk
     std::atomic<bool> trim_pending{false};         // a media request ran: return freed heap to the OS when the worker is idle
@@ -459,7 +462,24 @@ static void gen_prefill_chunk(Server& S) {
     if (gen_token(S, j, tok)) { gen_finish(S, jp); return; }
     S.active.push_back(jp); S.n_active = (int)S.active.size();
 }
-// One batched decode step for every active sequence.
+// Prompt lookup: the tokens that followed the most recent earlier occurrence of the last n tokens (n = 4, 3, 2) - replies often copy the prompt
+// (ids, names, quoted text) or repeat themselves, and a copied run can be verified k tokens per forward instead of one.
+static std::vector<int> lookup_draft(const std::vector<int>& h, int kmax, int eos, int min_n) {
+    const int L = (int)h.size();
+    for (int n = std::min(4, L - 1); n >= min_n; --n) {
+        for (int p = L - n - 1; p >= 0; --p) {
+            bool eq = true; for (int k = 0; k < n; ++k) if (h[p + k] != h[L - n + k]) { eq = false; break; }
+            if (!eq) continue;
+            std::vector<int> d;
+            for (int k = p + n; k < L && (int)d.size() < kmax; ++k) { if (h[k] == eos) break; d.push_back(h[k]); }
+            if (!d.empty()) return d;
+        }
+    }
+    return {};
+}
+// One batched decode step for every active sequence. When some stream can draft (prompt lookup), the step is a verification window instead: each
+// stream's rows [last token, drafts...] run with exactly the arithmetic of serial decode, tokens are sampled row by row (one sampler draw per produced
+// token, as serially) and a draft is kept only while it equals the sampled token - so the output is identical to decoding one token at a time.
 static void gen_decode_step(Server& S) {
     const int V = S.lm.n_vocab();
     // drop cancelled / shutting-down sequences
@@ -468,23 +488,82 @@ static void gen_decode_step(Server& S) {
     }
     S.n_active = (int)S.active.size();
     if (S.active.empty()) return;
-    std::vector<LmSeq*> seqs; std::vector<const int*> toks; std::vector<int> ns;
-    for (auto& j : S.active) { seqs.push_back(&j->seq); toks.push_back(&j->next); ns.push_back(1); }
+    std::vector<std::vector<int>> drafts(S.active.size());
+    bool any = false;
+    if (S.o.spec_draft > 0 && S.active.size() < 8 && S.lm.spec_ok()) {
+        int budget = 8 - (int)S.active.size();
+        for (size_t i = 0; i < S.active.size() && budget > 0; ++i) {
+            GenJob& j = *S.active[i];
+            if (!j.spec) continue;
+            if (j.spec_skip > 0) { --j.spec_skip; continue; }                       // recent drafts failed: sit out a few steps
+            const int kj = j.spec_acc > 0.85 ? S.o.spec_draft : std::min(3, S.o.spec_draft);      // long windows only pay when nearly every draft is accepted
+            const int room = std::min({kj, budget, j.max_tokens - j.n_gen - 1, S.lm.max_ctx() - j.seq.n_past - 2});
+            if (room <= 0) continue;
+            drafts[i] = lookup_draft(j.hist, room, S.eos_id, j.spec_acc >= 0.6 ? 2 : 3);       // a stream that has not shown drafting works needs a 3-token match
+            if (!drafts[i].empty()) { budget -= (int)drafts[i].size(); any = true; }
+        }
+    }
     std::string err; bool ok = false;
     const auto tstep = clk::now();
-    try { ok = S.lm.step(seqs, toks, ns, S.lg.data(), &err); } catch (const std::exception& e) { err = e.what(); }
-    const double step_ms = ms_since(tstep);
+    int produced = 0;
+    if (!any) {
+        std::vector<LmSeq*> seqs; std::vector<const int*> toks; std::vector<int> ns;
+        for (auto& j : S.active) { seqs.push_back(&j->seq); toks.push_back(&j->next); ns.push_back(1); }
+        try { ok = S.lm.step(seqs, toks, ns, S.lg.data(), &err); } catch (const std::exception& e) { err = e.what(); }
+        if (!ok) {
+            for (auto& j : S.active) gen_finish(S, j, (err.empty() ? "decode failed" : err).c_str());
+            S.active.clear(); S.n_active = 0; return;
+        }
+        std::vector<std::shared_ptr<GenJob>> keep;
+        for (size_t i = 0; i < S.active.size(); ++i) {
+            auto& j = S.active[i];
+            const int tok = j->sampler->sample(S.lg.data() + i * (size_t)V, V, j->hist);
+            ++produced;
+            if (gen_token(S, *j, tok)) gen_finish(S, j); else keep.push_back(j);
+        }
+        S.rw_decode.add(produced, ms_since(tstep));
+        S.active.swap(keep); S.n_active = (int)S.active.size();
+        return;
+    }
+    // ---- verification window
+    std::vector<LmSeq*> seqs; std::vector<std::vector<int>> rows; std::vector<int> off;
+    int total = 0;
+    for (size_t i = 0; i < S.active.size(); ++i) {
+        seqs.push_back(&S.active[i]->seq); rows.push_back({S.active[i]->next}); rows.back().insert(rows.back().end(), drafts[i].begin(), drafts[i].end());
+        off.push_back(total); total += (int)rows.back().size();
+    }
+    S.lg_spec.resize((size_t)total * V);
+    try { ok = S.lm.verify(seqs, rows, S.lg_spec.data(), &err); } catch (const std::exception& e) { err = e.what(); }
     if (!ok) {
         for (auto& j : S.active) gen_finish(S, j, (err.empty() ? "decode failed" : err).c_str());
         S.active.clear(); S.n_active = 0; return;
     }
-    std::vector<std::shared_ptr<GenJob>> keep;
+    std::vector<std::shared_ptr<GenJob>> keep; std::vector<LmSeq*> cseqs; std::vector<int> coff, cacc;
     for (size_t i = 0; i < S.active.size(); ++i) {
         auto& j = S.active[i];
-        const int tok = j->sampler->sample(S.lg.data() + i * (size_t)V, V, j->hist);
-        if (gen_token(S, *j, tok)) gen_finish(S, j); else keep.push_back(j);
+        const int m = (int)rows[i].size(); int acc = 0, confirmed = 0; bool fin = false;
+        for (int r = 0; r < m; ++r) {
+            const int tok = j->sampler->sample(S.lg_spec.data() + (size_t)(off[i] + r) * V, V, j->hist);
+            fin = gen_token(S, *j, tok); acc = r + 1; ++produced;
+            if (fin) break;
+            if (r + 1 < m && j->next == rows[i][r + 1]) { ++confirmed; continue; }   // the draft was what the model would have said: its row is valid too
+            break;
+        }
+        const int k = m - 1;
+        if (k > 0) {
+            j->spec_d += (uint64_t)k; j->spec_a += (uint64_t)confirmed; S.spec_drafted += (uint64_t)k; S.spec_accepted += (uint64_t)confirmed;
+            j->spec_acc = 0.6 * j->spec_acc + 0.4 * ((double)confirmed / (double)k);
+            if (confirmed == 0) { j->spec_fail++; j->spec_skip = std::min(1 << std::min(j->spec_fail, 4), 16) - 1; } else j->spec_fail = 0;
+        }
+        if (fin) { gen_finish(S, j); continue; }
+        keep.push_back(j); cseqs.push_back(&j->seq); coff.push_back(off[i]); cacc.push_back(acc);
     }
-    S.rw_decode.add((int)S.active.size(), step_ms);
+    if (!cseqs.empty() && !S.lm.commit(cseqs, coff, cacc)) {
+        for (auto& j : keep) gen_finish(S, j, "decode failed (commit)");
+        keep.clear();
+    }
+    S.spec_steps++;
+    S.rw_decode.add(produced, ms_since(tstep));
     S.active.swap(keep); S.n_active = (int)S.active.size();
 }
 // One scheduler iteration for generation: admit waiting requests into free slots, fill ONE slice of one prompt, then run `decode_share`
@@ -789,8 +868,9 @@ static std::string health_json(Server& S) {
     }
     {   // container memory: what is resident now vs the limit, and what admitted media requests have reserved
         size_t gqn = 0; { std::lock_guard<std::mutex> g(S.qm); gqn = S.gq.size() + S.q.size() + S.dq.size(); }
-        char lv[260]; snprintf(lv, sizeof lv, ",\"live\":{\"decode_tokens_per_second\":%.2f,\"prefill_tokens_per_second\":%.2f,\"connections\":%d,\"waiting\":%zu,\"ttft_ms_mean\":%.1f}",
-                               S.rw_decode.rate(), S.rw_prefill.rate(), S.conns.load(), gqn, S.ttft_n.load() ? S.ttft_us.load() / 1000.0 / (double)S.ttft_n.load() : 0.0);
+        char lv[420]; snprintf(lv, sizeof lv, ",\"live\":{\"decode_tokens_per_second\":%.2f,\"prefill_tokens_per_second\":%.2f,\"connections\":%d,\"waiting\":%zu,\"ttft_ms_mean\":%.1f},\"speculative\":{\"drafted\":%llu,\"accepted\":%llu,\"steps\":%llu}",
+                               S.rw_decode.rate(), S.rw_prefill.rate(), S.conns.load(), gqn, S.ttft_n.load() ? S.ttft_us.load() / 1000.0 / (double)S.ttft_n.load() : 0.0,
+                               (unsigned long long)S.spec_drafted.load(), (unsigned long long)S.spec_accepted.load(), (unsigned long long)S.spec_steps.load());
         out.pop_back(); out += lv; out += '}';
         double inflight; { std::lock_guard<std::mutex> g(S.mem_m); inflight = S.mem_inflight; }
         const double lim = cgroup_limit_mb(), used = cgroup_used_mb();
@@ -834,6 +914,7 @@ static std::shared_ptr<GenJob> parse_gen_request(Server& S, const std::string& t
     if (const Json* cp = b.find("cache_prompt")) j->cache_prompt = !(cp->t == Json::Bool && !cp->b);
     j->think_budget = (int)jnum(b.find("thinking_budget"), jnum(b.find("reasoning_budget"), S.o.thinking_budget));
     if (const Json* ie = b.find("ignore_eos")) j->ignore_eos = ie->t == Json::Bool && ie->b;
+    if (const Json* dr = b.find("draft")) j->spec = !(dr->t == Json::Bool && !dr->b);
     if (chat && j->cache_prompt && S.o.prefix_cache_mb > 0) {      // natural cache boundary: the end of a leading system message (checked, not assumed, to be an exact prefix)
         const Json& m0 = b.find("messages")->arr[0];
         const Json* role = m0.is_object() ? m0.find("role") : nullptr;
@@ -915,7 +996,7 @@ static int handle_generate(Server& S, int fd, bool keep, const std::string& text
     auto finish_str = [&] { return j->finish; };
     auto summary = [&] {                                  // pp = prefill speed over the tokens actually prefilled; cached = restored from the prefix cache
         char b[200]; const size_t fresh = j->prompt.size() - (size_t)j->cached;
-        snprintf(b, sizeof b, "prompt=%zu%s gen=%d finish=%s pp=%.0ftok/s", j->prompt.size(), j->cached ? (" cached=" + std::to_string(j->cached)).c_str() : "", j->n_gen, j->finish.c_str(), j->prompt_ms > 0 ? fresh / (j->prompt_ms / 1000.0) : 0.0);
+        snprintf(b, sizeof b, "prompt=%zu%s gen=%d%s finish=%s pp=%.0ftok/s", j->prompt.size(), j->cached ? (" cached=" + std::to_string(j->cached)).c_str() : "", j->n_gen, j->spec_d ? (" spec=" + std::to_string(j->spec_a) + "/" + std::to_string(j->spec_d)).c_str() : "", j->finish.c_str(), j->prompt_ms > 0 ? fresh / (j->prompt_ms / 1000.0) : 0.0);
         return std::string(b); };
     std::deque<Delta> ev;
     if (!j->stream) {
@@ -1128,6 +1209,8 @@ static std::string metrics_text(Server& S) {
         metric("ferro_lm_queued_requests", "gauge", "Generation requests waiting for a slot.", (double)gq);
         metric("ferro_lm_decode_tokens_per_second", "gauge", "Decode speed over the last 10 s of activity (tokens per busy second, all streams).", S.rw_decode.rate());
         metric("ferro_lm_prefill_tokens_per_second", "gauge", "Prefill speed over the last 10 s of activity.", S.rw_prefill.rate());
+        metric("ferro_lm_spec_drafted_tokens_total", "counter", "Tokens drafted by prompt lookup.", (double)S.spec_drafted.load());
+        metric("ferro_lm_spec_accepted_tokens_total", "counter", "Drafted tokens confirmed by verification.", (double)S.spec_accepted.load());
         metric("ferro_lm_prefix_cache_hits_total", "counter", "Requests that restored a cached prefix.", (double)S.pc_hits.load());
         metric("ferro_lm_prefix_cache_misses_total", "counter", "Requests with no usable cached prefix.", (double)S.pc_miss.load());
         metric("ferro_lm_prefix_cache_cached_tokens_total", "counter", "Prompt tokens served from the prefix cache.", (double)S.pc_saved.load());

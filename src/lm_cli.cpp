@@ -112,6 +112,50 @@ int run_generate(const GenArgs& a) {
             fprintf(stderr, "[selfcheck] %-34s max|diff| %.4g\n", "decode after restore vs donor", mx);
             eng.release(a); eng.release(c); eng.release(pad);
         }
+        if (eng.spec_ok() && getenv("FERRO_LM_WINBENCH")) {                // cost of one verification window by row count (median of 15, incl. the logits read-back)
+            LmSeq w; eng.reset(w); eng.step({&w}, {ids.data()}, {N}, cur.data(), &err, true);
+            const int tk[8] = {1098, 3456, 220, 15, 9012, 77, 801, 5};
+            std::vector<float> lg((size_t)8 * V);
+            for (int m : {1, 2, 3, 4, 5, 6, 7, 8}) {
+                std::vector<double> t;
+                for (int rep = 0; rep < 15; ++rep) { const auto t0 = clk::now(); eng.verify({&w}, {std::vector<int>(tk, tk + m)}, lg.data(), &err); t.push_back(std::chrono::duration<double, std::milli>(clk::now() - t0).count()); }
+                std::sort(t.begin(), t.end()); fprintf(stderr, "[winbench] %d row(s): %.1f ms  (%.1f ms/row)\n", m, t[t.size() / 2], t[t.size() / 2] / m);
+            }
+            std::vector<double> t1; for (int rep = 0; rep < 15; ++rep) { const auto t0 = clk::now(); const int tkn = tk[0]; LmSeq w2; (void)w2; eng.step({&w}, {&tkn}, {1}, cur.data(), &err); t1.push_back(std::chrono::duration<double, std::milli>(clk::now() - t0).count()); }
+            std::sort(t1.begin(), t1.end()); fprintf(stderr, "[winbench] plain decode step: %.1f ms\n", t1[t1.size() / 2]);
+            eng.release(w);
+        }
+        if (eng.spec_ok()) {                                               // speculative window == serial decode, bit for bit; commit leaves exactly the serial state
+            const int toks[5] = {1098, 3456, 220, 15, 9012};
+            std::vector<std::vector<float>> serial(5, std::vector<float>(V));
+            LmSeq a; eng.reset(a); eng.step({&a}, {ids.data()}, {N}, cur.data(), &err, true);
+            for (int i = 0; i < 5; ++i) eng.step({&a}, {&toks[i]}, {1}, serial[i].data(), &err);              // reference: five decode steps
+            eng.release(a);                                                    // keep slots free for the sequences below
+            auto maxdiff = [&](const float* x, const float* y) { double mx = 0; for (int i = 0; i < V; ++i) mx = std::max(mx, (double)std::fabs(x[i] - y[i])); return mx; };
+            for (int accept : {5, 3, 1, 2}) {
+                LmSeq b; eng.reset(b); eng.step({&b}, {ids.data()}, {N}, cur.data(), &err, true);
+                std::vector<float> lg((size_t)5 * V);
+                if (!eng.verify({&b}, {std::vector<int>(toks, toks + 5)}, lg.data(), &err)) { fprintf(stderr, "[selfcheck] verify failed: %s\n", err.c_str()); return 1; }
+                double mx = 0; for (int r = 0; r < 5; ++r) mx = std::max(mx, maxdiff(lg.data() + (size_t)r * V, serial[r].data()));
+                char nm[64]; snprintf(nm, sizeof nm, "window of 5 rows vs 5 decode steps"); if (accept == 5) fprintf(stderr, "[selfcheck] %-34s max|diff| %.4g\n", nm, mx);
+                if (!eng.commit({&b}, {0}, {accept})) { fprintf(stderr, "[selfcheck] commit failed\n"); return 1; }
+                double mx2 = 0;                                            // after committing `accept` rows, the next decode must equal the serial one
+                for (int i = accept; i < 5; ++i) { std::vector<float> o(V); eng.step({&b}, {&toks[i]}, {1}, o.data(), &err); mx2 = std::max(mx2, maxdiff(o.data(), serial[i].data())); }
+                snprintf(nm, sizeof nm, "commit %d of 5 rows, then decode on", accept); fprintf(stderr, "[selfcheck] %-34s max|diff| %.4g\n", nm, mx2);
+                eng.release(b);
+            }
+            {   // two sequences with different window lengths in one verification (rows of different sequences interleave in one batch)
+                LmSeq p, q; eng.reset(p); eng.reset(q);
+                eng.step({&p}, {ids.data()}, {N}, cur.data(), &err, true); eng.step({&q}, {ids.data()}, {N / 2}, cur.data(), &err, true);
+                std::vector<float> refq((size_t)3 * V), lg((size_t)5 * V); LmSeq q2; eng.reset(q2); eng.step({&q2}, {ids.data()}, {N / 2}, cur.data(), &err, true);
+                for (int i = 0; i < 3; ++i) eng.step({&q2}, {&toks[i]}, {1}, refq.data() + (size_t)i * V, &err);
+                eng.verify({&p, &q}, {std::vector<int>(toks, toks + 2), std::vector<int>(toks, toks + 3)}, lg.data(), &err);
+                double mx = 0; for (int r = 0; r < 2; ++r) mx = std::max(mx, maxdiff(lg.data() + (size_t)r * V, serial[r].data()));
+                for (int r = 0; r < 3; ++r) mx = std::max(mx, maxdiff(lg.data() + (size_t)(2 + r) * V, refq.data() + (size_t)r * V));
+                fprintf(stderr, "[selfcheck] %-34s max|diff| %.4g\n", "two windows (2+3 rows) in one batch", mx);
+                eng.release(p); eng.release(q); eng.release(q2);
+            }
+        }
         return 0;
     }
     LmSeq seq; eng.reset(seq);

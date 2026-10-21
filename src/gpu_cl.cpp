@@ -1835,6 +1835,24 @@ __kernel void lm_qkv_post_kvq(__global float* C, int rowc, int nq, int nkv, int 
   vstore4(convert_char4_sat_rte(b * (sb > 0.f ? 1.f / sb : 0.f)), lid, o + hlf);
   if (lid == 0) { __global float* sp = KVs + row * (kvw / 32) + (isv ? (nkv * hd) / 32 : 0) + hh * (hd / 32); sp[0] = sa; sp[1] = sb; }
 }
+// Window conv for speculative verification: the exact expression of lm_conv_dec_q (so a verified row equals a serial decode row bit for bit),
+// but the two previous b*x rows come from earlier rows of the same window (src >= 0) or from the conv state (src < 0, as lm_conv_q); the state
+// is NOT updated (the window may be only partly accepted: the engine commits it afterwards from a saved copy of C).
+__kernel void lm_conv_win_q(__global const float* C, __global const int* src1, __global const int* src2, __global const float* st,
+                            __global const float* taps, __global uint* Xp, __global float* Xs, int d) {
+  __local float am[512];
+  const int t = get_group_id(0), lid = get_local_id(0);
+  const __global float* r = C + (size_t)t * 3 * d;
+  const float4 bx = vload4(lid, r) * vload4(lid, r + 2 * d);
+  const int s1 = src1[t], s2 = src2[t];
+  float4 b1, b2;
+  if (s1 >= 0) { const __global float* p = C + (size_t)s1 * 3 * d; b1 = vload4(lid, p) * vload4(lid, p + 2 * d); }
+  else b1 = vload4(lid, st + (size_t)(-1 - s1) * d);
+  if (s2 >= 0) { const __global float* p = C + (size_t)s2 * 3 * d; b2 = vload4(lid, p) * vload4(lid, p + 2 * d); }
+  else b2 = vload4(lid, st + (size_t)(-1 - s2) * d);
+  const float4 y = bx * vload4(lid, taps + 2 * d) + b1 * vload4(lid, taps + d) + b2 * vload4(lid, taps);
+  quant_lane4(vload4(lid, r + d) * y, am, Xp, Xs, t, d);
+}
 )CL";
 
 // ---------------------------------------------------------------- state
@@ -1863,7 +1881,7 @@ static cl_kernel k_quant = nullptr, k_gemm = nullptr, k_gemm_sw = nullptr, k_rms
                  k_rowf3 = nullptr, k_qkvp3 = nullptr, k_attq3 = nullptr, k_gmq3 = nullptr, k_gmvq3 = nullptr,
                  k_rnq = nullptr, k_hinq = nullptr, k_convq = nullptr, k_siluq = nullptr, k_bactq = nullptr,
                  k_badd = nullptr, k_score = nullptr, k_attq4 = nullptr, k_attq5 = nullptr, k_quantq = nullptr, k_lngq = nullptr, k_dqk = nullptr, k_dsm = nullptr, k_dpv = nullptr, k_qkvg4 = nullptr, k_dqkh = nullptr, k_dpvh = nullptr, k_dsmw = nullptr, k_anq = nullptr, k_aact = nullptr, k_ares = nullptr, k_aconv = nullptr, k_aattn = nullptr, k_lmconv = nullptr, k_lmcst = nullptr, k_lmkv = nullptr, k_lmpf = nullptr, k_lmdec = nullptr, k_lmcdec = nullptr, k_lmqkv = nullptr;
-static cl_kernel k_lmpfq = nullptr, k_lmdecq = nullptr, k_lmqkvq = nullptr;   // int8-KV variants
+static cl_kernel k_lmpfq = nullptr, k_lmdecq = nullptr, k_lmqkvq = nullptr, k_lmcwin = nullptr;   // int8-KV variants
 static std::vector<Slot> g_slots;
 static size_t g_bytes = 0;
 static cl_mem g_Xp = nullptr, g_Xs = nullptr;           // quantized-activation scratch
@@ -1931,7 +1949,7 @@ bool init(bool verbose) {
         {&k_attn, "attention"}, {&k_gmul, "gelu_mul"}, {&k_gmulv, "gelu_mulvec"}, {&k_add, "add_scale"},
         {&k_rowf, "row_fused"}, {&k_qkvp, "qkv_post"}, {&k_attq, "attention_q"}, {&k_gmq, "gelu_mul_q"},
         {&k_gmvq, "gelu_mulvec_q"}, {&k_attq2, "attention_q2"}, {&k_gmq2, "gelu_mul_q2"}, {&k_gmvq2, "gelu_mulvec_q2"},
-        {&k_qkvg4, "qkv_post_g4"}, {&k_dsmw, "dattn_stats_w"}, {&k_anq, "a_norm_quant"}, {&k_aact, "a_act_quant"}, {&k_ares, "a_resid"}, {&k_aconv, "a_conv_mid"}, {&k_aattn, "a_attn"}, {&k_lmconv, "lm_conv_q"}, {&k_lmcst, "lm_conv_state"}, {&k_lmkv, "lm_kv_write"}, {&k_lmpf, "lm_attn_pf"}, {&k_lmdec, "lm_attn_dec"}, {&k_lmcdec, "lm_conv_dec_q"}, {&k_lmqkv, "lm_qkv_post_kv"}, {&k_lmpfq, "lm_attn_pf_q"}, {&k_lmdecq, "lm_attn_dec_q"}, {&k_lmqkvq, "lm_qkv_post_kvq"}, {&k_dqkh, "dattn_qk_h"}, {&k_dpvh, "dattn_pv_h"}, {&k_rowf3, "row_fused3"}, {&k_qkvp3, "qkv_post3"}, {&k_attq3, "attention_q3"}, {&k_gmq3, "gelu_mul_q3"},
+        {&k_qkvg4, "qkv_post_g4"}, {&k_dsmw, "dattn_stats_w"}, {&k_anq, "a_norm_quant"}, {&k_aact, "a_act_quant"}, {&k_ares, "a_resid"}, {&k_aconv, "a_conv_mid"}, {&k_aattn, "a_attn"}, {&k_lmconv, "lm_conv_q"}, {&k_lmcst, "lm_conv_state"}, {&k_lmkv, "lm_kv_write"}, {&k_lmpf, "lm_attn_pf"}, {&k_lmdec, "lm_attn_dec"}, {&k_lmcdec, "lm_conv_dec_q"}, {&k_lmqkv, "lm_qkv_post_kv"}, {&k_lmcwin, "lm_conv_win_q"}, {&k_lmpfq, "lm_attn_pf_q"}, {&k_lmdecq, "lm_attn_dec_q"}, {&k_lmqkvq, "lm_qkv_post_kvq"}, {&k_dqkh, "dattn_qk_h"}, {&k_dpvh, "dattn_pv_h"}, {&k_rowf3, "row_fused3"}, {&k_qkvp3, "qkv_post3"}, {&k_attq3, "attention_q3"}, {&k_gmq3, "gelu_mul_q3"},
         {&k_gmvq3, "gelu_mulvec_q3"}, {&k_rnq, "resid_norm_q3"}, {&k_hinq, "head_in_q3"}, {&k_convq, "conv_gate_q3"},
         {&k_siluq, "silu_mul_q8"}, {&k_bactq, "bias_act_q8"}, {&k_badd, "bias_add"}, {&k_score, "score_out"}, {&k_attq4, "attention_q4"}, {&k_attq5, "attention_q5"}, {&k_quantq, "quant_q3"}, {&k_lngq, "ln_gather_q3"}, {&k_dqk, "dattn_qk"}, {&k_dsm, "dattn_stats"}, {&k_dpv, "dattn_pv"}};
     for (auto& k : ks) { *k.k = cl.clCreateKernel(g_prog, k.n, &err); CK(err); }
@@ -2476,6 +2494,12 @@ bool op_lm_qkv_post_kv(Buf C, int rowc, int T, int nq, int nkv, int hd, Buf qw, 
     return launch(k_lmqkv, 2, g, l);
 }
 
+bool op_lm_conv_win_q(Buf C, Buf src1, Buf src2, Buf st, Buf taps, int T, int d) {
+    if (d % 32 || d / 4 > 512) return false;
+    set_args(k_lmcwin, C, src1, src2, st, taps, (Buf)g_Xp, (Buf)g_Xs, (cl_int)d);
+    size_t g[1] = {(size_t)T * (d / 4)}, l[1] = {(size_t)d / 4};
+    return launch(k_lmcwin, 1, g, l);
+}
 bool op_lm_attn_pf_q(Buf C, int ldc, Buf KVq, Buf KVs, int ldkv, int voff, int kvbase, int nq, int nkv, int pos0, float scale, int T) {
     set_args(k_lmpfq, C, (cl_int)ldc, KVq, KVs, (cl_int)ldkv, (cl_int)voff, (cl_int)kvbase, (cl_int)nq, (cl_int)nkv, (cl_int)pos0, scale,
              (Buf)g_Xp, (Buf)g_Xs, (cl_int)T);

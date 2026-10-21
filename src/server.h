@@ -22,6 +22,7 @@ struct ServerOptions {
     bool plan_only = false;                    // `ferro-embed plan`: print the memory plan and exit
     bool no_memory_check = false;              // start even when the plan says the configuration does not fit the container limit
     bool kv_int8 = false;                       // --kv-dtype int8: KV cache as int8 + one fp32 scale per 32 values (3.6x smaller; same scheme as llama.cpp's q8_0 KV; small accuracy cost, see README)
+    int spec_draft = 6;                        // speculative decoding (prompt lookup, verified exactly): longest draft per step; 0 = off. Streams start at 3 (a 4-row window costs ~1.3x a plain step) and use up to N once >85% of their drafts are accepted. Request field "draft": false opts out
     int thinking_budget = -1;                  // default cap on reasoning tokens per reply (-1 = none); the reply field `thinking_budget` overrides it
     int prefill_slice_ms = 250;                // while other work waits (decode streams, d1, embeddings) a long prompt is prefilled in slices of about this many ms
     int decode_share = 40;                     // percent of the time decode steps get while a prompt is filling (decode runs ~slice*share/(100-share) ms after each slice)

@@ -118,7 +118,7 @@ struct LmEngine::Impl {
     struct Gpu {
         bool ok = false;
         int slots = 1, cap = 0, Tmax = 0;
-        std::vector<gpu::Buf> an, fn, taps, qn, kn, kv, kvs, cst;   // per layer (an/fn), per conv layer (taps, cst), per attention layer (qn, kn, kv)
+        std::vector<gpu::Buf> an, fn, taps, qn, kn, kv, kvs, cst, cw;   // per layer (an/fn), per conv layer (taps, cst), per attention layer (qn, kn, kv)
         gpu::Buf out_norm = nullptr, cosb = nullptr, sinb = nullptr, zero = nullptr;
         gpu::Buf X = nullptr, X2 = nullptr, D = nullptr, C = nullptr, G = nullptr, Xl = nullptr, Dl = nullptr, logits = nullptr;
         gpu::Buf bpos = nullptr, bdst = nullptr, bsrc1 = nullptr, bsrc2 = nullptr, bslot = nullptr, br1 = nullptr, br2 = nullptr, bbase = nullptr, blen = nullptr;
@@ -137,6 +137,7 @@ struct LmEngine::Impl {
 };
 
 // ------------------------------------------------------------------ iGPU path
+static const int kWinMax = 16;      // rows of one speculative verification window
 static bool gpu_setup(LmEngine::Impl& in, LmModel& m, int max_ctx, int n_slots, bool kv_int8_) {
     auto& g = in.g;
     const int d = m.n_embd, hd = m.head_dim, ff = m.n_ff, kvw = 2 * m.n_kv * hd, rowc = m.n_head * hd + kvw;
@@ -149,7 +150,8 @@ static bool gpu_setup(LmEngine::Impl& in, LmModel& m, int max_ctx, int n_slots, 
     auto up = [&](const std::vector<float>& v) { gpu::Buf b = gpu::upload(v.data(), v.size() * 4); ok = ok && b; return b; };
     for (auto& l : m.L) {
         g.an.push_back(up(l.attn_norm)); g.fn.push_back(up(l.ffn_norm));
-        if (l.conv) { g.taps.push_back(up(l.taps)); g.cst.push_back(gpu::alloc((size_t)n_slots * 2 * d * 4)); ok = ok && g.cst.back(); }
+        if (l.conv) { g.taps.push_back(up(l.taps)); g.cst.push_back(gpu::alloc((size_t)n_slots * 2 * d * 4)); ok = ok && g.cst.back();
+                           g.cw.push_back(gpu::alloc((size_t)kWinMax * 3 * d * 4)); ok = ok && g.cw.back(); }       // copy of the window's in_proj rows (speculative commit)
         else {
             g.qn.push_back(up(l.q_norm)); g.kn.push_back(up(l.k_norm));
             g.kv.push_back(gpu::alloc((size_t)n_slots * max_ctx * kvw * (kv_int8_ ? 1 : 4))); ok = ok && g.kv.back();
@@ -162,7 +164,7 @@ static bool gpu_setup(LmEngine::Impl& in, LmModel& m, int max_ctx, int n_slots, 
     gpu::warm_small_gemm(4);
     g.slots = n_slots; g.cap = max_ctx;
     g.Tmax = std::min(max_ctx, getenv("FERRO_LM_TMAX") ? atoi(getenv("FERRO_LM_TMAX")) : 1024);
-    g.max_ns = std::max(n_slots, 1);
+    g.max_ns = std::max(n_slots, kWinMax);                       // also bounds the logits / residual rows of a speculative window
     const size_t R = (size_t)std::max(g.Tmax, g.max_ns);
     g.X = gpu::alloc(R * d * 4); g.X2 = gpu::alloc((size_t)4 * d * 4); g.D = gpu::alloc(R * d * 4); g.C = gpu::alloc(R * std::max(3 * d, rowc) * 4);
     g.G = gpu::alloc(R * 2 * ff * 4); g.Xl = gpu::alloc((size_t)g.max_ns * d * 4); g.Dl = gpu::alloc((size_t)g.max_ns * d * 4);
@@ -203,7 +205,7 @@ static bool lm_dup(const char* name) {            // FERRO_LM_DUP=a,b: launch th
 
 // One forward over `T` rows. Prefill (pf): rows are consecutive tokens of one sequence (positions pos0..), decode: one row per sequence.
 static bool gpu_forward(LmEngine::Impl& in, const LmModel& m, const std::vector<int>& ids, const std::vector<LmSeq*>& seqs, bool pf, int pos0, float* logits,
-                        std::string* err) {
+                        std::string* err, const std::vector<int>* win_j = nullptr) {
     // Decode rows always use the split-K GEMV and prefill rows always use the tile GEMM, so a row's arithmetic does not
     // depend on how many other rows share the launch (batch- and chunk-invariant; FERRO_ROW_POLICY=0 restores the old mix).
     struct Policy { Policy(int p) { static const char* e = getenv("FERRO_ROW_POLICY"); gpu::set_row_policy(e && atoi(e) == 0 ? 0 : p); } ~Policy() { gpu::set_row_policy(0); } } policy_guard(pf ? 2 : 1);
@@ -222,6 +224,14 @@ static bool gpu_forward(LmEngine::Impl& in, const LmModel& m, const std::vector<
             g.src2[t] = t >= 2 ? t - 2 : (t == 1 ? -1 - (sl * 2 + 1) : -1 - (sl * 2 + 0));
         }
         g.slot[0] = sl; g.r1[0] = T - 1; g.r2[0] = T >= 2 ? T - 2 : -1;
+    } else if (win_j) {                                          // speculative window: one decode-style row per token, several rows per sequence
+        for (int b = 0; b < T; ++b) {
+            const int sl = seqs[b]->gpu_slot, j = (*win_j)[b], p = seqs[b]->n_past + j;
+            g.pos[b] = p; g.dst[b] = sl * g.cap + p;
+            g.src1[b] = j >= 1 ? b - 1 : -1 - (sl * 2 + 1);
+            g.src2[b] = j >= 2 ? b - 2 : (j == 1 ? -1 - (sl * 2 + 1) : -1 - (sl * 2 + 0));
+            g.slot[b] = sl; g.r1[b] = b; g.r2[b] = -1; g.base[b] = sl * g.cap; g.len[b] = p + 1;
+        }
     } else {
         for (int b = 0; b < T; ++b) {
             const int sl = seqs[b]->gpu_slot, p = seqs[b]->n_past;
@@ -241,7 +251,7 @@ static bool gpu_forward(LmEngine::Impl& in, const LmModel& m, const std::vector<
     static const bool fuse_pro = fuse && getenv("FERRO_LM_FUSE") && atoi(getenv("FERRO_LM_FUSE")) >= 2;
     // decode with <= 4 sequences: rmsnorm / silu*up run inside the consumer GEMV (one launch less each); X ping-pongs between X and X2
     static const int pro_mask = getenv("FERRO_PRO_MASK") ? atoi(getenv("FERRO_PRO_MASK")) : 15;   // sites: 1 layer-opening GEMV, 2 gateup, 4 down(silu), 8 lm_head
-    bool fpro = fuse_pro && !pf && T <= 4 && ns == T && gpu::gemv_pro_ok(m.tok_embd.gpu_slot, T, 1, 0);
+    bool fpro = fuse_pro && !pf && !win_j && T <= 4 && ns == T && gpu::gemv_pro_ok(m.tok_embd.gpu_slot, T, 1, 0);
     for (int il = 0; fpro && il < m.n_layer; ++il) {
         const LmLayer& l = m.L[il];
         fpro = gpu::gemv_pro_ok(l.conv ? l.in_proj.gpu_slot : l.wqkv.gpu_slot, T, 1, 0) && gpu::gemv_pro_ok(l.gateup.gpu_slot, T, 1, 0) && gpu::gemv_pro_ok(l.down.gpu_slot, T, 2, ff);
@@ -276,7 +286,8 @@ static bool gpu_forward(LmEngine::Impl& in, const LmModel& m, const std::vector<
         const LmLayer& l = m.L[il];
         if (l.conv) {
             ok = P("gemm", first_gemm(l.in_proj.gpu_slot, il, g.C));
-            if (ok && fuse && !pf) ok = P("conv", gpu::op_lm_conv_dec_q(g.C, g.cst[ci], g.bslot, g.taps[ci], T, d));          // decode: gate + state in one launch
+            if (ok && win_j) ok = P("conv", gpu::op_lm_conv_win_q(g.C, g.bsrc1, g.bsrc2, g.cst[ci], g.taps[ci], T, d)) && gpu::copy(g.cw[ci], 0, g.C, 0, (size_t)T * 3 * d * 4);
+            else if (ok && fuse && !pf) ok = P("conv", gpu::op_lm_conv_dec_q(g.C, g.cst[ci], g.bslot, g.taps[ci], T, d));          // decode: gate + state in one launch
             else if (ok) ok = P("conv", gpu::op_lm_conv_q(g.C, g.bsrc1, g.bsrc2, g.cst[ci], g.taps[ci], T, d))
                               && P("conv_state", gpu::op_lm_conv_state(g.C, g.cst[ci], g.bslot, g.br1, g.br2, ns, d));
             ok = ok && P("gemm", gpu::op_gemm_q(l.out_proj.gpu_slot, T, g.D));
@@ -321,6 +332,35 @@ static bool gpu_forward(LmEngine::Impl& in, const LmModel& m, const std::vector<
 }
 
 bool LmEngine::on_gpu() const { return impl_ && impl_->g.ok; }
+
+bool LmEngine::spec_ok() const {          // verification rows must use the same kernels as serial decode: the default fused path only
+    if (!on_gpu()) return false;
+    const char* f = getenv("FERRO_LM_FUSE"); const int lv = f ? atoi(f) : 1;
+    return lv == 1;
+}
+
+bool LmEngine::verify(const std::vector<LmSeq*>& seqs, const std::vector<std::vector<int>>& rows, float* logits, std::string* err) {
+    if (!spec_ok()) { if (err) *err = "speculative verification needs the iGPU path with the default fused kernels"; return false; }
+    std::vector<int> ids, wj; std::vector<LmSeq*> rs;
+    for (size_t i = 0; i < seqs.size(); ++i) {
+        const int m = (int)rows[i].size();
+        if (m <= 0 || seqs[i]->gpu_slot < 0 || seqs[i]->n_past + m > max_ctx_) { if (err) *err = "bad verification window"; return false; }
+        for (int j = 0; j < m; ++j) { ids.push_back(rows[i][j]); wj.push_back(j); rs.push_back(seqs[i]); }
+    }
+    if (ids.empty() || (int)ids.size() > kWinMax) { if (err) *err = "verification window too large"; return false; }
+    return gpu_forward(*impl_, m_, ids, rs, false, 0, logits, err, &wj);
+}
+
+bool LmEngine::commit(const std::vector<LmSeq*>& seqs, const std::vector<int>& row_off, const std::vector<int>& accepted) {
+    auto& g = impl_->g; const int d = m_.n_embd, n = (int)seqs.size();
+    std::vector<int> slot(n), r1(n), r2(n);
+    for (int i = 0; i < n; ++i) { const int a = accepted[i]; slot[i] = seqs[i]->gpu_slot; r1[i] = row_off[i] + a - 1; r2[i] = a >= 2 ? row_off[i] + a - 2 : -1; }
+    bool ok = gpu::write(g.bslot, slot.data(), (size_t)n * 4) && gpu::write(g.br1, r1.data(), (size_t)n * 4) && gpu::write(g.br2, r2.data(), (size_t)n * 4);
+    for (size_t ci = 0; ok && ci < g.cst.size(); ++ci) ok = gpu::op_lm_conv_state(g.cw[ci], g.cst[ci], g.bslot, g.br1, g.br2, n, d);
+    if (ok) ok = gpu::finish();                                   // the arrays above are host memory that must outlive the enqueued kernels
+    if (ok) for (int i = 0; i < n; ++i) seqs[i]->n_past += accepted[i];
+    return ok;
+}
 
 bool LmEngine::init(const std::string& path, int n_threads, int max_ctx, std::string* err, int n_slots, bool kv_int8) {
     (void)n_threads;

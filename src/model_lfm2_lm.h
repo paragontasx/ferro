@@ -70,6 +70,12 @@ public:
     bool export_prefix(const LmPrefix& p, std::vector<uint8_t>* out) const;
     std::shared_ptr<LmPrefix> import_prefix(int n_tokens, const uint8_t* data, size_t len) const;
     uint64_t state_id() const { return state_id_; }
+    // Speculative decoding. verify(): for each sequence a window of tokens [last sampled, draft_1 .. draft_k] is run as k+1 decode rows with exactly the
+    // arithmetic of serial decode (logits for EVERY row, [row][vocab], rows in sequence order) without advancing the sequences; commit() then keeps the
+    // first accepted[i] rows of each window (KV rows are already in place, the conv state is rebuilt from the window) and advances n_past. At most 16 rows.
+    bool spec_ok() const;
+    bool verify(const std::vector<LmSeq*>& seqs, const std::vector<std::vector<int>>& rows, float* logits, std::string* err);
+    bool commit(const std::vector<LmSeq*>& seqs, const std::vector<int>& row_off, const std::vector<int>& accepted);
     int n_slots() const { return n_slots_; }
     void release(LmSeq& s);                          // give the sequence's device slot back (no-op on CPU)
     const LmModel& model() const { return m_; }
