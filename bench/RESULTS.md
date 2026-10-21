@@ -216,10 +216,10 @@ Token counts equal the server's in every case (1104 for 44 s: ONE `<|audio>..<au
   423 tok 2830 -> 804, 542 tok 4468 -> 1131, 672 tok 6729 -> 1545, 951 tok 13239 -> 2608 (5.1x). Sequences above the old 1024-token
   limit stay on the iGPU (1150 tok 3.7 s, 1587 tok 6.4 s, 2104 tok 10.4 s; cos vs llama.cpp >= .9998). Headline 16x188 bench unchanged.
 - **Query-tiled dense attention**: a 1080p photo is 8280 patches (3.3 GB of scores); queries are tiled into a bounded 64 MB scratch.
-  1080p: 67 s encode vs llama.cpp CPU 183 s; attention is 88% of it (qk 28.9 s, pv 28.1 s, stats 4.7 s, ~58 GMAC/s = 55% of fp32 peak).
+  1080p: 67 s encode vs llama.cpp CPU 183 s; attention is 88% of it (qk 28.9 s, pv 28.1 s, stats 4.7 s, ~29 GMAC/s each = 27% of the 109 GFMA/s fp32 peak; an earlier version of this line said 55% because it double-counted MACs as FLOPs).
 
 ### Limits / not done
-- 1080p photos are slow (~70 s): ViT attention at ~55% of fp32 peak; fp16/flash-style fusion is not available through this OpenCL.
+- 1080p photos are slow (~70 s): ViT attention runs at ~27% of fp32 peak (29 GMAC/s), so kernel tuning has real headroom.
 - Video costs ~1.5 s/frame: small frames are upscaled to the 70-token minimum image (a 320x240 frame becomes 480x384 = 720 patches).
   Batching frames into one forward (segment-masked attention) would amortise the weight traffic; not done.
 - Audio attention / conv module / SSCP still run on the CPU (the audio GEMMs are on the iGPU).
