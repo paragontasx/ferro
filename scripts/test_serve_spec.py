@@ -14,7 +14,8 @@ def post(b):
 def chat(user, draft=True, temp=0.0, seed=None, n=120, system=None):
     b = {"messages": ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": user}], "max_tokens": n, "temperature": temp, "cache_prompt": False, "draft": draft}
     if seed is not None: b["seed"] = seed
-    dt, o = post(b); return o["choices"][0]["message"]["content"], dt, o["usage"]["completion_tokens"]
+    dt, o = post(b); m = o["choices"][0]["message"]       # a Thinking model may still be inside <think> at max_tokens: compare reasoning + content
+    return m["content"] + "\u241e" + m.get("reasoning_content", ""), dt, o["usage"]["completion_tokens"]
 def health(): return json.loads(urllib.request.urlopen(U + "/health").read())["lm"] if False else json.loads(urllib.request.urlopen(U + "/health").read())
 tickets = "\n".join(f"TICKET-{1000 + i}: customer {['Ana', 'Bo', 'Cy', 'Di'][i % 4]} reports {['a refund', 'a late parcel', 'a broken screen', 'a billing error'][i % 4]} on order {7000 + i * 13}" for i in range(14))
 P = {
@@ -48,6 +49,7 @@ check("a mix of speculating and non-speculating streams stays exact", outs[0] ==
 s1, _, _ = chat(P["copy list"], False, n=37); s2, _, _ = chat(P["copy list"], True, n=37)
 check("max_tokens inside a verification window cuts at exactly the same token", s1 == s2 and len(s1) > 10, f"{len(s1)} chars")
 b = {"messages": [{"role": "user", "content": P["copy list"]}], "max_tokens": 120, "temperature": 0, "stop": ["TICKET-1005"], "cache_prompt": False}
-o1 = post(dict(b, draft=False))[1]["choices"][0]["message"]["content"]; o2 = post(dict(b, draft=True))[1]["choices"][0]["message"]["content"]
-check("a stop string inside a draft window cuts at the same place", o1 == o2 and "TICKET-1005" not in o2 and "TICKET-1004" in o2, repr(o2[-40:]))
+txt = lambda o: o["choices"][0]["message"]["content"] + "\u241e" + o["choices"][0]["message"].get("reasoning_content", "")
+o1 = txt(post(dict(b, draft=False))[1]); o2 = txt(post(dict(b, draft=True))[1])
+check("a stop string inside a draft window cuts at the same place", o1 == o2 and "TICKET-1005" not in o2, repr(o2[-40:]))
 print("ALL PASS" if not fails else f"{fails} FAILED"); sys.exit(1 if fails else 0)

@@ -164,7 +164,8 @@ Fusion / timing-experiment knobs: `FERRO_LM_FUSE=0` (unfused launches), `=2` (op
 One resident process, OpenAI-compatible, embeddings and/or language model and/or the d1 decision model on the same iGPU (one worker thread owns the device):
 ```sh
 ./ferro-embed serve --model models/embeddinggemma-2-Q8_0.gguf --mmproj models/mmproj-embeddinggemma-2-Q8_0.gguf \
-                    --lm models/LFM2.5-1.2B-Thinking-Q8_0.gguf --d1 models/d1-omni-600M-Q8_0.gguf --port 8088 [--lm-slots 4] [--lm-ctx 4096] [--api-key K] [--host 0.0.0.0]
+                    --lm models/LFM2.5-1.2B-Thinking-Q8_0.gguf --d1 models/d1-omni-600M-Q8_0.gguf --port 8088 [--lm-slots 4] [--lm-ctx 4096] [--kv-dtype f32|int8] [--spec-draft 6] [--snapshot-dir D] [--api-key 'label: key']... [--host 0.0.0.0]
+./ferro-embed plan <same flags>      # what this configuration needs vs the container limit, before anything is loaded
 curl localhost:8088/v1/chat/completions -d '{"messages":[{"role":"user","content":"What is 17*23?"}],"stream":true}'
 curl localhost:8088/v1/embeddings -d '{"input":"hello"}'
 ```
@@ -174,6 +175,8 @@ curl localhost:8088/v1/embeddings -d '{"input":"hello"}'
 | `POST /v1/chat/completions`, `POST /v1/completions` | `messages` (+`tools` are rendered into the prompt), `max_tokens`, `temperature`, `top_p`, `top_k`, `min_p`, `repetition_penalty`, `seed`, `stop`, `stream` (SSE) + `stream_options.include_usage`; `usage` and llama.cpp-style `timings` in every response |
 | `POST /v1/systemone` | d1-omni typed decisions (choice / score / noul) over a text, image or audio state - llama.cpp's contract, answers identical to `ferro-embed decide`; queued requests share one forward pass; `crop` / `crops` regions (below) |
 | `POST /apply-template` | rendered chat prompt (same contract as llama.cpp) |
+| `POST /tokenize`, `POST /detokenize` | token ids for a `prompt` / `messages` (chat template applied) and back; vLLM's fields |
+| `GET /metrics` | Prometheus text (counters, live tokens/s, TTFT histogram, memory); needs a key when keys are set |
 | `GET /v1/models`, `GET /health` | capabilities / context / slots; queue, active slots, throughput counters |
 
 `<think>..</think>` output is returned as `reasoning_content` (`--reasoning-format none` keeps it inline). Generation is continuously batched over `--lm-slots`
@@ -215,6 +218,67 @@ container that leaves too little headroom for multimodal embedding bursts (the a
 The server prints the KV size and warns when it approaches a container limit. Tests: `scripts/test_serve.py` (embeddings), `scripts/test_serve_lm.py`
 (chat: usage accounting, seeds, stream == non-stream, stop strings, UTF-8, errors, cancellation, concurrency, template parity with `--llama URL`),
 `scripts/test_serve_prefix.py` (prefix cache: cold vs warm, exactness vs `cache_prompt:false`, tools, learned prefixes, streaming usage, concurrency, LRU eviction), `scripts/test_serve_d1.py` (decisions: CLI parity, media, crop == pre-cropped image, error cases, concurrency / pass sharing), `scripts/bench_lm_serve.py` (concurrency scaling), `scripts/bench_serve.py` (embeddings).
+
+Newer suites (each starts the servers it needs or takes `--url`): `scripts/test_batch_invariance.py` (solo == among N streams), `scripts/test_serve_sched.py` (chunked prefill),
+`scripts/test_serve_think.py` (thinking budget; needs the 1.2B-Thinking model), `scripts/test_serve_spec.py` (speculative decoding exactness), `scripts/test_memory.py`, `scripts/test_snapshots.py`,
+`scripts/test_serve_ops.py`; benchmarks `scripts/bench_spec.py`, `scripts/bench_lm_serve.py`.
+
+## Exactness, scheduling and operations (LM serving)
+Everything here is measured on the N100 iGPU with the files in `models/` (scripts named in each item are in `scripts/`).
+
+**Exactness contract.** A stream decodes to the same tokens alone or among any number of other streams, a prompt filled in slices or restored from a
+cache equals the same prompt filled at once, and speculative decoding changes nothing: the output is what one-token decoding gives.
+Decode rows always use the split-K GEMV (8-row passes beyond 8 rows) and prefill rows always use the tile GEMM, so a row's arithmetic does not depend on how
+many other rows share the launch; a 1-token prefill tail takes the prefill path. Before this, 2 of 4 greedy prompts differed between a solo run and a run among
+5-8 streams (a different GEMM kernel, a different float summation order); now 4/4 are identical at 2..12 streams, greedy and seeded
+(`scripts/test_batch_invariance.py`), and the engine self-check (`FERRO_LM_SELFCHECK=1`) shows split prefill and every cache restore bit-identical
+(`max|diff| 0`, also at 641 tokens). Cost: 1-4 streams unchanged, 5 streams -5% (95 -> 91 tok/s aggregate), 8 streams -1.5%. `FERRO_ROW_POLICY=0` restores the old mix.
+
+**Chunked prefill (`--prefill-slice-ms`, default 250; `--decode-share`, default 40%).** A long prompt used to stop everything: a d1 decision took 3855 ms
+instead of 113 ms while a 1615-token prompt filled. The prompt is now filled in slices sized from the measured prefill rate (a whole prompt at once when nothing
+else is waiting), and after each slice the decode streams get their share of the time; d1 and embedding work run between slices. During that prefill: d1
+2187 -> 170-196 ms (113 alone), longest stall of a decoding stream 2278 -> 360 ms, a short chat 2088 -> 1041 ms; the long prompt itself takes ~38% longer under
+contention (6.2 s vs 4.5 s). Same output as unsliced (`scripts/test_serve_sched.py`).
+
+**Speculative decoding by prompt lookup (`--spec-draft N`, default 6; per request `"draft": false`).** Replies often copy the prompt (ids, names, quoted text) or
+repeat themselves. The server looks for the last 2-4 generated tokens earlier in the prompt + reply and proposes the tokens that followed, then verifies them
+in one forward as a window of rows that use exactly the arithmetic of serial decode (own conv kernel, conv-state rollback; window == serial decode `max|diff| 0`).
+Tokens are sampled row by row with one sampler draw per produced token, and a draft is kept only while it equals the sampled token, so greedy and seeded replies
+are identical with and without it, also under concurrency and when a stop string or `max_tokens` falls inside a window (`scripts/test_serve_spec.py`).
+Greedy tokens/s, 350M (interleaved rounds, `scripts/bench_spec.py`): copy a list verbatim 31.6 -> 52.3 (**1.65x**, 67% of drafted tokens accepted), extract ids 1.25x,
+rewrite a log 1.12x, write code 1.08x, free-form text 1.03x (no drafts attempted). The 1.2B-Thinking measured 0.99-1.08x, i.e. within noise: it spends its tokens on
+reasoning prose, which does not copy. A window costs (350M, plain step 26.6 ms): 2 rows 27.1 ms, 4 rows 32.9, 5-8 rows 43-47 (1.2B: 58 / 72 / 112-129 ms), so streams start
+at 3 drafted tokens and use up to `--spec-draft` only once >85% of their drafts are accepted; a stream whose drafts keep failing sits out a few steps, and a stream that
+has not shown drafting works needs a 3-token match. Only with the default fused kernels (`FERRO_LM_FUSE=1`) and at most 8 active streams.
+
+**Thinking budget (`--thinking-budget N`, request `thinking_budget`).** After N reasoning tokens a `</think>` is forced and the model answers (unbounded: 217 tokens;
+budget 24: reasoning cut at 24). A reply that stops at `max_tokens` inside `<think>` has empty `content`, so it now says so: a log line, and a `warnings` array in the
+response (and on the last streamed chunk). `ignore_eos: true` generates past the end token (fixed-length benchmark runs).
+
+**int8 KV cache (`--kv-dtype int8`, default f32).** K/V rows as int8 with one fp32 scale per 32 values (llama.cpp's q8_0 KV scheme), quantized in the fused
+norm+rope+cache-write kernel and dequantized in the attention kernels; prefix snapshots carry the scales. 350M at 4 x 4096: KV 384 -> 108 MB (resident memory -276 MB
+measured). Accuracy vs the same-weights llama.cpp oracle: top-1 12/12 either way, mean TV 0.0172 (f32) -> 0.0276 (int8), the loss concentrated on short prompts.
+Speed: decode ~10-15% slower at a 2k context (350M 23.1 -> 19.6 tok/s, 1.2B 12.0 -> 10.9) because dequantizing adds work to the attention kernel; no change at short context.
+Worth it when memory is the limit, not otherwise.
+
+**Memory planning and admission.** `ferro-embed plan <serve flags>` prints what a configuration needs from GGUF headers and file sizes alone (runtime ~700 MB + 1.3 x every
+GGUF + KV + prefix cache; calibrated: 350M + d1 + EG2 + mmproj estimated 3585 MB, measured 3373 MB) against the container limit, with concrete advice when it does not fit
+(`--lm-slots 3 fits`, `--kv-dtype int8 saves 1104 MB`, ...); exit code 3 = does not fit. `serve` runs the same check *before loading anything* and refuses an over-committed
+configuration instead of being OOM-killed (`--no-memory-check` overrides). Requests with media are admitted only if their estimated transient memory fits the headroom right now
+(reserved while in flight): 413 with guidance when nothing else is running ("send a crop / downscale / fewer frames"), 503 when waiting would help. Measured transients: d1 image
++42 / 74 / 166 / 293 MB at 0.07 / 0.23 / 0.92 / 2.07 MP (capped by the vision-token budget); EG2 image +375 MB at 1080p; audio and video use conservative payload-size estimates (not
+measured). Freed heap is returned to the OS when the worker goes idle. `/health` `memory` shows limit / used / headroom / reserved / rejected. `scripts/test_memory.py`.
+
+**Persistent prefix snapshots (`--snapshot-dir D`, `--snapshot-mb`, default 2048).** New prefix-cache entries are also written to `D` in the background (CRC, atomic rename, oldest-first
+disk budget), and a device-cache miss falls back to disk, so a restart no longer throws the system-prompt prefill away: the first request after a restart took 835 ms instead of 5927 ms
+(1856 of 1881 tokens restored; a 1881-token snapshot is 43.6 MB with an f32 KV cache), with an answer identical to the uncached one. A snapshot's identity is the model file, KV dtype and kernel build:
+files from anything else are never loaded (and never deleted), corrupt files are detected and dropped, over-budget entries are not stored. `scripts/test_snapshots.py`.
+
+**Operations.** `GET /metrics` (Prometheus text: request / token counters, live decode and prefill tokens per second, TTFT histogram, queue / slot gauges, prefix-cache and snapshot stats,
+speculative drafted / accepted, memory gauges); `/health` adds `live` rates and the speculative counters. `POST /tokenize` and `/detokenize` (vLLM's fields: `prompt` or `messages`,
+`add_special_tokens`, `return_token_strs`; they use the exact tokenization generation uses, so a client can count and plan cached prefixes). Several labelled API keys: `--api-key 'label: key'`
+(repeatable), `--api-key-file F` (one `label: key` or bare key per line, `#` comments; **re-read on SIGHUP**), `Authorization: Bearer` or `x-api-key`; the log names the key used; `/metrics` needs a key unless
+`--metrics-open`, `/health` stays open. `scripts/test_serve_ops.py`.
 
 ## How the iGPU path is fast
 1. **int8 DP4A GEMMs** (`cl_khr_integer_dot_product`): Q8_0 weights resident on the GPU in a
@@ -274,4 +338,4 @@ d1: faster than llama.cpp CPU (1.5×), but ~7× slower than the iGPU — use the
 paths, for A/B) · `FERRO_DECISION_BATCH=N` (tokens per d1 forward, default 4096) ·
 `FERRO_MM_GPU=0` / `FERRO_MM_DENSE=0` (media encoder fallbacks) · `FERRO_DECISION_DUMP=1` (rendered d1 prompts + token ids) · `FERRO_DEBUG_LAYERS=1` · `FERRO_TIME=1` ·
 `FERRO_MM_AUDIO_GPU=0` (audio GEMMs on CPU) · `FERRO_MM_AUDIO_DEV=0` (audio blocks back to host-driven GEMMs) · `FERRO_GPU_DENSE_TEXT=0` / `FERRO_GPU_DENSE_MIN=N` (dense long-sequence text attention) · `FERRO_G4_SYNC=1` / `FERRO_G4_DUMP=dir` / `G4A_TIME=1` / `EMB_TIME=1` (multimodal debugging) ·
-`FERRO_LM_*` (see the LM section) · `FERRO_LOW_MEM=1` · `FERRO_DBGDIR=/path` (CPU stage dumps for golden diffing)
+`FERRO_LM_*` (see the LM section) · `FERRO_ROW_POLICY=0` (old decode/prefill GEMM mix) · `FERRO_KV=f32|int8` · `FERRO_MEM_LIMIT_MB=N` (override the detected container limit; tests) · `FERRO_LM_WINBENCH=1` (with `FERRO_LM_SELFCHECK=1`: cost of a speculative window by row count) · `FERRO_LOW_MEM=1` · `FERRO_DBGDIR=/path` (CPU stage dumps for golden diffing)

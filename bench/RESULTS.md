@@ -376,3 +376,30 @@ Speed (system prompt 1396 tokens + a ~30-token digest, 24 generated tokens, `cac
 Cost of caching on a cold request: +4.5% (350M 1519 -> 1590 ms, 1.2B 5494 -> 5748 ms for a 741-token prompt); the snapshot is 10-17 ms of that, the rest is the extra prefill chunk boundary. Memory: 16.8 MB for 714 tokens;
 the budget is enforced by LRU eviction (8 MB test: 9 evictions, never above budget) and is included in the startup memory estimate.
 Not done: a snapshot at the end of every prompt (would give multi-turn chats a hit one turn earlier at the price of churn), prefix caching for d1's question prompts (compute-bound at ~500 tok/s with ~40-token questions, so little to save).
+
+## Exactness, scheduling, speculation, memory (LM serving study)
+N100 iGPU, 350M / 1.2B-Thinking Q8_0, interleaved runs, greedy unless noted. Details and flags: README "Exactness, scheduling and operations".
+
+**Batch / chunk invariance** (`scripts/test_batch_invariance.py`, engine `FERRO_LM_SELFCHECK=1`): a stream alone vs among N concurrent streams, greedy and T=0.8 seeded.
+Before: 2 of 4 prompts differed at >= 5 streams. After: identical at 2, 3, 4, 5, 6, 8, 12 streams; split prefill (1+640, 2+639, 3+638, 320+321) and cache restores `max|diff| 0`.
+Aggregate decode tok/s (350M, policy off -> on): 1 stream 33-35 -> 34; 2: 56-57 -> 61-67; 4: 95-99 -> 98-100; 5: 95-97 -> 91; 8: 129-130 -> 127.5.
+
+**Chunked prefill** (1615-token prompt in flight, `scripts/test_serve_sched.py`): d1 decision 2187 ms -> 170-196 ms (alone 108-113), longest decode stall 2278 -> 360 ms (72 tokens kept flowing),
+short chat 2088 -> 1041 ms; the prompt itself 4.5 s idle, 6.2-6.8 s under contention.
+
+**Speculative decoding** (`scripts/bench_spec.py`, 350M, drafts off -> on, tokens/s): copy a list 31.6 -> 52.3 (1.65x, 67% accepted); extract ids 26.6 -> 33.2 (1.25x, 48%); rewrite a log 28.6 -> 31.9 (1.12x, 59%);
+write code 38.6 -> 41.6 (1.08x, 52%); free-form 37.0 -> 37.9 (1.03x, no drafts). 1.2B-Thinking: copy 1.01x, extract 0.99x, rewrite 1.02x, free 1.08x, code 1.07x (within noise; reasoning prose does not copy).
+Before the "3-token match until proven" rule, free-form text lost 4% (0.96x) to coincidental 2-token matches. Verification window cost (`FERRO_LM_WINBENCH=1`, median of 15, incl. logits read-back),
+350M: 1 row 24.8 ms, 2: 27.1, 3: 27.7, 4: 32.9, 5: 42.8, 6: 46.5, 7: 45.4, 8: 47.3 (plain decode step 26.6); 1.2B: 56.9, 58.5, 72.4, 71.5, 111.9, 114.7, 124.2, 129.0 (plain 64.2). The 8-row GEMV variant is the
+expensive part, hence short default windows. Exactness: verified window rows == serial decode rows `max|diff| 0` (f32 and int8 KV, one and two sequences), commit of 1/2/3/5 accepted rows then decode == serial `max|diff| 0`.
+
+**int8 KV cache**: 350M, 4 x 4096: KV 384 -> 108 MB (resident -276 MB). Parity vs llama.cpp (same Q8_0 weights): top-1 12/12 both, mean TV 0.0172 -> 0.0276 (prompts 6/8/9 worst: 0.045 -> 0.096, 0.031 -> 0.073, 0.031 -> 0.058).
+Decode at a 1921-token context: 350M 23.1 -> 19.6 tok/s, 1.2B 12.0 -> 10.9 tok/s (prefill unchanged: 380 -> 383, 125 -> 128).
+
+**Memory admission** (transient above idle, sampled every 10 ms; later requests understate it because freed arenas stay resident): d1 image 256x256 +42 MB, 640x360 +74, 1280x720 +166, 1920x1080 +293 (21.8 s, ~7000 vision tokens);
+EG2 image 1280x720 +261, 1920x1080 +375 (69.5 s). Plan estimate vs measured: 350M + d1 + EG2 + mmproj 3585 vs 3373 MB.
+
+**Persistent snapshots**: 1881-token system prompt on the 350M: first request after a restart 5927 ms (cold) -> 835 ms (1856 tokens restored from disk), answer identical to the uncached one; snapshot 43.6 MB (f32 KV).
+
+**Measurement note.** Parity here is judged against llama.cpp running the *same Q8_0 weights* (`lm_parity.py --llama` pointed at a server on the Q8_0 file); an F16 oracle measures weight-quantization noise on top
+(350M: mean TV 0.0426 against F16 vs 0.0172 against Q8_0, identical code) and flips the argmax on a near-tie prompt - not a regression.
