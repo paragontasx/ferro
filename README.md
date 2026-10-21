@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.png">
+    <img src="assets/logo.png" alt="ferro - geometric inference engine" width="420">
+  </picture>
+</p>
+
 # Ferro
 
 Lightweight inference engine for Intel low-power SoCs (N100-class) that runs two models from one
