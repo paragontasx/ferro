@@ -148,7 +148,7 @@ device slots, prefill uses a causal tiled attention kernel, decode batches one t
 | decode, 1 stream | **36-37 tok/s** | 31.8 tok/s |
 | decode, aggregate over 2 / 4 / 8 streams (server) | **58 / 98 / 132 tok/s** | |
 
-Parity vs llama.cpp Q8_0 on the same weights: top-1 12/12, mean TV 0.017 (every prompt < 0.06). This model is far more sensitive to Q8 than the 1.2B (llama.cpp's own Q8 vs F16 is TV 0.040; ferro vs F16 0.043; both flip the same near-tie on an out-of-distribution `<think>` prompt), so compare against the same-weights Q8 oracle for it. Decode here is latency-bound (0.38 GB of weights = ~15 ms at 25.9 GB/s, the step takes ~27 ms: ~190 small kernel launches/token), so it is only ~1.1x llama.cpp CPU single-stream; prefill and batched serving are where the iGPU wins.
+Parity vs llama.cpp Q8_0 on the same weights: top-1 12/12, mean TV 0.017 (every prompt < 0.06). This model is far more sensitive to Q8 than the 1.2B (llama.cpp's own Q8 vs F16 is TV 0.040; ferro vs F16 0.043; both flip the same near-tie on an out-of-distribution `<think>` prompt), so compare against the same-weights Q8 oracle for it. Decode streams ~510 MB/token (int8 + fp32 scales) = 19.7 ms at the 25.9 GB/s ceiling against a ~26 ms step; the rest is ~70 small-kernel launches at ~40 us each (after the default conv/qkv fusions), so it is only ~1.2x llama.cpp CPU single-stream; prefill and batched serving are where the iGPU wins (details: `bench/RESULTS.md`, "Decode kernel fusion study").
 The chat template is read from each GGUF: the 350M template walks content arrays itself (text parts concatenated, system arrays too) while the Thinking template does not (llama.cpp's server joins parts with `\n` there); `serve` logs the detected variant and `/apply-template` is byte-identical to llama.cpp's jinja for both.
 
 Decode streams 1.17 GB of weights per token at ~22 GB/s; a pure-streaming read kernel reaches 25.9 GB/s on this iGPU, so Q8 decode is ~85% of the
@@ -158,6 +158,7 @@ the same as llama.cpp's own Q8_0 vs its F16 (0.0200), i.e. at the quantisation n
 vs F16) ferro's fp32-activation CPU reference is *closer* to F16 than llama.cpp's int8-activation Q8 path (1.1 / 1.4% vs 1.9 / 2.6%); the iGPU path quantises
 activations to int8 like llama.cpp and lands on the same TV. Debug knobs: `FERRO_LM_GPU=0` (CPU reference, ~0.5 tok/s decode), `FERRO_LM_PROF=1` (per-op device times),
 `FERRO_LM_STEPTIME=1`, `FERRO_LM_SELFCHECK=1` (chunked prefill / token-by-token decode vs one prefill), `FERRO_LM_KEEP_HOST=1`, `FERRO_GPU_SMALL=0` / `FERRO_GPU_GEMV=0`.
+Fusion / timing-experiment knobs: `FERRO_LM_FUSE=0` (unfused launches), `=2` (opt-in prologue-fused GEMVs, break-even on this GPU), `FERRO_PRO_MASK`, `FERRO_LM_ABL=op,..` / `FERRO_LM_DUP=op,..` (skip / double ops to measure their cost), `FERRO_LM_NOEOS=1`.
 
 ## Serving over HTTP (`ferro-embed serve`)
 One resident process, OpenAI-compatible, embeddings and/or language model on the same iGPU (one worker thread owns the device):

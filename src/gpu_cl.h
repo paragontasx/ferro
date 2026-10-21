@@ -75,6 +75,12 @@ bool op_conv_gate_q(Buf C, Buf prev, Buf next, Buf taps, int T, int d);   // pre
 bool op_lm_conv_q(Buf C, Buf src1, Buf src2, Buf st, Buf taps, int T, int d);     // causal conv gate; src: row >= 0 or state ref -1-(slot*2+k)
 bool op_lm_conv_state(Buf C, Buf st, Buf slot, Buf r1, Buf r2, int ns, int d);    // st[slot] <- b*x of rows r2 (or old newer slot), r1
 bool op_lm_kv_write(Buf C, int rowc, int koff, Buf KV, Buf dst, int T, int kvw);  // KV[dst[t]] <- C[t][koff .. koff+kvw)
+// decode GEMV with the activation prologue fused in (T<=4). mode 1: x=rmsnorm(A+B)*wn (+ store A+B to Xo); mode 2: x=silu(A[:ff])*A[ff:2ff]
+bool gemv_pro_ok(int slot, int T, int mode, int ff);
+bool op_gemv_pro(int slot, int T, Buf Y, int mode, Buf A, Buf B, Buf wn, Buf Xo, int ff, float eps);
+// fused decode versions (one row per sequence): conv gate + state update; q/k norm + rope + K/V cache write
+bool op_lm_conv_dec_q(Buf C, Buf st, Buf slot, Buf taps, int T, int d);
+bool op_lm_qkv_post_kv(Buf C, int rowc, int T, int nq, int nkv, int hd, Buf qw, Buf kw, Buf cosb, Buf sinb, Buf pos, int hlf, float eps, Buf KV, Buf dst, int kvw);
 bool op_lm_attn_pf(Buf C, int ldc, Buf KV, int ldkv, int voff, int kvbase, int nq, int nkv, int pos0, float scale, int T);
 bool op_lm_attn_dec(Buf C, int ldc, Buf KV, int ldkv, int voff, Buf bases, Buf lens, int nq, int nkv, float scale, int B);
 bool op_silu_mul_q(Buf G, int T, int FF);                    // silu(G[:, :FF]) * G[:, FF:] -> int8

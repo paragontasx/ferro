@@ -103,7 +103,7 @@ int run_generate(const GenArgs& a) {
     int stop = 0;
     for (int i = 0; i < a.n_predict; ++i) {
         const int nxt = sampler.sample(logits.data(), eng.n_vocab(), hist);
-        if (nxt == eng.model().eos_id) { stop = 1; break; }
+        if (nxt == eng.model().eos_id && !getenv("FERRO_LM_NOEOS")) { stop = 1; break; }     // FERRO_LM_NOEOS=1: timing experiments
         gen.push_back(nxt); hist.push_back(nxt);
         if (!a.quiet) { const std::string s = tok.decode_piece(nxt); fwrite(s.data(), 1, s.size(), stdout); fflush(stdout); }
         if (seq.n_past + 1 >= eng.max_ctx()) { stop = 2; break; }

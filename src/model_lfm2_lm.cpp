@@ -120,7 +120,7 @@ struct LmEngine::Impl {
         int slots = 1, cap = 0, Tmax = 0;
         std::vector<gpu::Buf> an, fn, taps, qn, kn, kv, cst;   // per layer (an/fn), per conv layer (taps, cst), per attention layer (qn, kn, kv)
         gpu::Buf out_norm = nullptr, cosb = nullptr, sinb = nullptr, zero = nullptr;
-        gpu::Buf X = nullptr, D = nullptr, C = nullptr, G = nullptr, Xl = nullptr, Dl = nullptr, logits = nullptr;
+        gpu::Buf X = nullptr, X2 = nullptr, D = nullptr, C = nullptr, G = nullptr, Xl = nullptr, Dl = nullptr, logits = nullptr;
         gpu::Buf bpos = nullptr, bdst = nullptr, bsrc1 = nullptr, bsrc2 = nullptr, bslot = nullptr, br1 = nullptr, br2 = nullptr, bbase = nullptr, blen = nullptr;
         std::vector<int> free_slots;
         std::vector<float> hostX;
@@ -163,13 +163,13 @@ static bool gpu_setup(LmEngine::Impl& in, LmModel& m, int max_ctx, int n_slots) 
     g.Tmax = std::min(max_ctx, getenv("FERRO_LM_TMAX") ? atoi(getenv("FERRO_LM_TMAX")) : 1024);
     g.max_ns = std::max(n_slots, 1);
     const size_t R = (size_t)std::max(g.Tmax, g.max_ns);
-    g.X = gpu::alloc(R * d * 4); g.D = gpu::alloc(R * d * 4); g.C = gpu::alloc(R * std::max(3 * d, rowc) * 4);
+    g.X = gpu::alloc(R * d * 4); g.X2 = gpu::alloc((size_t)4 * d * 4); g.D = gpu::alloc(R * d * 4); g.C = gpu::alloc(R * std::max(3 * d, rowc) * 4);
     g.G = gpu::alloc(R * 2 * ff * 4); g.Xl = gpu::alloc((size_t)g.max_ns * d * 4); g.Dl = gpu::alloc((size_t)g.max_ns * d * 4);
     g.logits = gpu::alloc((size_t)g.max_ns * m.n_vocab * 4);
     const size_t mi = R * 4;
     g.bpos = gpu::alloc(mi); g.bdst = gpu::alloc(mi); g.bsrc1 = gpu::alloc(mi); g.bsrc2 = gpu::alloc(mi);
     g.bslot = gpu::alloc(mi); g.br1 = gpu::alloc(mi); g.br2 = gpu::alloc(mi); g.bbase = gpu::alloc(mi); g.blen = gpu::alloc(mi);
-    for (gpu::Buf b : {g.X, g.D, g.C, g.G, g.Xl, g.Dl, g.logits, g.bpos, g.bdst, g.bsrc1, g.bsrc2, g.bslot, g.br1, g.br2, g.bbase, g.blen, g.zero}) ok = ok && b;
+    for (gpu::Buf b : {g.X, g.X2, g.D, g.C, g.G, g.Xl, g.Dl, g.logits, g.bpos, g.bdst, g.bsrc1, g.bsrc2, g.bslot, g.br1, g.br2, g.bbase, g.blen, g.zero}) ok = ok && b;
     if (!ok || !gpu::ensure_qscratch((int)R, std::max(ff, 2 * d))) return false;
     for (int i = n_slots - 1; i >= 0; --i) g.free_slots.push_back(i);
     in.g.hostX.resize(R * d);
@@ -188,6 +188,16 @@ static bool gpu_setup(LmEngine::Impl& in, LmModel& m, int max_ctx, int n_slots) 
 void LmEngine::release(LmSeq& s) {
     if (impl_ && impl_->g.ok && s.gpu_slot >= 0) impl_->g.free_slots.push_back(s.gpu_slot);
     s.gpu_slot = -1;
+}
+
+static bool lm_skip(const char* name) {
+    static const std::string abl = getenv("FERRO_LM_ABL") ? std::string(",") + getenv("FERRO_LM_ABL") + "," : std::string();
+    return !abl.empty() && abl.find(std::string(",") + name + ",") != std::string::npos;
+}
+
+static bool lm_dup(const char* name) {            // FERRO_LM_DUP=a,b: launch these ops twice (marginal launch cost experiment; results are garbage)
+    static const std::string d = getenv("FERRO_LM_DUP") ? std::string(",") + getenv("FERRO_LM_DUP") + "," : std::string();
+    return !d.empty() && d.find(std::string(",") + name + ",") != std::string::npos;
 }
 
 // One forward over `T` rows. Prefill (pf): rows are consecutive tokens of one sequence (positions pos0..), decode: one row per sequence.
@@ -221,47 +231,77 @@ static bool gpu_forward(LmEngine::Impl& in, const LmModel& m, const std::vector<
               && gpu::write(g.bsrc1, g.src1.data(), (size_t)T * 4) && gpu::write(g.bsrc2, g.src2.data(), (size_t)T * 4)
               && gpu::write(g.bslot, g.slot.data(), (size_t)ns * 4) && gpu::write(g.br1, g.r1.data(), (size_t)ns * 4) && gpu::write(g.br2, g.r2.data(), (size_t)ns * 4);
     if (!pf) ok = ok && gpu::write(g.bbase, g.base.data(), (size_t)ns * 4) && gpu::write(g.blen, g.len.data(), (size_t)ns * 4);
-    ok = ok && gpu::op_resid_norm_q(g.X, nullptr, nullptr, g.an[0], nullptr, false, T, d, m.rms_eps);
     int ci = 0, ai = 0;
+    static const bool fuse = !(getenv("FERRO_LM_FUSE") && atoi(getenv("FERRO_LM_FUSE")) == 0);      // FERRO_LM_FUSE=0: unfused launches (A/B); unset/1: conv+state and qkv+kv fusions (default); 2: + prologue-fused GEMVs (opt-in, break-even on ADL-N)
+    static const bool fuse_pro = fuse && getenv("FERRO_LM_FUSE") && atoi(getenv("FERRO_LM_FUSE")) >= 2;
+    // decode with <= 4 sequences: rmsnorm / silu*up run inside the consumer GEMV (one launch less each); X ping-pongs between X and X2
+    static const int pro_mask = getenv("FERRO_PRO_MASK") ? atoi(getenv("FERRO_PRO_MASK")) : 15;   // sites: 1 layer-opening GEMV, 2 gateup, 4 down(silu), 8 lm_head
+    bool fpro = fuse_pro && !pf && T <= 4 && ns == T && gpu::gemv_pro_ok(m.tok_embd.gpu_slot, T, 1, 0);
+    for (int il = 0; fpro && il < m.n_layer; ++il) {
+        const LmLayer& l = m.L[il];
+        fpro = gpu::gemv_pro_ok(l.conv ? l.in_proj.gpu_slot : l.wqkv.gpu_slot, T, 1, 0) && gpu::gemv_pro_ok(l.gateup.gpu_slot, T, 1, 0) && gpu::gemv_pro_ok(l.down.gpu_slot, T, 2, ff);
+    }
+    const bool p_first = fpro && (pro_mask & 1), p_gate = fpro && (pro_mask & 2), p_down = fpro && (pro_mask & 4), p_head = fpro && (pro_mask & 8);
+    if (!pf && getenv("FERRO_VERBOSE")) { static int last = -1; const int sig = (p_first | p_gate << 1 | p_down << 2 | p_head << 3) * 8 + T; if (last != sig) { last = sig; fprintf(stderr, "[lm] decode T=%d: fused-prologue GEMV sites first=%d gateup=%d down=%d head=%d\n", T, p_first, p_gate, p_down, p_head); } }
+    gpu::Buf xcur = g.X, xoth = g.X2; bool have_d = false;      // xcur: residual stream; have_d: g.D holds a not-yet-added branch output
+    auto first_gemm = [&](int slot, int il, gpu::Buf Y) {        // GEMV that opens a layer, together with the attn/conv input norm
+        if (p_first) {
+            const bool r = gpu::op_gemv_pro(slot, T, Y, 1, xcur, have_d ? g.D : nullptr, g.an[il], have_d ? xoth : nullptr, 0, m.rms_eps);
+            if (r && have_d) std::swap(xcur, xoth);
+            have_d = false;
+            return r;
+        }
+        const bool r = gpu::op_resid_norm_q(xcur, have_d ? g.D : nullptr, nullptr, g.an[il], nullptr, false, T, d, m.rms_eps);   // in place
+        have_d = false;
+        return r && gpu::op_gemm_q(slot, T, Y);
+    };
     static const bool prof = getenv("FERRO_LM_PROF") != nullptr;          // per-op timing (syncs after every op)
     static std::map<std::string, std::pair<double, int>> times;
     static struct Dump { ~Dump() { if (!prof) return; double tot = 0; for (auto& kv : times) tot += kv.second.first;
         for (auto& kv : times) fprintf(stderr, "[lm-prof] %-14s %8.1f ms total  %6d calls  %7.3f ms/call  %5.1f%%\n", kv.first.c_str(), kv.second.first * 1e3, kv.second.second, kv.second.first * 1e3 / kv.second.second, 100 * kv.second.first / tot); } } dump_at_exit;
-    auto P = [&](const char* name, bool r) {
+    auto P_impl = [&](const char* name, bool r) {
         if (!prof || !r) return r;
         const auto t0 = std::chrono::steady_clock::now(); gpu::finish();
         auto& e = times[std::string(pf ? "pf:" : "dec:") + name]; e.first += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); e.second++;
         return r;
     };
+#define P(name, expr) (lm_skip(name) ? true : (lm_dup(name) ? ((expr) && P_impl(name, (expr))) : P_impl(name, (expr))))   // FERRO_LM_ABL=a,b: skip ops by name (timing ablation; results are garbage)
     // when profiling, each op is timed from enqueue to completion (the previous op is already finished, so this is that op's own latency)
     for (int il = 0; ok && il < m.n_layer; ++il) {
         const LmLayer& l = m.L[il];
         if (l.conv) {
-            ok = P("gemm", gpu::op_gemm_q(l.in_proj.gpu_slot, T, g.C))
-                 && P("conv", gpu::op_lm_conv_q(g.C, g.bsrc1, g.bsrc2, g.cst[ci], g.taps[ci], T, d))
-                 && P("conv_state", gpu::op_lm_conv_state(g.C, g.cst[ci], g.bslot, g.br1, g.br2, ns, d))
-                 && P("gemm", gpu::op_gemm_q(l.out_proj.gpu_slot, T, g.D));
+            ok = P("gemm", first_gemm(l.in_proj.gpu_slot, il, g.C));
+            if (ok && fuse && !pf) ok = P("conv", gpu::op_lm_conv_dec_q(g.C, g.cst[ci], g.bslot, g.taps[ci], T, d));          // decode: gate + state in one launch
+            else if (ok) ok = P("conv", gpu::op_lm_conv_q(g.C, g.bsrc1, g.bsrc2, g.cst[ci], g.taps[ci], T, d))
+                              && P("conv_state", gpu::op_lm_conv_state(g.C, g.cst[ci], g.bslot, g.br1, g.br2, ns, d));
+            ok = ok && P("gemm", gpu::op_gemm_q(l.out_proj.gpu_slot, T, g.D));
             ++ci;
         } else {
-            ok = P("gemm", gpu::op_gemm_q(l.wqkv.gpu_slot, T, g.C))
-                 && P("qkv_post", gpu::op_qkv_post(g.C, rowc, T, nq, nkv, hd, g.qn[ai], g.kn[ai], g.cosb, g.sinb, g.bpos, hd / 2, m.rms_eps, false))
-                 && P("kv_write", gpu::op_lm_kv_write(g.C, rowc, qsz, g.kv[ai], g.bdst, T, kvw))
+            ok = P("gemm", first_gemm(l.wqkv.gpu_slot, il, g.C));
+            if (ok && fuse) ok = P("qkv_post", gpu::op_lm_qkv_post_kv(g.C, rowc, T, nq, nkv, hd, g.qn[ai], g.kn[ai], g.cosb, g.sinb, g.bpos, hd / 2, m.rms_eps, g.kv[ai], g.bdst, kvw));
+            else if (ok) ok = P("qkv_post", gpu::op_qkv_post(g.C, rowc, T, nq, nkv, hd, g.qn[ai], g.kn[ai], g.cosb, g.sinb, g.bpos, hd / 2, m.rms_eps, false))
+                              && P("kv_write", gpu::op_lm_kv_write(g.C, rowc, qsz, g.kv[ai], g.bdst, T, kvw));
+            ok = ok
                  && P("attn", pf ? gpu::op_lm_attn_pf(g.C, rowc, g.kv[ai], kvw, ksz, seqs[0]->gpu_slot * g.cap, nq, nkv, pos0, scale, T)
                                  : gpu::op_lm_attn_dec(g.C, rowc, g.kv[ai], kvw, ksz, g.bbase, g.blen, nq, nkv, scale, T))
                  && P("gemm", gpu::op_gemm_q(l.wo.gpu_slot, T, g.D));
             ++ai;
         }
-        ok = ok && P("resid_norm", gpu::op_resid_norm_q(g.X, g.D, nullptr, g.fn[il], nullptr, false, T, d, m.rms_eps))
-             && P("gemm", gpu::op_gemm_q(l.gateup.gpu_slot, T, g.G)) && P("silu_mul", gpu::op_silu_mul_q(g.G, T, ff)) && P("gemm", gpu::op_gemm_q(l.down.gpu_slot, T, g.D));
-        if (ok && il + 1 < m.n_layer) ok = P("resid_norm", gpu::op_resid_norm_q(g.X, g.D, nullptr, g.an[il + 1], nullptr, false, T, d, m.rms_eps));
+        if (p_gate) { ok = ok && P("gemm", gpu::op_gemv_pro(l.gateup.gpu_slot, T, g.G, 1, xcur, g.D, g.fn[il], xoth, 0, m.rms_eps)); std::swap(xcur, xoth); }
+        else ok = ok && P("resid_norm", gpu::op_resid_norm_q(xcur, g.D, nullptr, g.fn[il], nullptr, false, T, d, m.rms_eps)) && P("gemm", gpu::op_gemm_q(l.gateup.gpu_slot, T, g.G));
+        if (p_down) ok = ok && P("gemm", gpu::op_gemv_pro(l.down.gpu_slot, T, g.D, 2, g.G, nullptr, nullptr, nullptr, ff, 0.f));
+        else ok = ok && P("silu_mul", gpu::op_silu_mul_q(g.G, T, ff)) && P("gemm", gpu::op_gemm_q(l.down.gpu_slot, T, g.D));
+        have_d = true;
         if (ok && pf) ok = gpu::finish();                                  // keep every submission short (i915 watchdog)
     }
     // final: X += D on the last row of every sequence, output norm, tied LM head
-    for (int s = 0; ok && s < ns; ++s) {
+    for (int s = 0; ok && !p_head && s < ns; ++s) {
         const size_t row = (size_t)(pf ? T - 1 : s) * d * 4;
-        ok = gpu::copy(g.Xl, (size_t)s * d * 4, g.X, row, (size_t)d * 4) && gpu::copy(g.Dl, (size_t)s * d * 4, g.D, row, (size_t)d * 4);
+        ok = gpu::copy(g.Xl, (size_t)s * d * 4, xcur, row, (size_t)d * 4) && gpu::copy(g.Dl, (size_t)s * d * 4, g.D, row, (size_t)d * 4);
     }
     const auto tenq = std::chrono::steady_clock::now();
+    if (p_head) ok = ok && P("lm_head", gpu::op_gemv_pro(m.tok_embd.gpu_slot, ns, g.logits, 1, xcur, g.D, g.out_norm, nullptr, 0, m.rms_eps)) && gpu::read(g.logits, logits, (size_t)ns * m.n_vocab * 4);
+    else
     ok = ok && gpu::op_resid_norm_q(g.Xl, g.Dl, nullptr, g.out_norm, nullptr, false, ns, d, m.rms_eps)
          && P("lm_head", gpu::op_gemm_q(m.tok_embd.gpu_slot, ns, g.logits)) && gpu::read(g.logits, logits, (size_t)ns * m.n_vocab * 4);
     if (steptime && !pf) {

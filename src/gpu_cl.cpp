@@ -1552,6 +1552,138 @@ __kernel void q8gemv(__global const uint* restrict Wp, __global const float* res
     }
   }
 }
+
+// q8gemv with an activation prologue: the WG first builds its own int8 activations in local memory, then runs the identical weight loop.
+//   mode 1: x = rmsnorm(A + B) * wn   (B optional; the WG with group id 0 also stores A + B to Xo = the new residual stream)
+//   mode 2: x = silu(A[:ff]) * A[ff:2ff]   (row stride 2*ff)
+// Quantization is bit-for-bit quant_lane4 (blocks of 32, amax/127, round-to-nearest-even). Replaces resid_norm_q3 / silu_mul_q8 + a launch.
+__kernel void q8gemv_p(__global const uint* restrict Wp, __global const float* restrict Ws, __global float* restrict Y, int rows, int cols, int T,
+                       int mode, __global const float* PA, __global const float* PB, int has_b, __global const float* wn,
+                       __global float* Xo, int has_xo, int ff, float eps, __local uint4* xq4, __local float* xsc) {
+  __local float red[32];
+  __local float4 red4[SKV * TT * LXV];
+  __local uint* xq = (__local uint*)xq4;
+  const int lx = get_local_id(0), sk = get_local_id(1), LX = get_local_size(0), SK = get_local_size(1);   // LX*SK = 128 (LX = 16/32/64 rows-of-4 per WG)
+  const int li = sk * LX + lx, NTH = LX * SK;
+  const int R4 = rows >> 2, gx = get_group_id(0) * LX + lx;
+  const int nb = cols / 32, cw = cols / 4;
+  __local float am[2][4][128];                // double-buffered block maxima: one barrier per batch of 4 float4 per lane
+  int par = 0;
+  const bool wr_xo = has_xo && get_group_id(0) == 0;
+  for (int j = 0; j < T && mode != 0; ++j) {          // mode 0: timing experiment, prologue skipped
+    const __global float* a = PA + (size_t)j * (mode == 1 ? cols : 2 * ff);
+    const __global float* b2 = PB + (size_t)j * cols;
+    float inv = 1.0f;
+    if (mode == 1) {
+      float ss = 0.f;
+      for (int c = li; c < cw; c += NTH) { float4 y = vload4(c, a); if (has_b) y += vload4(c, b2); ss += dot(y, y); }
+      inv = 1.0f / sqrt(wg_add(ss, red) / (float)cols + eps);
+    }
+    for (int c0 = 0; c0 < cw; c0 += 4 * NTH) {        // lane li owns float4 c = c0 + i*NTH + li (coalesced); 8 consecutive lanes = one block of 32
+      float4 v[4];
+      for (int i = 0; i < 4; ++i) {
+        const int c = c0 + i * NTH + li;
+        float4 y = (float4)(0.f);
+        if (c < cw) {
+          if (mode == 1) {
+            y = vload4(c, a); if (has_b) y += vload4(c, b2);
+            if (wr_xo) vstore4(y, c, Xo + (size_t)j * cols);
+            y = y * inv * vload4(c, wn);
+          } else {
+            const float4 x = vload4(c, a);
+            y = x / (1.0f + native_exp2(x * -1.4426950408889634f)) * vload4(c, a + ff);
+          }
+        }
+        v[i] = y;
+        const float4 ab = fabs(y);
+        am[par][i][li] = fmax(fmax(ab.x, ab.y), fmax(ab.z, ab.w));
+      }
+      barrier(CLK_LOCAL_MEM_FENCE);
+      const int g0 = li & ~7;
+      for (int i = 0; i < 4; ++i) {
+        const int c = c0 + i * NTH + li;
+        if (c < cw) {
+          float amax = am[par][i][g0];
+          for (int q = 1; q < 8; ++q) amax = fmax(amax, am[par][i][g0 + q]);
+          const float d = amax / 127.f, id = d > 0.f ? 1.f / d : 0.f;
+          xq[j * cw + c] = as_uint(convert_char4_sat_rte(v[i] * id));
+          if ((li & 7) == 0) xsc[j * nb + (c >> 3)] = d;
+        }
+      }
+      par ^= 1;
+    }
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  const int b0 = (nb * sk) / SK, b1 = (nb * (sk + 1)) / SK;
+  float4 acc[TT];
+  for (int j = 0; j < TT; ++j) acc[j] = (float4)(0.f);
+  const __global uint4* Wb = (const __global uint4*)Wp + gx;
+  const __global float4* Sb = (const __global float4*)Ws + gx;
+  for (int b = b0; b < b1; ++b) {
+    uint4 w[8];
+    for (int k = 0; k < 8; ++k) w[k] = Wb[(size_t)(b * 8 + k) * R4];
+    const float4 ws = Sb[(size_t)b * R4];
+    for (int j = 0; j < TT; ++j) {
+      const int t = min(j, T - 1);
+      const uint4 xa = xq4[(t * cw + b * 8) / 4], xb = xq4[(t * cw + b * 8) / 4 + 1];
+      int4 s = (int4)(0);
+      STEPV(s, 0, xa.s0) STEPV(s, 1, xa.s1) STEPV(s, 2, xa.s2) STEPV(s, 3, xa.s3)
+      STEPV(s, 4, xb.s0) STEPV(s, 5, xb.s1) STEPV(s, 6, xb.s2) STEPV(s, 7, xb.s3)
+      acc[j] = mad(convert_float4(s), ws * xsc[t * nb + b], acc[j]);
+    }
+  }
+  for (int j = 0; j < TT; ++j) red4[(sk * TT + j) * LX + lx] = acc[j];
+  barrier(CLK_LOCAL_MEM_FENCE);
+  if (sk == 0) {
+    for (int j = 0; j < TT; ++j) {
+      float4 a4 = red4[j * LX + lx];
+      for (int q = 1; q < SK; ++q) a4 += red4[(q * TT + j) * LX + lx];
+      if (j < T) vstore4(a4, 0, Y + (size_t)j * rows + gx * 4);
+    }
+  }
+}
+// ---- fused decode kernels (LFM2 generative): fewer launches per token ----
+// decode causal conv gate + conv-state update in one pass: row t is its own sequence (slot[t]); the new state is (old newer slot, b*x of this row)
+__kernel void lm_conv_dec_q(__global const float* C, __global float* st, __global const int* slot, __global const float* taps,
+                            __global uint* Xp, __global float* Xs, int d) {
+  __local float am[512];
+  const int t = get_group_id(0), lid = get_local_id(0);
+  const __global float* r = C + (size_t)t * 3 * d;
+  __global float* s0 = st + (size_t)slot[t] * 2 * d;
+  __global float* s1 = s0 + d;
+  const float4 bx = vload4(lid, r) * vload4(lid, r + 2 * d);
+  const float4 b1 = vload4(lid, s1), b2 = vload4(lid, s0);
+  const float4 y = bx * vload4(lid, taps + 2 * d) + b1 * vload4(lid, taps + d) + b2 * vload4(lid, taps);
+  vstore4(b1, lid, s0);                      // each lane owns its 4 channels of both state rows: no hazard inside the group
+  vstore4(bx, lid, s1);
+  quant_lane4(vload4(lid, r + d) * y, am, Xp, Xs, t, d);
+}
+// q/k RMSNorm + rope (in place on C) and the K / V rows written straight into the KV cache (replaces qkv_post3 + lm_kv_write)
+__kernel void lm_qkv_post_kv(__global float* C, int rowc, int nq, int nkv, int hd, __global const float* qw, __global const float* kw,
+                             __global const float* cosb, __global const float* sinb, __global const int* pos, int hlf, float eps,
+                             __global float* KV, __global const int* dst, int kvw) {
+  __local float red[32];
+  const int slot = get_group_id(0), t = get_group_id(1), lid = get_local_id(0);
+  __global float* v = C + (size_t)t * rowc + slot * hd;
+  float4 a = vload4(lid, v), b = vload4(lid, v + hlf);
+  if (slot >= nq + nkv) {                    // V head: raw copy into the cache (uniform branch per work-group)
+    __global float* o = KV + (size_t)dst[t] * kvw + (size_t)nkv * hd + (size_t)(slot - nq - nkv) * hd;
+    vstore4(a, lid, o); vstore4(b, lid, o + hlf);
+    return;
+  }
+  const float inv = 1.0f / sqrt(wg_add(dot(a, a) + dot(b, b), red) / (float)hd + eps);
+  __global const float* w = slot < nq ? qw : kw;
+  a = a * inv * vload4(lid, w);
+  b = b * inv * vload4(lid, w + hlf);
+  const int p = pos[t];
+  const float4 c = vload4(lid, cosb + (size_t)p * hlf), sn = vload4(lid, sinb + (size_t)p * hlf);
+  const float4 na = a * c - b * sn, nb = b * c + a * sn;
+  vstore4(na, lid, v); vstore4(nb, lid, v + hlf);
+  if (slot >= nq) {
+    __global float* o = KV + (size_t)dst[t] * kvw + (size_t)(slot - nq) * hd;
+    vstore4(na, lid, o); vstore4(nb, lid, o + hlf);
+  }
+}
 )CL";
 
 // ---------------------------------------------------------------- state
@@ -1568,7 +1700,7 @@ static cl_device_id g_dev = nullptr;
 static bool ensure_kb8();
 // decode-sized GEMM variants: the same kernel built with a 1/2/4-token tile (the default 10-token tile wastes ~90% of its DP4A work at T=1)
 static cl_program g_prog_small[3] = {nullptr, nullptr, nullptr};
-static cl_kernel k_gemm_small[3] = {nullptr, nullptr, nullptr}, k_gemv_small[3] = {nullptr, nullptr, nullptr};
+static cl_kernel k_gemm_small[3] = {nullptr, nullptr, nullptr}, k_gemv_small[3] = {nullptr, nullptr, nullptr}, k_gemvp_small[3] = {nullptr, nullptr, nullptr};
 static int small_idx(int T) { return T <= 1 ? 0 : T <= 2 ? 1 : 2; }
 static const int kSmallTT[3] = {1, 2, 4};
 static bool ensure_small(int i);
@@ -1578,7 +1710,7 @@ static cl_kernel k_quant = nullptr, k_gemm = nullptr, k_gemm_sw = nullptr, k_rms
                  k_attq2 = nullptr, k_gmq2 = nullptr, k_gmvq2 = nullptr,
                  k_rowf3 = nullptr, k_qkvp3 = nullptr, k_attq3 = nullptr, k_gmq3 = nullptr, k_gmvq3 = nullptr,
                  k_rnq = nullptr, k_hinq = nullptr, k_convq = nullptr, k_siluq = nullptr, k_bactq = nullptr,
-                 k_badd = nullptr, k_score = nullptr, k_attq4 = nullptr, k_attq5 = nullptr, k_quantq = nullptr, k_lngq = nullptr, k_dqk = nullptr, k_dsm = nullptr, k_dpv = nullptr, k_qkvg4 = nullptr, k_dqkh = nullptr, k_dpvh = nullptr, k_dsmw = nullptr, k_anq = nullptr, k_aact = nullptr, k_ares = nullptr, k_aconv = nullptr, k_aattn = nullptr, k_lmconv = nullptr, k_lmcst = nullptr, k_lmkv = nullptr, k_lmpf = nullptr, k_lmdec = nullptr;
+                 k_badd = nullptr, k_score = nullptr, k_attq4 = nullptr, k_attq5 = nullptr, k_quantq = nullptr, k_lngq = nullptr, k_dqk = nullptr, k_dsm = nullptr, k_dpv = nullptr, k_qkvg4 = nullptr, k_dqkh = nullptr, k_dpvh = nullptr, k_dsmw = nullptr, k_anq = nullptr, k_aact = nullptr, k_ares = nullptr, k_aconv = nullptr, k_aattn = nullptr, k_lmconv = nullptr, k_lmcst = nullptr, k_lmkv = nullptr, k_lmpf = nullptr, k_lmdec = nullptr, k_lmcdec = nullptr, k_lmqkv = nullptr;
 static std::vector<Slot> g_slots;
 static size_t g_bytes = 0;
 static cl_mem g_Xp = nullptr, g_Xs = nullptr;           // quantized-activation scratch
@@ -1646,7 +1778,7 @@ bool init(bool verbose) {
         {&k_attn, "attention"}, {&k_gmul, "gelu_mul"}, {&k_gmulv, "gelu_mulvec"}, {&k_add, "add_scale"},
         {&k_rowf, "row_fused"}, {&k_qkvp, "qkv_post"}, {&k_attq, "attention_q"}, {&k_gmq, "gelu_mul_q"},
         {&k_gmvq, "gelu_mulvec_q"}, {&k_attq2, "attention_q2"}, {&k_gmq2, "gelu_mul_q2"}, {&k_gmvq2, "gelu_mulvec_q2"},
-        {&k_qkvg4, "qkv_post_g4"}, {&k_dsmw, "dattn_stats_w"}, {&k_anq, "a_norm_quant"}, {&k_aact, "a_act_quant"}, {&k_ares, "a_resid"}, {&k_aconv, "a_conv_mid"}, {&k_aattn, "a_attn"}, {&k_lmconv, "lm_conv_q"}, {&k_lmcst, "lm_conv_state"}, {&k_lmkv, "lm_kv_write"}, {&k_lmpf, "lm_attn_pf"}, {&k_lmdec, "lm_attn_dec"}, {&k_dqkh, "dattn_qk_h"}, {&k_dpvh, "dattn_pv_h"}, {&k_rowf3, "row_fused3"}, {&k_qkvp3, "qkv_post3"}, {&k_attq3, "attention_q3"}, {&k_gmq3, "gelu_mul_q3"},
+        {&k_qkvg4, "qkv_post_g4"}, {&k_dsmw, "dattn_stats_w"}, {&k_anq, "a_norm_quant"}, {&k_aact, "a_act_quant"}, {&k_ares, "a_resid"}, {&k_aconv, "a_conv_mid"}, {&k_aattn, "a_attn"}, {&k_lmconv, "lm_conv_q"}, {&k_lmcst, "lm_conv_state"}, {&k_lmkv, "lm_kv_write"}, {&k_lmpf, "lm_attn_pf"}, {&k_lmdec, "lm_attn_dec"}, {&k_lmcdec, "lm_conv_dec_q"}, {&k_lmqkv, "lm_qkv_post_kv"}, {&k_dqkh, "dattn_qk_h"}, {&k_dpvh, "dattn_pv_h"}, {&k_rowf3, "row_fused3"}, {&k_qkvp3, "qkv_post3"}, {&k_attq3, "attention_q3"}, {&k_gmq3, "gelu_mul_q3"},
         {&k_gmvq3, "gelu_mulvec_q3"}, {&k_rnq, "resid_norm_q3"}, {&k_hinq, "head_in_q3"}, {&k_convq, "conv_gate_q3"},
         {&k_siluq, "silu_mul_q8"}, {&k_bactq, "bias_act_q8"}, {&k_badd, "bias_add"}, {&k_score, "score_out"}, {&k_attq4, "attention_q4"}, {&k_attq5, "attention_q5"}, {&k_quantq, "quant_q3"}, {&k_lngq, "ln_gather_q3"}, {&k_dqk, "dattn_qk"}, {&k_dsm, "dattn_stats"}, {&k_dpv, "dattn_pv"}};
     for (auto& k : ks) { *k.k = cl.clCreateKernel(g_prog, k.n, &err); CK(err); }
@@ -1720,6 +1852,8 @@ static bool ensure_small(int i) {
     if (err != CL_SUCCESS) { k_gemm_small[i] = nullptr; return false; }
     k_gemv_small[i] = cl.clCreateKernel(g_prog_small[i], "q8gemv", &err);
     if (err != CL_SUCCESS) k_gemv_small[i] = nullptr;
+    k_gemvp_small[i] = cl.clCreateKernel(g_prog_small[i], "q8gemv_p", &err);
+    if (err != CL_SUCCESS) k_gemvp_small[i] = nullptr;
     return true;
 }
 
@@ -1823,6 +1957,34 @@ bool op_gemm_q(int slot, int T, Buf Y) {
     size_t gg[2] = {(size_t)s.rows / 4, (size_t)((T + tt - 1) / tt)};
     size_t lg[2] = {s.lws, 1};
     return launch(k, 2, gg, lg);
+}
+
+// fused-prologue decode GEMV (see q8gemv_p). mode 1: x = rmsnorm(A + B)*wn, optionally storing A + B to Xo; mode 2: x = silu(A[:ff])*A[ff:]. T <= 4.
+bool gemv_pro_ok(int slot, int T, int mode, int ff) {
+    static const bool off = getenv("FERRO_GPU_GEMV") && atoi(getenv("FERRO_GPU_GEMV")) == 0;
+    if (off || T < 1 || T > 4 || slot < 0 || slot >= (int)g_slots.size()) return false;
+    const Slot& s = g_slots[slot];
+    if (s.kb != FERRO_GPU_KB || use_swizzle(s, T) || (s.rows / 4) % 16 || s.cols % 32) return false;
+    if (mode == 2 && (s.cols != ff || ff > 6656)) return false;
+    if (mode == 1 && s.cols > 2048) return false;
+    const int si = small_idx(T);
+    return ensure_small(si) && k_gemvp_small[si];
+}
+bool op_gemv_pro(int slot, int T, Buf Y, int mode, Buf A, Buf B, Buf wn, Buf Xo, int ff, float eps) {
+    if (!gemv_pro_ok(slot, T, mode, ff)) return false;
+    static const bool nopro = getenv("FERRO_PRO_MODE0") != nullptr; if (nopro) mode = 0;
+    const Slot& s = g_slots[slot];
+    const int si = small_idx(T);
+    cl_kernel k = k_gemvp_small[si];
+    set_args(k, (Buf)s.wp, (Buf)s.ws, Y, (cl_int)s.rows, (cl_int)s.cols, (cl_int)T, (cl_int)mode, A, B ? B : A, (cl_int)(B != nullptr), wn ? wn : A,
+             Xo ? Xo : A, (cl_int)(Xo != nullptr), (cl_int)ff, eps);
+    cl.clSetKernelArg(k, 15, (size_t)T * s.cols + 16, nullptr);                 // int8 activations (4 tokens x cols bytes max)
+    cl.clSetKernelArg(k, 16, (size_t)T * (s.cols / 32) * 4 + 16, nullptr);      // their block scales
+    static const int lx_max = getenv("FERRO_PRO_LX") ? atoi(getenv("FERRO_PRO_LX")) : 64;
+    int LX = 16;                                                              // fatter WGs where there are plenty of them: the prologue is repeated per WG
+    for (int c : {32, 64}) if (c <= lx_max && (s.rows / 4) % c == 0 && (s.rows / 4) / c >= 64) LX = c;
+    size_t gv[2] = {(size_t)s.rows / 4, (size_t)(128 / LX)}, lv[2] = {(size_t)LX, (size_t)(128 / LX)};
+    return launch(k, 2, gv, lv);
 }
 
 bool warm_small_gemm() { bool ok = true; for (int i = 0; i < 3; ++i) ok = ensure_small(i) && ok; return ok; }
@@ -2130,6 +2292,20 @@ bool op_lm_attn_dec(Buf C, int ldc, Buf KV, int ldkv, int voff, Buf bases, Buf l
     return launch(k_lmdec, 2, g, l);
 }
 
+bool op_lm_conv_dec_q(Buf C, Buf st, Buf slot, Buf taps, int T, int d) {
+    if (d % 32 || d / 4 > 512) return false;
+    set_args(k_lmcdec, C, st, slot, taps, (Buf)g_Xp, (Buf)g_Xs, (cl_int)d);
+    size_t g[1] = {(size_t)T * (d / 4)}, l[1] = {(size_t)d / 4};
+    return launch(k_lmcdec, 1, g, l);
+}
+bool op_lm_qkv_post_kv(Buf C, int rowc, int T, int nq, int nkv, int hd, Buf qw, Buf kw, Buf cosb, Buf sinb, Buf pos, int hlf, float eps, Buf KV, Buf dst, int kvw) {
+    if (hd != 64 || 2 * hlf != hd) return false;
+    const size_t LS = (size_t)hd / 8;
+    set_args(k_lmqkv, C, (cl_int)rowc, (cl_int)nq, (cl_int)nkv, (cl_int)hd, qw, kw, cosb, sinb, pos, (cl_int)hlf, eps, KV, dst, (cl_int)kvw);
+    size_t g[2] = {(size_t)(nq + 2 * nkv) * LS, (size_t)T}, l[2] = {LS, 1};
+    return launch(k_lmqkv, 2, g, l);
+}
+
 bool op_silu_mul_q(Buf G, int T, int FF) {
     if (FF % 32 || FF / 8 > 1024) return false;
     set_args(k_siluq, G, (cl_int)FF, (Buf)g_Xp, (Buf)g_Xs);
@@ -2214,7 +2390,7 @@ void shutdown() {
     g_Xp = g_Xs = g_hX = g_hY = nullptr;
     for (cl_kernel k : {k_quant, k_gemm, k_gemm_sw, k_rms, k_rope, k_attn, k_gmul, k_gmulv, k_add, k_rowf, k_qkvp, k_attq, k_gmq, k_gmvq,
                         k_attq2, k_gmq2, k_gmvq2, k_rowf3, k_qkvp3, k_attq3, k_gmq3, k_gmvq3,
-                        k_rnq, k_hinq, k_convq, k_siluq, k_bactq, k_badd, k_score, k_attq4, k_attq5, k_quantq, k_lngq, k_dqk, k_dsm, k_dpv, k_qkvg4, k_dqkh, k_dpvh, k_dsmw, k_anq, k_aact, k_ares, k_aconv, k_aattn, k_lmconv, k_lmcst, k_lmkv, k_lmpf, k_lmdec})
+                        k_rnq, k_hinq, k_convq, k_siluq, k_bactq, k_badd, k_score, k_attq4, k_attq5, k_quantq, k_lngq, k_dqk, k_dsm, k_dpv, k_qkvg4, k_dqkh, k_dpvh, k_dsmw, k_anq, k_aact, k_ares, k_aconv, k_aattn, k_lmconv, k_lmcst, k_lmkv, k_lmpf, k_lmdec, k_lmcdec, k_lmqkv})
         if (k) cl.clReleaseKernel(k);
     cl.clReleaseProgram(g_prog); cl.clReleaseCommandQueue(g_q); cl.clReleaseContext(g_ctx);
     g_ok = false;

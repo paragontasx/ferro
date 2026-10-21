@@ -325,8 +325,30 @@ tool-call parsing of model output; `n > 1`, logprobs; sampling is on the host (~
 Parity (`lm_parity.py`, 12 prompts): vs llama.cpp **Q8_0** (same weights) top-1 12/12, mean TV 0.0172, max 0.0445; vs F16: llama.cpp Q8 0.0398 (11/12 top-1), ferro 0.0426 (11/12) - the 350M is ~2x more
 quantisation-sensitive than the 1.2B (0.020) and prompt #3 (an out-of-distribution `<think>` ending for a non-thinking model) flips the same near-tie (token 9266 vs 730) in llama.cpp's Q8 and in ferro.
 So for small models validate against the same-weights quantised oracle AND report the F16 noise floor.
-Decode profile (`FERRO_LM_STEPTIME`): enqueue 4-6 ms + device 21-23 ms per token; ideal at the measured 25.9 GB/s streaming ceiling is ~15 ms for 0.38 GB, so ~7-10 ms is per-kernel launch/dependency latency over ~190 launches
-(sync profile: GEMM 48%, resid_norm 15%, silu_mul 8%, conv+conv_state 10%). Fusing conv+state, qkv_post+kv_write and the residual/norm ops is the available win (~1.3x on this model); the 1.2B is bandwidth-bound and gains more from a Q4 weight path.
+Decode profile (`FERRO_LM_STEPTIME`): enqueue 2-4 ms (overlapped) + device ~22-25 ms per token. (An earlier version of this note called the gap to a "15 ms ideal" pure launch
+latency and promised ~1.3x from fusion; that was wrong - see the fusion study below: the device streams ~510 MB/token, not 0.38 GB, because the fp32 block scales ride along.)
 **Chat template differs per model**: the 350M GGUF carries a template that handles typed content arrays itself (no "\n" join, system arrays concatenated, images -> `<image>`); the Thinking one does not. A port hard-coded
 to the Thinking template rendered multi-part content wrongly for the 350M (caught by the byte-level `/apply-template` comparison). The variant is now detected from `tokenizer.chat_template`; both verified byte-identical to llama.cpp's jinja.
 Server memory warning is now computed from the real file sizes (it hard-coded the 1.2B footprint).
+
+### Decode kernel fusion study (LFM2.5-350M / 1.2B, 2026-10-22) - what it bought and what it did not
+Method: interleaved A/B rounds (config order rotated each round so thermal/DVFS drift hits every config equally), median of per-step `enqueue + device wait` over 55 decode steps.
+The iGPU drifts +-1.5 ms between runs, so every claim below is a median of >= 4-6 interleaved rounds. `FERRO_LM_ABL=op,..` skips ops, `FERRO_LM_DUP=op,..` launches them twice,
+`FERRO_LM_NOEOS=1` keeps generating past EOS (timing experiments; outputs are garbage), `FERRO_LM_FUSE=0|1|2` selects unfused / default / +prologue GEMVs.
+
+1. **Where the 350M step goes (27 ms).** Skipping all ~87 small kernels (norms, silu, conv, qkv/rope, kv write, attention): 19-21 ms left. The GEMMs alone are at the bandwidth ceiling: 453 M weights x 1.125 B
+   (int8 + fp32 scale per 32) = 510 MB per token / 25.9 GB/s = 19.7 ms. So the GEMMs cannot be sped up (only a smaller weight format would), and the small-kernel set is the only fusible part.
+2. **Marginal cost of a launch, measured in situ** (launch each op twice, 4 interleaved rounds): +86 launches = +3.65 ms, i.e. **~42 us per launch**. Per-category skipping looked like "free" (+-0.3 ms) because skipping a
+   producer also feeds stale data to the GEMMs and the noise is 1-2 ms; duplicate-launch is the reliable probe. So the whole small-kernel set is worth ~3.7 ms (13% of the step) and a perfect fusion could never give 1.3x.
+3. **Fusions shipped (default, `FERRO_LM_FUSE` unset/1)**: decode causal-conv gate + conv-state update in one kernel (`lm_conv_dec_q`, 10 launches/token), q/k RMSNorm + rope + K/V cache write in one kernel
+   (`lm_qkv_post_kv`, 6 launches/token saved, also used by prefill). Result: 350M single-stream decode 29.0 -> 26.1 ms/step (**1.11x**, 34.5 -> 38.3 tok/s; unfused runs 27.4-30.1 vs fused 23.4-27.0).
+   Decode-vs-prefill self-check cosine 0.99961 (unfused 0.99957); chunked prefill bit-identical; `lm_parity.py` identical fused vs unfused (350M: 12/12, TV 0.0172; 1.2B: 12/12, TV 0.0168); `make test`, `test_serve_lm.py` ALL PASS.
+4. **1.2B and multi-stream: no measurable gain.** The saving is a fixed ~2.5-3 ms/token, i.e. ~4% of the 1.2B's 59 ms step (below the noise floor; its unfused runs span 59-76 ms) and nothing at all once several streams share a step.
+   Server A/B (`bench_lm_serve.py`), fused vs `FERRO_LM_FUSE=0`: 1.2B 1/2/4 streams 16.8 / 31.0 / 42.5 vs 16.3 / 30.6 / 44.5 tok/s; 350M 1/2/4/8 streams 34.9 / 62.1 / 101.7 / 134.2 vs 33.2 / 65.5 / 101.1 / 130.2 tok/s.
+5. **Prologue-fused GEMVs (opt-in `FERRO_LM_FUSE=2`): break-even, not shipped as default.** `q8gemv_p` computes `rmsnorm(X+D)*w` or `silu(gate)*up` inside the consumer GEMV (activations built once per work-group in local
+   memory, bit-identical quantisation) and removes 49 more launches/token (all resid_norm, silu_mul, the lm_head row copies). With the prologue skipped (timing-only) the step is 24.4 ms (-4 ms) - the launch saving is real - but every
+   work-group repeats the prologue: first version +13 ms (uncoalesced), coalesced version +3.8 ms, fatter work-groups (64 rows) bring it to break-even: 350M 26.1 (default) vs 27.1 ms (FUSE=2); 1.2B 59.2 vs 58.5 ms. Per-site
+   (`FERRO_PRO_MASK`) no site wins alone (-2..-5%); prefetching the next weight block to hide the latency made it worse (29.8 ms: register pressure slows the weight loop). Repeated-prologue cost scales with the number of
+   work-groups (`lm_head` has 256-1024), which is why the idea does not pay on a 24-EU GPU where only ~21 work-groups are resident at once.
+**Conclusion:** single-stream decode now runs at ~75% of the weight-streaming limit on both models (350M: 19.7 ms ideal vs 26.1 ms; 1.2B: 1.17 GB at 25.9 GB/s = 45 ms ideal vs 59 ms). The remaining ~25% is the ~70 small launches (~3 ms)
+plus GEMV tail effects; the lever left is fewer weight bytes (Q4, or fp16 scales: the fp32 scales are 11% of the traffic), not more fusion.
