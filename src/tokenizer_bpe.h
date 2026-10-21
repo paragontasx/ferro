@@ -18,6 +18,9 @@ public:
     std::vector<int> tokenize(const std::string& text, bool parse_special) const;
 
     int token_id(const std::string& piece) const;   // -1 if absent
+    // id -> raw bytes (GPT-2 byte-level pieces mapped back; special tokens come out as their literal text, e.g. "<|im_end|>").
+    // A multi-byte UTF-8 character can be split across tokens: concatenate the bytes of consecutive tokens before display.
+    std::string decode_piece(int id) const;
     const std::string& piece(int id) const { return tokens_[id]; }
     int n_vocab() const { return (int)tokens_.size(); }
     int mask_id() const { return mask_id_; }

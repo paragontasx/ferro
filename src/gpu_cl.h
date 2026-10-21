@@ -42,6 +42,7 @@ bool op_gemm(int slot, Buf X, int T, Buf Y);                // Y[T x rows] = X[T
 
 // ---- fused path: producers write the int8 GEMM input (shared scratch) directly ----
 bool ensure_qscratch(int T, int max_cols);
+bool warm_small_gemm();   // build the 1/2/4-token decode GEMM variants now instead of on first use
 bool op_gemm_q(int slot, int T, Buf Y);                     // GEMM on the current quantized scratch
 // y = ((R?R:0) + (D? rms(D)*wd : 0))*scale -> OUT (if OUT); then quantize (norm_q ? rms(y)*wq : y) if do_q
 bool op_row_fused(Buf R, Buf D, Buf wd, float scale, Buf OUT, Buf wq, bool norm_q, bool do_q, int T, int cols, float eps);
@@ -70,6 +71,12 @@ bool op_resid_norm_q(Buf X, Buf D, Buf db, Buf w, Buf b, bool is_ln, int T, int 
 bool op_head_in_q(Buf X, Buf D, Buf ow, Buf te, Buf type, Buf lw, Buf lb, int T, int cols, float rms_eps, float ln_eps);
 // centred 3-tap short conv gate over C = [b|c|x] (segment bounds inclusive) -> quantized z
 bool op_conv_gate_q(Buf C, Buf prev, Buf next, Buf taps, int T, int d);   // prev/next: neighbour rows, -1 = none
+// ---- LFM2 generative (causal) models; hd = 64, outputs go to the shared int8 scratch
+bool op_lm_conv_q(Buf C, Buf src1, Buf src2, Buf st, Buf taps, int T, int d);     // causal conv gate; src: row >= 0 or state ref -1-(slot*2+k)
+bool op_lm_conv_state(Buf C, Buf st, Buf slot, Buf r1, Buf r2, int ns, int d);    // st[slot] <- b*x of rows r2 (or old newer slot), r1
+bool op_lm_kv_write(Buf C, int rowc, int koff, Buf KV, Buf dst, int T, int kvw);  // KV[dst[t]] <- C[t][koff .. koff+kvw)
+bool op_lm_attn_pf(Buf C, int ldc, Buf KV, int ldkv, int voff, int kvbase, int nq, int nkv, int pos0, float scale, int T);
+bool op_lm_attn_dec(Buf C, int ldc, Buf KV, int ldkv, int voff, Buf bases, Buf lens, int nq, int nkv, float scale, int B);
 bool op_silu_mul_q(Buf G, int T, int FF);                    // silu(G[:, :FF]) * G[:, FF:] -> int8
 bool op_bias_act_q(Buf G, Buf b, bool relu, int T, int cols);// (G + b) [relu] -> int8
 bool op_bias_add(Buf Y, Buf b, int T, int rows);

@@ -1,11 +1,19 @@
-// server.h - `ferro-embed serve`: a resident, OpenAI-compatible HTTP embedding server (EmbeddingGemma 2, text / image / audio / video).
+// server.h - `ferro-embed serve`: a resident, OpenAI-compatible HTTP server.
+//   * embeddings: EmbeddingGemma 2, text / image / audio / video        (--model [--mmproj])
+//   * chat / completions: LiquidAI LFM2 / LFM2.5 language models, streaming (--lm)
+// Either or both can be loaded; they share the iGPU through one worker thread.
 #pragma once
 #include <string>
 
 namespace ferro {
 
 struct ServerOptions {
-    std::string model, mmproj;                 // EG2 text GGUF (+ optional mmproj for image / audio / video inputs)
+    std::string model, mmproj;                 // EG2 text GGUF (+ optional mmproj for image / audio / video inputs); empty = no embeddings
+    std::string lm;                            // LFM2 / LFM2.5 language-model GGUF (chat + completions); empty = no generation
+    std::string lm_name;                       // id reported for the language model (default: file name)
+    int lm_ctx = 4096;                         // context per sequence slot; the KV cache is allocated up front (LFM2.5-1.2B: ~25 MB per 1k tokens per slot)
+    int lm_slots = 4;                          // concurrent generations (decode of all active slots runs as one batched pass)
+    std::string reasoning_format = "deepseek"; // "deepseek": <think>..</think> -> reasoning_content; "none": keep it inline in content
     std::string host = "127.0.0.1";            // bind address (use 0.0.0.0 to expose it)
     int port = 8080;
     std::string api_key;                       // non-empty: require "Authorization: Bearer <key>" (everything but /health)

@@ -7,6 +7,7 @@ binary, **on the integrated GPU by default** (OpenCL, int8 DP4A) with automatic 
 |---|---|---|---|
 | **EmbeddingGemma-2** | `gemma-embedding2` | `embed` / `bench` | sentence embeddings |
 | **LiquidAI d1-omni-600M** | `lfm2` + `lfm2.decision.*` | `decide` / `bench` | typed answers (yes/no, choice, score) over a state, one forward pass, no generated tokens |
+| **LiquidAI LFM2 / LFM2.5** (e.g. LFM2.5-1.2B-Thinking) | `lfm2` (causal) | `generate` / `serve --lm` | text generation: chat + completions, streaming, OpenAI-compatible |
 
 The model kind is detected from the GGUF metadata. libOpenCL is `dlopen`'d, so the binary also runs on
 GPU-less hosts. Native GGUF loading and native tokenizers (Gemma SPM-BPE; LFM2 byte-level BPE).
@@ -113,6 +114,65 @@ large images are bound by ViT attention (88% of the 1080p time); text/audio sequ
 beyond that the layer loop falls back to the CPU. Text-model attention for single long sequences uses head-dim generic dense
 kernels (5x faster than the lane-per-key kernels at 950 tokens).
 
+## Using LFM2.5 language models (chat / completions)
+`LiquidAI/LFM2.5-1.2B-Thinking` (and the other causal `lfm2` GGUFs: Instruct, Base, ...) run natively: 10 gated short-conv blocks + 6 GQA
+attention blocks, SwiGLU, tied LM head, byte-level BPE, the model's own chat template (ported natively, byte-identical to llama.cpp's jinja
+rendering incl. tools and the past-turn `<think>` stripping) and a sampler (temperature / top-k / top-p / min-p / repetition penalty / seed;
+defaults are LiquidAI's recommended 0.05 / 50 / 1.05). Q8_0, F16, BF16 and F32 GGUFs load (non-Q8 weights are quantised to Q8_0 on load).
+```sh
+./ferro-embed generate --lm models/LFM2.5-1.2B-Thinking-Q8_0.gguf --prompt "Explain why the sky is blue in two sentences." --n-predict 400
+./ferro-embed generate --lm models/LFM2.5-1.2B-Thinking-Q8_0.gguf --messages chat.json --temp 0.1   # chat.json: [{"role":..,"content":..}] or {"messages":..,"tools":..}
+```
+Everything runs on the iGPU: Q8 weights stay device-resident, the KV cache (attention layers) and the 2-token conv state live in per-sequence
+device slots, prefill uses a causal tiled attention kernel, decode batches one token of every active sequence into a single pass
+(split-K GEMV for the 1-4 token GEMMs, one-query-per-row attention over the cache). Measured on the N100 (Q8_0, same file as llama.cpp):
+
+| LFM2.5-1.2B-Thinking Q8_0 | ferro iGPU | llama.cpp CPU (2 threads) |
+|---|---|---|
+| prefill, 762 tokens | **153 tok/s** | 11.2 tok/s |
+| decode, 1 stream | **15-19 tok/s** | 6.1 tok/s |
+| decode, aggregate over 2 / 4 streams (server) | **22 / 35 tok/s** | |
+
+Decode streams 1.17 GB of weights per token at ~22 GB/s; a pure-streaming read kernel reaches 25.9 GB/s on this iGPU, so Q8 decode is ~85% of the
+hardware limit (only a smaller weight format can go meaningfully faster). **Accuracy** (`scripts/lm_parity.py`, 12 prompts incl. chat-template,
+code and a 900-token one; next-token distribution vs llama.cpp **F16** as the oracle): top-1 agreement 12/12, mean total-variation distance **0.0198** -
+the same as llama.cpp's own Q8_0 vs its F16 (0.0200), i.e. at the quantisation noise floor. At the hidden-state level (3 / 8 layers, per-token relative L2
+vs F16) ferro's fp32-activation CPU reference is *closer* to F16 than llama.cpp's int8-activation Q8 path (1.1 / 1.4% vs 1.9 / 2.6%); the iGPU path quantises
+activations to int8 like llama.cpp and lands on the same TV. Debug knobs: `FERRO_LM_GPU=0` (CPU reference, ~0.5 tok/s decode), `FERRO_LM_PROF=1` (per-op device times),
+`FERRO_LM_STEPTIME=1`, `FERRO_LM_SELFCHECK=1` (chunked prefill / token-by-token decode vs one prefill), `FERRO_LM_KEEP_HOST=1`, `FERRO_GPU_SMALL=0` / `FERRO_GPU_GEMV=0`.
+
+## Serving over HTTP (`ferro-embed serve`)
+One resident process, OpenAI-compatible, embeddings and/or language model on the same iGPU (one worker thread owns the device):
+```sh
+./ferro-embed serve --model models/embeddinggemma-2-Q8_0.gguf --mmproj models/mmproj-embeddinggemma-2-Q8_0.gguf \
+                    --lm models/LFM2.5-1.2B-Thinking-Q8_0.gguf --port 8088 [--lm-slots 4] [--lm-ctx 4096] [--api-key K] [--host 0.0.0.0]
+curl localhost:8088/v1/chat/completions -d '{"messages":[{"role":"user","content":"What is 17*23?"}],"stream":true}'
+curl localhost:8088/v1/embeddings -d '{"input":"hello"}'
+```
+| Endpoint | |
+|---|---|
+| `POST /v1/embeddings` | text / `image_url` / `input_audio` / `video_url` parts (data URLs), `dimensions`, `encoding_format: base64`; concurrent text requests share packed forward passes |
+| `POST /v1/chat/completions`, `POST /v1/completions` | `messages` (+`tools` are rendered into the prompt), `max_tokens`, `temperature`, `top_p`, `top_k`, `min_p`, `repetition_penalty`, `seed`, `stop`, `stream` (SSE) + `stream_options.include_usage`; `usage` and llama.cpp-style `timings` in every response |
+| `POST /apply-template` | rendered chat prompt (same contract as llama.cpp) |
+| `GET /v1/models`, `GET /health` | capabilities / context / slots; queue, active slots, throughput counters |
+
+`<think>..</think>` output is returned as `reasoning_content` (`--reasoning-format none` keeps it inline). Generation is continuously batched over `--lm-slots`
+device slots (each holds `--lm-ctx` tokens of KV cache, ~25 MB per 1k tokens); embedding requests are served between decode steps (a short text embedding
+measured 0.12-1.8 s while 4 streams were generating - it waits for the decode step or prefill in progress); a closed client connection frees its slot within a step; 503 when the queue is full; Bearer `--api-key`
+(or `FERRO_API_KEY`). Not implemented: tool-call *parsing* of model output (tools are only rendered into the prompt), `n > 1`, logprobs, image input to the LM, prefix caching.
+**Memory** (iGPU buffers are system RAM and not swappable - size `--lm-slots` x `--lm-ctx` to your limit; measured via cgroup, device buffers show as shmem):
+
+| Process | anon | device (shmem) |
+|---|---|---|
+| `--lm` only, 4 x 4096 | ~0.6 GB | 1.8 GB |
+| `--lm` only, 1 slot | ~0.8 GB | 1.5 GB |
+| `--model` + `--mmproj` | ~1.6 GB | 0.8 GB |
+| EG2 text only | ~0.9 GB | 0.2 GB |
+
+The server prints the KV size and warns when it approaches a container limit. Tests: `scripts/test_serve.py` (embeddings), `scripts/test_serve_lm.py`
+(chat: usage accounting, seeds, stream == non-stream, stop strings, UTF-8, errors, cancellation, concurrency, template parity with `--llama URL`),
+`scripts/bench_lm_serve.py` (concurrency scaling), `scripts/bench_serve.py` (embeddings).
+
 ## How the iGPU path is fast
 1. **int8 DP4A GEMMs** (`cl_khr_integer_dot_product`): Q8_0 weights resident on the GPU in a
    coalesced `[block][k][rows]` layout; activations quantized per 32-block (llama.cpp's scheme);
@@ -153,6 +213,7 @@ d1: faster than llama.cpp CPU (1.5×), but ~7× slower than the iGPU — use the
 - `src/gpu_cl.{h,cpp}` — dlopen'd OpenCL backend: DP4A GEMM + all fused layer kernels (both models)
 - `src/model_eg2.cpp` — EmbeddingGemma-2 forward (`layers_gpu` on-device loop; CPU loop; hetero split)
 - `src/model_lfm2.cpp` — LFM2 decision model: loader, CPU forward, on-device forward (`forward_gpu`)
+- `src/model_lfm2_lm.*` — LFM2/LFM2.5 generative engine (causal CPU reference + iGPU prefill/decode, device KV/conv slots) · `src/chat_template.*` · `src/sampler.*` · `src/lm_cli.*` (`generate`) · `src/server.*` (HTTP)
 - `src/decision.cpp` — systemone protocol: request parsing, prompt template + token budgets, answers
 - `src/tokenizer_bpe.cpp` — byte-level BPE (LFM2/llama3 pre-tokenizer); `third_party/llama_unicode/`
   (vendored from llama.cpp, MIT) · `src/json.cpp` — order-preserving JSON incl. jinja `tojson`
@@ -170,4 +231,4 @@ d1: faster than llama.cpp CPU (1.5×), but ~7× slower than the iGPU — use the
 paths, for A/B) · `FERRO_DECISION_BATCH=N` (tokens per d1 forward, default 4096) ·
 `FERRO_MM_GPU=0` / `FERRO_MM_DENSE=0` (media encoder fallbacks) · `FERRO_DECISION_DUMP=1` (rendered d1 prompts + token ids) · `FERRO_DEBUG_LAYERS=1` · `FERRO_TIME=1` ·
 `FERRO_MM_AUDIO_GPU=0` (audio GEMMs on CPU) · `FERRO_MM_AUDIO_DEV=0` (audio blocks back to host-driven GEMMs) · `FERRO_GPU_DENSE_TEXT=0` / `FERRO_GPU_DENSE_MIN=N` (dense long-sequence text attention) · `FERRO_G4_SYNC=1` / `FERRO_G4_DUMP=dir` / `G4A_TIME=1` / `EMB_TIME=1` (multimodal debugging) ·
-`FERRO_LOW_MEM=1` · `FERRO_DBGDIR=/path` (CPU stage dumps for golden diffing)
+`FERRO_LM_*` (see the LM section) · `FERRO_LOW_MEM=1` · `FERRO_DBGDIR=/path` (CPU stage dumps for golden diffing)

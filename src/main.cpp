@@ -11,6 +11,7 @@
 #include "mm_gemma4.h"
 #include "embed_mm.h"
 #include "server.h"
+#include "lm_cli.h"
 #include "gpu_cl.h"
 #include "tokenizer.h"
 #include "threadpool.h"
@@ -34,7 +35,10 @@ static void usage() {
         "       ferro-embed decide --model D1.gguf --request req.json|- [--mmproj P.gguf] [--out f] [--threads N] [--reps R] [--cpu|--gpu]\n"
         "       ferro-embed embed-media --model EG2.gguf [--mmproj P.gguf] --item text:STR|image:F|audio:F|video:F ... [--fps N] [--out f.bin]\n"
         "                   (multimodal EmbeddingGemma 2: items are interleaved in order into one 768-d embedding; vision/audio encoders on the iGPU)\n"
-        "       ferro-embed serve --model EG2.gguf [--mmproj P.gguf] [--host H] [--port N] [--api-key K] [--max-batch-tokens N] [--batch-wait-ms N]\n"
+        "       ferro-embed generate --lm LFM2.5.gguf (--prompt TEXT | --messages f.json) [--n-predict N] [--temp T] [--top-k K] [--rep-penalty P] [--seed S]\n"
+        "                   (text generation with an LFM2 / LFM2.5 model, e.g. LFM2.5-1.2B-Thinking; chat template + sampler built in)\n"
+        "       ferro-embed serve [--model EG2.gguf [--mmproj P.gguf]] [--lm LFM2.5.gguf [--lm-ctx N] [--lm-slots N] [--reasoning-format deepseek|none]] [--host H] [--port P] [--api-key K]\n"
+        "       (old form follows)  ferro-embed serve --model EG2.gguf [--mmproj P.gguf] [--host H] [--port N] [--api-key K] [--max-batch-tokens N] [--batch-wait-ms N]\n"
         "                   (resident OpenAI-compatible server: POST /v1/embeddings with text / image_url / input_audio / video_url parts, GET /v1/models, GET /health)\n"
         "       ferro-embed mm-embed --mmproj P.gguf --media image|audio --out f.bin     (per-chunk encoder output, mm_ref format)\n"
         "       ferro-embed mel-dump --media in.f32 --out mel.bin                        (Gemma 4 audio log-mel frontend only)\n");
@@ -329,6 +333,7 @@ int main(int argc, char** argv) {
     std::string model, inp, tokf, outp, reqf, mmproj, media;
     std::vector<std::string> items;   // embed-media: ordered text:/image:/audio:/video: items
     float video_fps = 4.0f;
+    GenArgs ga;                       // generate: --lm --prompt --system --messages --n-predict --ctx --temp --top-k --top-p --min-p --rep-penalty --seed --raw --print-ids --dump-logits
     ServerOptions so;                 // serve: --host --port --api-key --model-name --max-batch-tokens --batch-wait-ms --max-queue --max-body-mb
     int threads = 0, maxtok = 2048, reps = 5;  // 0 = auto: power-limited SoCs run best on 2 cores
     bool int8 = false;
@@ -350,6 +355,27 @@ int main(int argc, char** argv) {
         else if (a == "--threads") threads = atoi(next("--threads"));
         else if (a == "--max-tokens") maxtok = atoi(next("--max-tokens"));
         else if (a == "--reps") reps = atoi(next("--reps"));
+        else if (a == "--lm") ga.lm = next("--lm");
+        else if (a == "--lm-ctx") so.lm_ctx = atoi(next("--lm-ctx"));
+        else if (a == "--lm-slots") so.lm_slots = atoi(next("--lm-slots"));
+        else if (a == "--lm-name") so.lm_name = next("--lm-name");
+        else if (a == "--reasoning-format") so.reasoning_format = next("--reasoning-format");
+        else if (a == "--prompt") ga.prompt = next("--prompt");
+        else if (a == "--system") ga.system = next("--system");
+        else if (a == "--messages") ga.messages_file = next("--messages");
+        else if (a == "--n-predict") ga.n_predict = atoi(next("--n-predict"));
+        else if (a == "--ctx") ga.ctx = atoi(next("--ctx"));
+        else if (a == "--temp") ga.sp.temperature = (float)atof(next("--temp"));
+        else if (a == "--top-k") ga.sp.top_k = atoi(next("--top-k"));
+        else if (a == "--top-p") ga.sp.top_p = (float)atof(next("--top-p"));
+        else if (a == "--min-p") ga.sp.min_p = (float)atof(next("--min-p"));
+        else if (a == "--rep-penalty") ga.sp.repetition_penalty = (float)atof(next("--rep-penalty"));
+        else if (a == "--seed") ga.sp.seed = (uint64_t)atoll(next("--seed"));
+        else if (a == "--raw") ga.raw = true;
+        else if (a == "--print-ids") ga.print_ids = true;
+        else if (a == "--quiet") ga.quiet = true;
+        else if (a == "--dump-logits") ga.dump_logits = next("--dump-logits");
+        else if (a == "--logits-batch") ga.logits_batch = next("--logits-batch");
         else if (a == "--host") so.host = next("--host");
         else if (a == "--port") so.port = atoi(next("--port"));
         else if (a == "--api-key") so.api_key = next("--api-key");
@@ -364,9 +390,15 @@ int main(int argc, char** argv) {
         else if (a == "--hetero") { setenv("FERRO_GPU", "1", 1); setenv("FERRO_HETERO", "1", 1); }  // CPU+iGPU split
         else usage();
     }
+    if (cmd == "generate") {
+        if (ga.lm.empty() || (ga.prompt.empty() && ga.messages_file.empty() && ga.logits_batch.empty())) { fprintf(stderr, "generate --lm LFM.gguf (--prompt TEXT | --messages file.json) [--system S] [--n-predict N] [--ctx N] [--temp T] [--top-k K] [--rep-penalty P] [--seed S] [--raw] [--print-ids] [--dump-logits f.bin]\n"); return 2; }
+        ga.threads = threads > 0 ? threads : 2;
+        return run_generate(ga);
+    }
     if (cmd == "serve") {
-        if (model.empty()) { fprintf(stderr, "serve --model EG2.gguf [--mmproj P.gguf] [--host 127.0.0.1] [--port 8080] [--api-key K]\n"); return 2; }
-        so.model = model; so.mmproj = mmproj; so.threads = threads > 0 ? threads : 2; so.video_fps = video_fps;
+        if (model.empty() && ga.lm.empty()) { fprintf(stderr, "serve [--model EG2.gguf [--mmproj P.gguf]] [--lm LFM2.5.gguf [--lm-ctx N] [--lm-slots N]] [--host 127.0.0.1] [--port 8080] [--api-key K]\n"); return 2; }
+        if (so.lm_ctx < 256 || so.lm_slots < 1 || so.lm_slots > 32 || (so.reasoning_format != "deepseek" && so.reasoning_format != "none")) { fprintf(stderr, "bad --lm-ctx / --lm-slots / --reasoning-format (deepseek|none)\n"); return 2; }
+        so.model = model; so.mmproj = mmproj; so.lm = ga.lm; so.threads = threads > 0 ? threads : 2; so.video_fps = video_fps;
         if (so.api_key.empty()) if (const char* k = getenv("FERRO_API_KEY")) so.api_key = k;
         return run_server(so);
     }

@@ -142,4 +142,32 @@ std::vector<int> BpeTokenizer::tokenize(const std::string& text, bool parse_spec
     return out;
 }
 
+std::string BpeTokenizer::decode_piece(int id) const {
+    static int cp2byte[512]; static bool init = false;
+    if (!init) {
+        for (int& v : cp2byte) v = -1;
+        int n = 0;
+        for (int b = 0; b < 256; ++b) {
+            const bool direct = (b >= 33 && b <= 126) || (b >= 161 && b <= 172) || (b >= 174 && b <= 255);
+            if (direct) cp2byte[b] = b; else cp2byte[256 + n++] = b;
+        }
+        init = true;
+    }
+    if (id < 0 || id >= (int)tokens_.size()) return std::string();
+    const std::string& p = tokens_[id];
+    std::string out;
+    for (size_t i = 0; i < p.size();) {
+        const unsigned char c = (unsigned char)p[i];
+        int cp, len;
+        if (c < 0x80) { cp = c; len = 1; }
+        else if ((c >> 5) == 6 && i + 1 < p.size()) { cp = ((c & 0x1F) << 6) | (p[i + 1] & 0x3F); len = 2; }
+        else if ((c >> 4) == 14 && i + 2 < p.size()) { cp = ((c & 0x0F) << 12) | ((p[i + 1] & 0x3F) << 6) | (p[i + 2] & 0x3F); len = 3; }
+        else { out.append(p, i, 1); ++i; continue; }
+        if (cp < 512 && cp2byte[cp] >= 0) out += (char)cp2byte[cp];
+        else out.append(p, i, (size_t)len);                       // not a byte-level character: keep as is
+        i += (size_t)len;
+    }
+    return out;
+}
+
 }  // namespace ferro

@@ -4,6 +4,7 @@
 #define CL_TARGET_OPENCL_VERSION 300
 #include <CL/cl.h>
 #include "gpu_cl.h"
+#include "threadpool.h"
 #include "kernels.h"
 #include <dlfcn.h>
 #include <cstdio>
@@ -1352,6 +1353,205 @@ __kernel void a_attn(__global const float* C, int ldc, __global const float* Pk,
     O[(size_t)gq * d + h * AHD + e] = acc;
   }
 }
+// ================= LFM2 generative models (causal short conv + GQA attention over a device KV cache) =================
+// causal 3-tap short-conv gate. C rows = [b|c|x] (3d). src1/src2[t]: >= 0: row of C whose b*x is the t-1 / t-2 value;
+// < 0: conv state ref -1-(slot*2+k) (k = 0: older, 1: newer). taps[k*d+c]: tap k multiplies token t-2+k.
+__kernel void lm_conv_q(__global const float* C, __global const int* src1, __global const int* src2, __global const float* st,
+                        __global const float* taps, __global uint* Xp, __global float* Xs, int d) {
+  __local float am[512];
+  const int t = get_group_id(0), lid = get_local_id(0);
+  const __global float* r = C + (size_t)t * 3 * d;
+  float4 y = vload4(lid, r) * vload4(lid, r + 2 * d) * vload4(lid, taps + 2 * d);
+  const int s1 = src1[t], s2 = src2[t];
+  float4 b1, b2;
+  if (s1 >= 0) { const __global float* p = C + (size_t)s1 * 3 * d; b1 = vload4(lid, p) * vload4(lid, p + 2 * d); }
+  else b1 = vload4(lid, st + (size_t)(-1 - s1) * d);
+  if (s2 >= 0) { const __global float* p = C + (size_t)s2 * 3 * d; b2 = vload4(lid, p) * vload4(lid, p + 2 * d); }
+  else b2 = vload4(lid, st + (size_t)(-1 - s2) * d);
+  y += b1 * vload4(lid, taps + d) + b2 * vload4(lid, taps);
+  quant_lane4(vload4(lid, r + d) * y, am, Xp, Xs, t, d);
+}
+// new conv state of every sequence = b*x of its last two rows (r2 < 0: the old newer slot shifts down)
+__kernel void lm_conv_state(__global const float* C, __global float* st, __global const int* slot, __global const int* r1,
+                            __global const int* r2, int d) {
+  const int s = get_group_id(0), lid = get_local_id(0);
+  __global float* s0 = st + (size_t)slot[s] * 2 * d;
+  __global float* s1 = s0 + d;
+  const float4 old1 = vload4(lid, s1);
+  const __global float* p1 = C + (size_t)r1[s] * 3 * d;
+  const float4 n1 = vload4(lid, p1) * vload4(lid, p1 + 2 * d);
+  float4 n0 = old1;
+  if (r2[s] >= 0) { const __global float* p2 = C + (size_t)r2[s] * 3 * d; n0 = vload4(lid, p2) * vload4(lid, p2 + 2 * d); }
+  vstore4(n0, lid, s0);
+  vstore4(n1, lid, s1);
+}
+// copy the K|V part (kvw floats, contiguous at koff) of row t into KV cache row dst[t]
+__kernel void lm_kv_write(__global const float* C, int rowc, int koff, __global float* KV, __global const int* dst, int kvw) {
+  const int t = get_group_id(0), lid = get_local_id(0);
+  vstore4(vload4(lid, C + (size_t)t * rowc + koff), lid, KV + (size_t)dst[t] * kvw);
+}
+// causal attention of T consecutive queries of ONE sequence (positions pos0..pos0+T-1) over its KV cache rows kvbase..
+// (hd = 64; queries one per lane, key tiles staged in SLM); output -> int8 scratch (like attention_q5)
+__kernel void lm_attn_pf(__global const float* C, int ldc, __global const float* KV, int ldkv, int voff, int kvbase,
+                         int nq, int nkv, int pos0, float scale, __global uint* Xp, __global float* Xs, int T) {
+  __local float Qs[QT5 * 68];
+  __local float Ks[KT5 * 64];
+  __local float Vs[KT5 * 64];
+  const int h = get_group_id(0), lid = get_local_id(0);
+  const int t0 = get_group_id(1) * QT5;
+  const int tq = t0 + lid, t = min(tq, T - 1);
+  const int kvh = h / (nq / nkv);
+  const __global float* qr = C + (size_t)t * ldc + h * 64;
+  for (int i = 0; i < 16; ++i) vstore4(vload4(i, qr) * (scale * 1.4426950408889634f), i, Qs + lid * 68);
+  float4 acc[16];
+  for (int i = 0; i < 16; ++i) acc[i] = (float4)(0.f);
+  float m = -1e30f, l = 0.f;
+  const int thi = pos0 + min(t0 + QT5 - 1, T - 1);
+  const int myhi = pos0 + t;
+  for (int k0 = 0; k0 <= thi; k0 += KT5) {
+    const int kn = min(KT5, thi - k0 + 1);
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int i = lid; i < kn * 16; i += QT5) {
+      const int r = i >> 4, c4 = i & 15;
+      const __global float* row = KV + (size_t)(kvbase + k0 + r) * ldkv + kvh * 64;
+      vstore4(vload4(c4, row), c4, Ks + r * 64);
+      vstore4(vload4(c4, row + voff), c4, Vs + r * 64);
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    float sc[KT5];
+    for (int j = 0; j < kn; ++j) {
+      float4 s4 = (float4)(0.f);
+      for (int i = 0; i < 16; ++i) s4 = mad(vload4(i, Qs + lid * 68), vload4(i, Ks + j * 64), s4);
+      sc[j] = (k0 + j <= myhi) ? (s4.x + s4.y + s4.z + s4.w) : -1e30f;
+    }
+    for (int j = 0; j < kn; ++j) {
+      const float sj = sc[j];
+      if (sj < -1e29f) continue;
+      if (sj > m) {
+        const float a = native_exp2(m - sj);
+        for (int i = 0; i < 16; ++i) acc[i] *= a;
+        l *= a; m = sj;
+      }
+      const float p = native_exp2(sj - m);
+      l += p;
+      for (int i = 0; i < 16; ++i) acc[i] = mad((float4)(p), vload4(i, Vs + j * 64), acc[i]);
+    }
+  }
+  if (tq >= T) return;
+  const float inv = l > 0.f ? 1.0f / l : 0.f;
+  const int cols = nq * 64;
+  for (int b = 0; b < 2; ++b) {
+    float amax = 0.f;
+    for (int i = 0; i < 8; ++i) { const float4 a = fabs(acc[b * 8 + i] * inv); amax = fmax(amax, fmax(fmax(a.x, a.y), fmax(a.z, a.w))); }
+    const float dq = amax / 127.f, id = dq > 0.f ? 1.f / dq : 0.f;
+    for (int i = 0; i < 8; ++i)
+      Xp[(size_t)tq * (cols / 4) + h * 16 + b * 8 + i] = as_uint(convert_char4_sat_rte(acc[b * 8 + i] * inv * id));
+    Xs[(size_t)tq * (cols / 32) + h * 2 + b] = dq;
+  }
+}
+// decode: one query row per sequence (row b of C), keys 0..lens[b)-1 at KV rows bases[b]+j. WG = 64 lanes per (head, row);
+// scores of a chunk of DCH keys live in SLM, online softmax across chunks, lane e accumulates output dim e.
+#define DCH 1024
+__kernel void lm_attn_dec(__global const float* C, int ldc, __global const float* KV, int ldkv, int voff,
+                          __global const int* bases, __global const int* lens, int nq, int nkv, float scale,
+                          __global uint* Xp, __global float* Xs) {
+  __local float sc[DCH];
+  __local float qs[64];
+  __local float rd[64];
+  __local char q8[64];
+  const int h = get_group_id(0), b = get_group_id(1), lid = get_local_id(0);
+  const int kvh = h / (nq / nkv), len = lens[b], base = bases[b];
+  qs[lid] = C[(size_t)b * ldc + h * 64 + lid] * (scale * 1.4426950408889634f);
+  barrier(CLK_LOCAL_MEM_FENCE);
+  float m = -1e30f, l = 0.f, acc = 0.f;
+  for (int c0 = 0; c0 < len; c0 += DCH) {
+    const int n = min(DCH, len - c0);
+    float lmax = -1e30f;
+    for (int j = lid; j < n; j += 64) {
+      const __global float* row = KV + (size_t)(base + c0 + j) * ldkv + kvh * 64;
+      float4 s4 = (float4)(0.f);
+      for (int i = 0; i < 16; ++i) s4 = mad(vload4(i, qs), vload4(i, row), s4);
+      const float s = s4.x + s4.y + s4.z + s4.w;
+      sc[j] = s; lmax = fmax(lmax, s);
+    }
+    rd[lid] = lmax;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    float cm = rd[0];
+    for (int i = 1; i < 64; ++i) cm = fmax(cm, rd[i]);
+    barrier(CLK_LOCAL_MEM_FENCE);
+    const float nm = fmax(m, cm);
+    const float a = native_exp2(m - nm);
+    acc *= a; l *= a; m = nm;
+    float ls = 0.f;
+    for (int j = lid; j < n; j += 64) { const float p = native_exp2(sc[j] - m); sc[j] = p; ls += p; }
+    rd[lid] = ls;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    float tot = 0.f;
+    for (int i = 0; i < 64; ++i) tot += rd[i];
+    l += tot;
+    for (int j = 0; j < n; ++j) acc = mad(sc[j], KV[(size_t)(base + c0 + j) * ldkv + voff + kvh * 64 + lid], acc);
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  const float o = l > 0.f ? acc / l : 0.f;
+  rd[lid] = fabs(o);
+  barrier(CLK_LOCAL_MEM_FENCE);
+  const int b0 = lid & ~31;
+  float amax = 0.f;
+  for (int i = 0; i < 32; ++i) amax = fmax(amax, rd[b0 + i]);
+  const float dq = amax / 127.f, id = dq > 0.f ? 1.f / dq : 0.f;
+  q8[lid] = convert_char_sat_rte(o * id);
+  barrier(CLK_LOCAL_MEM_FENCE);
+  const int cols = nq * 64;
+  if (lid < 16) Xp[(size_t)b * (cols / 4) + h * 16 + lid] = ((__local uint*)q8)[lid];
+  if ((lid & 31) == 0) Xs[(size_t)b * (cols / 32) + h * 2 + (lid >> 5)] = dq;
+}
+// decode GEMV (T <= TT tokens): split-K. WG = (LXV row-groups) x (SKV k-splits); every thread streams its share of the weight blocks
+// (16 B per lane per step, coalesced over lanes), reduces through SLM. Same DP4A math as q8gemm; only the float summation order differs.
+#ifndef SKV
+#define SKV 8
+#endif
+#define LXV 16
+#define STEPV(A, K, XV) \
+  A.s0 = dot_acc_sat_4x8packed_ss_int(w[K].s0, XV, A.s0); \
+  A.s1 = dot_acc_sat_4x8packed_ss_int(w[K].s1, XV, A.s1); \
+  A.s2 = dot_acc_sat_4x8packed_ss_int(w[K].s2, XV, A.s2); \
+  A.s3 = dot_acc_sat_4x8packed_ss_int(w[K].s3, XV, A.s3);
+__kernel void q8gemv(__global const uint* restrict Wp, __global const float* restrict Ws,
+                     __global const uint* restrict Xp, __global const float* restrict Xs,
+                     __global float* restrict Y, int rows, int cols, int T) {
+  __local float4 red[SKV * TT * LXV];
+  const int lx = get_local_id(0), sk = get_local_id(1);
+  const int R4 = rows >> 2, gx = get_group_id(0) * LXV + lx;
+  const int nb = cols / 32, cw = cols / 4;
+  const int b0 = (nb * sk) / SKV, b1 = (nb * (sk + 1)) / SKV;
+  float4 acc[TT];
+  for (int j = 0; j < TT; ++j) acc[j] = (float4)(0.f);
+  const __global uint4* Wb = (const __global uint4*)Wp + gx;
+  const __global float4* Sb = (const __global float4*)Ws + gx;
+  for (int b = b0; b < b1; ++b) {
+    uint4 w[8];
+    for (int k = 0; k < 8; ++k) w[k] = Wb[(size_t)(b * 8 + k) * R4];
+    const float4 ws = Sb[(size_t)b * R4];
+    for (int j = 0; j < TT; ++j) {
+      const int t = min(j, T - 1);
+      const __global uint4* xp = (const __global uint4*)(Xp + (size_t)t * cw + b * 8);
+      const uint4 xa = xp[0], xb = xp[1];
+      int4 s = (int4)(0);
+      STEPV(s, 0, xa.s0) STEPV(s, 1, xa.s1) STEPV(s, 2, xa.s2) STEPV(s, 3, xa.s3)
+      STEPV(s, 4, xb.s0) STEPV(s, 5, xb.s1) STEPV(s, 6, xb.s2) STEPV(s, 7, xb.s3)
+      acc[j] = mad(convert_float4(s), ws * Xs[(size_t)t * nb + b], acc[j]);
+    }
+  }
+  for (int j = 0; j < TT; ++j) red[(sk * TT + j) * LXV + lx] = acc[j];
+  barrier(CLK_LOCAL_MEM_FENCE);
+  if (sk == 0) {
+    for (int j = 0; j < TT; ++j) {
+      float4 a = red[j * LXV + lx];
+      for (int q = 1; q < SKV; ++q) a += red[(q * TT + j) * LXV + lx];
+      if (j < T) vstore4(a, 0, Y + (size_t)j * rows + gx * 4);
+    }
+  }
+}
 )CL";
 
 // ---------------------------------------------------------------- state
@@ -1366,13 +1566,19 @@ static cl_program g_prog8 = nullptr;
 static cl_kernel k_gemm8 = nullptr, k_gemm_sw8 = nullptr;
 static cl_device_id g_dev = nullptr;
 static bool ensure_kb8();
+// decode-sized GEMM variants: the same kernel built with a 1/2/4-token tile (the default 10-token tile wastes ~90% of its DP4A work at T=1)
+static cl_program g_prog_small[3] = {nullptr, nullptr, nullptr};
+static cl_kernel k_gemm_small[3] = {nullptr, nullptr, nullptr}, k_gemv_small[3] = {nullptr, nullptr, nullptr};
+static int small_idx(int T) { return T <= 1 ? 0 : T <= 2 ? 1 : 2; }
+static const int kSmallTT[3] = {1, 2, 4};
+static bool ensure_small(int i);
 static cl_kernel k_quant = nullptr, k_gemm = nullptr, k_gemm_sw = nullptr, k_rms = nullptr, k_rope = nullptr, k_attn = nullptr,
                  k_gmul = nullptr, k_gmulv = nullptr, k_add = nullptr,
                  k_rowf = nullptr, k_qkvp = nullptr, k_attq = nullptr, k_gmq = nullptr, k_gmvq = nullptr,
                  k_attq2 = nullptr, k_gmq2 = nullptr, k_gmvq2 = nullptr,
                  k_rowf3 = nullptr, k_qkvp3 = nullptr, k_attq3 = nullptr, k_gmq3 = nullptr, k_gmvq3 = nullptr,
                  k_rnq = nullptr, k_hinq = nullptr, k_convq = nullptr, k_siluq = nullptr, k_bactq = nullptr,
-                 k_badd = nullptr, k_score = nullptr, k_attq4 = nullptr, k_attq5 = nullptr, k_quantq = nullptr, k_lngq = nullptr, k_dqk = nullptr, k_dsm = nullptr, k_dpv = nullptr, k_qkvg4 = nullptr, k_dqkh = nullptr, k_dpvh = nullptr, k_dsmw = nullptr, k_anq = nullptr, k_aact = nullptr, k_ares = nullptr, k_aconv = nullptr, k_aattn = nullptr;
+                 k_badd = nullptr, k_score = nullptr, k_attq4 = nullptr, k_attq5 = nullptr, k_quantq = nullptr, k_lngq = nullptr, k_dqk = nullptr, k_dsm = nullptr, k_dpv = nullptr, k_qkvg4 = nullptr, k_dqkh = nullptr, k_dpvh = nullptr, k_dsmw = nullptr, k_anq = nullptr, k_aact = nullptr, k_ares = nullptr, k_aconv = nullptr, k_aattn = nullptr, k_lmconv = nullptr, k_lmcst = nullptr, k_lmkv = nullptr, k_lmpf = nullptr, k_lmdec = nullptr;
 static std::vector<Slot> g_slots;
 static size_t g_bytes = 0;
 static cl_mem g_Xp = nullptr, g_Xs = nullptr;           // quantized-activation scratch
@@ -1440,7 +1646,7 @@ bool init(bool verbose) {
         {&k_attn, "attention"}, {&k_gmul, "gelu_mul"}, {&k_gmulv, "gelu_mulvec"}, {&k_add, "add_scale"},
         {&k_rowf, "row_fused"}, {&k_qkvp, "qkv_post"}, {&k_attq, "attention_q"}, {&k_gmq, "gelu_mul_q"},
         {&k_gmvq, "gelu_mulvec_q"}, {&k_attq2, "attention_q2"}, {&k_gmq2, "gelu_mul_q2"}, {&k_gmvq2, "gelu_mulvec_q2"},
-        {&k_qkvg4, "qkv_post_g4"}, {&k_dsmw, "dattn_stats_w"}, {&k_anq, "a_norm_quant"}, {&k_aact, "a_act_quant"}, {&k_ares, "a_resid"}, {&k_aconv, "a_conv_mid"}, {&k_aattn, "a_attn"}, {&k_dqkh, "dattn_qk_h"}, {&k_dpvh, "dattn_pv_h"}, {&k_rowf3, "row_fused3"}, {&k_qkvp3, "qkv_post3"}, {&k_attq3, "attention_q3"}, {&k_gmq3, "gelu_mul_q3"},
+        {&k_qkvg4, "qkv_post_g4"}, {&k_dsmw, "dattn_stats_w"}, {&k_anq, "a_norm_quant"}, {&k_aact, "a_act_quant"}, {&k_ares, "a_resid"}, {&k_aconv, "a_conv_mid"}, {&k_aattn, "a_attn"}, {&k_lmconv, "lm_conv_q"}, {&k_lmcst, "lm_conv_state"}, {&k_lmkv, "lm_kv_write"}, {&k_lmpf, "lm_attn_pf"}, {&k_lmdec, "lm_attn_dec"}, {&k_dqkh, "dattn_qk_h"}, {&k_dpvh, "dattn_pv_h"}, {&k_rowf3, "row_fused3"}, {&k_qkvp3, "qkv_post3"}, {&k_attq3, "attention_q3"}, {&k_gmq3, "gelu_mul_q3"},
         {&k_gmvq3, "gelu_mulvec_q3"}, {&k_rnq, "resid_norm_q3"}, {&k_hinq, "head_in_q3"}, {&k_convq, "conv_gate_q3"},
         {&k_siluq, "silu_mul_q8"}, {&k_bactq, "bias_act_q8"}, {&k_badd, "bias_add"}, {&k_score, "score_out"}, {&k_attq4, "attention_q4"}, {&k_attq5, "attention_q5"}, {&k_quantq, "quant_q3"}, {&k_lngq, "ln_gather_q3"}, {&k_dqk, "dattn_qk"}, {&k_dsm, "dattn_stats"}, {&k_dpv, "dattn_pv"}};
     for (auto& k : ks) { *k.k = cl.clCreateKernel(g_prog, k.n, &err); CK(err); }
@@ -1500,6 +1706,23 @@ static bool launch(cl_kernel k, cl_uint dims, const size_t* g, const size_t* l) 
 }
 
 // ---------------------------------------------------------------- weights
+static bool ensure_small(int i) {
+    if (k_gemm_small[i]) return true;
+    static const bool off = getenv("FERRO_GPU_SMALL") && atoi(getenv("FERRO_GPU_SMALL")) == 0;   // FERRO_GPU_SMALL=0: always use the 10-token tile
+    if (!g_ok || off) return false;
+    cl_int err = 0;
+    g_prog_small[i] = cl.clCreateProgramWithSource(g_ctx, 1, &kSrc, nullptr, &err);
+    if (err != CL_SUCCESS) return false;
+    char opts[256];
+    snprintf(opts, sizeof opts, "-cl-std=CL3.0 -DTT=%d -DKB=%d -DMAXS=%d -cl-mad-enable", kSmallTT[i], FERRO_GPU_KB, ATTN_MAXS);
+    if (cl.clBuildProgram(g_prog_small[i], 1, &g_dev, opts, nullptr, nullptr) != CL_SUCCESS) return false;
+    k_gemm_small[i] = cl.clCreateKernel(g_prog_small[i], "q8gemm", &err);
+    if (err != CL_SUCCESS) { k_gemm_small[i] = nullptr; return false; }
+    k_gemv_small[i] = cl.clCreateKernel(g_prog_small[i], "q8gemv", &err);
+    if (err != CL_SUCCESS) k_gemv_small[i] = nullptr;
+    return true;
+}
+
 static bool ensure_kb8() {
     if (k_gemm8) return true;
     if (!g_ok || FERRO_GPU_KB == 8) return false;
@@ -1530,15 +1753,20 @@ int upload_q8(const WMat& W) {
     if (!lws) return -1;
     std::vector<uint32_t> wp((size_t)nb * 8 * rows);
     std::vector<float> ws((size_t)nb * rows);
-    for (int r = 0; r < rows; ++r) {
-        const int8_t* src = W.wq.data() + (size_t)r * cols;
-        for (int b = 0; b < nb; ++b) {
-            for (int k = 0; k < 8; ++k) {
-                uint32_t u; memcpy(&u, src + b * 32 + 4 * k, 4);
-                wp[((size_t)b * 8 + k) * rows + r] = u;
+    {   // repack in 64-row tiles (each thread owns whole tiles): contiguous writes per (block, k) plane, the 32-byte source blocks stay in L1
+        const int ntile = (rows + 63) / 64;
+        Pool::get().parallel_for(ntile, [&](int lo, int hi) {
+            for (int tl = lo; tl < hi; ++tl) {
+                const int r0 = tl * 64, r1 = std::min(rows, r0 + 64);
+                for (int b = 0; b < nb; ++b) {
+                    for (int k = 0; k < 8; ++k) {
+                        uint32_t* dst = &wp[((size_t)b * 8 + k) * rows];
+                        for (int r = r0; r < r1; ++r) memcpy(&dst[r], W.wq.data() + (size_t)r * cols + b * 32 + 4 * k, 4);
+                    }
+                    for (int r = r0; r < r1; ++r) ws[(size_t)b * rows + r] = W.ws[(size_t)r * nb + b];
+                }
             }
-            ws[(size_t)b * rows + r] = W.ws[(size_t)r * nb + b];
-        }
+        });
     }
     std::lock_guard<std::mutex> lk(g_mu);
     Slot s; s.rows = rows; s.cols = cols; s.nb = nb; s.lws = lws; s.kb = kb;
@@ -1578,11 +1806,26 @@ bool op_gemm_q(int slot, int T, Buf Y) {
     const Slot& s = g_slots[slot];
     const bool k8 = s.kb != FERRO_GPU_KB;
     cl_kernel k = use_swizzle(s, T) ? (k8 ? k_gemm_sw8 : k_gemm_sw) : (k8 ? k_gemm8 : k_gemm);
+    int tt = FERRO_GPU_TT;
+    if (T <= 4 && !k8 && !use_swizzle(s, T)) {
+        const int si = small_idx(T);
+        if (ensure_small(si)) {
+            static const bool nogemv = getenv("FERRO_GPU_GEMV") && atoi(getenv("FERRO_GPU_GEMV")) == 0;
+            if (k_gemv_small[si] && !nogemv && (s.rows / 4) % 16 == 0) {                  // split-K GEMV: far more threads than rows/4 lanes
+                set_args(k_gemv_small[si], (Buf)s.wp, (Buf)s.ws, (Buf)g_Xp, (Buf)g_Xs, Y, (cl_int)s.rows, (cl_int)s.cols, (cl_int)T);
+                size_t gv[2] = {(size_t)s.rows / 4, (size_t)8}, lv[2] = {16, 8};
+                return launch(k_gemv_small[si], 2, gv, lv);
+            }
+            k = k_gemm_small[si]; tt = kSmallTT[si];
+        }
+    }
     set_args(k, (Buf)s.wp, (Buf)s.ws, (Buf)g_Xp, (Buf)g_Xs, Y, (cl_int)s.rows, (cl_int)s.cols, (cl_int)T);
-    size_t gg[2] = {(size_t)s.rows / 4, (size_t)((T + FERRO_GPU_TT - 1) / FERRO_GPU_TT)};
+    size_t gg[2] = {(size_t)s.rows / 4, (size_t)((T + tt - 1) / tt)};
     size_t lg[2] = {s.lws, 1};
     return launch(k, 2, gg, lg);
 }
+
+bool warm_small_gemm() { bool ok = true; for (int i = 0; i < 3; ++i) ok = ensure_small(i) && ok; return ok; }
 
 bool ensure_qscratch(int T, int max_cols) {
     return ensure(g_Xp, g_Xpcap, (size_t)T * max_cols) && ensure(g_Xs, g_Xscap, (size_t)T * (max_cols / 32) * 4);
@@ -1857,6 +2100,36 @@ bool op_conv_gate_q(Buf C, Buf prev, Buf next, Buf taps, int T, int d) {
     size_t g[1] = {(size_t)T * (d / 4)}, l[1] = {(size_t)d / 4};
     return launch(k_convq, 1, g, l);
 }
+// ---- LFM2 generative models ----
+bool op_lm_conv_q(Buf C, Buf src1, Buf src2, Buf st, Buf taps, int T, int d) {
+    if (d % 32 || d / 4 > 512) return false;
+    set_args(k_lmconv, C, src1, src2, st, taps, (Buf)g_Xp, (Buf)g_Xs, (cl_int)d);
+    size_t g[1] = {(size_t)T * (d / 4)}, l[1] = {(size_t)d / 4};
+    return launch(k_lmconv, 1, g, l);
+}
+bool op_lm_conv_state(Buf C, Buf st, Buf slot, Buf r1, Buf r2, int ns, int d) {
+    set_args(k_lmcst, C, st, slot, r1, r2, (cl_int)d);
+    size_t g[1] = {(size_t)ns * (d / 4)}, l[1] = {(size_t)d / 4};
+    return launch(k_lmcst, 1, g, l);
+}
+bool op_lm_kv_write(Buf C, int rowc, int koff, Buf KV, Buf dst, int T, int kvw) {
+    if (kvw % 4 || kvw / 4 > 1024) return false;
+    set_args(k_lmkv, C, (cl_int)rowc, (cl_int)koff, KV, dst, (cl_int)kvw);
+    size_t g[1] = {(size_t)T * (kvw / 4)}, l[1] = {(size_t)kvw / 4};
+    return launch(k_lmkv, 1, g, l);
+}
+bool op_lm_attn_pf(Buf C, int ldc, Buf KV, int ldkv, int voff, int kvbase, int nq, int nkv, int pos0, float scale, int T) {
+    set_args(k_lmpf, C, (cl_int)ldc, KV, (cl_int)ldkv, (cl_int)voff, (cl_int)kvbase, (cl_int)nq, (cl_int)nkv, (cl_int)pos0, scale,
+             (Buf)g_Xp, (Buf)g_Xs, (cl_int)T);
+    size_t g[2] = {(size_t)nq * 32, (size_t)((T + 31) / 32)}, l[2] = {32, 1};
+    return launch(k_lmpf, 2, g, l);
+}
+bool op_lm_attn_dec(Buf C, int ldc, Buf KV, int ldkv, int voff, Buf bases, Buf lens, int nq, int nkv, float scale, int B) {
+    set_args(k_lmdec, C, (cl_int)ldc, KV, (cl_int)ldkv, (cl_int)voff, bases, lens, (cl_int)nq, (cl_int)nkv, scale, (Buf)g_Xp, (Buf)g_Xs);
+    size_t g[2] = {(size_t)nq * 64, (size_t)B}, l[2] = {64, 1};
+    return launch(k_lmdec, 2, g, l);
+}
+
 bool op_silu_mul_q(Buf G, int T, int FF) {
     if (FF % 32 || FF / 8 > 1024) return false;
     set_args(k_siluq, G, (cl_int)FF, (Buf)g_Xp, (Buf)g_Xs);
@@ -1941,7 +2214,7 @@ void shutdown() {
     g_Xp = g_Xs = g_hX = g_hY = nullptr;
     for (cl_kernel k : {k_quant, k_gemm, k_gemm_sw, k_rms, k_rope, k_attn, k_gmul, k_gmulv, k_add, k_rowf, k_qkvp, k_attq, k_gmq, k_gmvq,
                         k_attq2, k_gmq2, k_gmvq2, k_rowf3, k_qkvp3, k_attq3, k_gmq3, k_gmvq3,
-                        k_rnq, k_hinq, k_convq, k_siluq, k_bactq, k_badd, k_score, k_attq4, k_attq5, k_quantq, k_lngq, k_dqk, k_dsm, k_dpv, k_qkvg4, k_dqkh, k_dpvh, k_dsmw, k_anq, k_aact, k_ares, k_aconv, k_aattn})
+                        k_rnq, k_hinq, k_convq, k_siluq, k_bactq, k_badd, k_score, k_attq4, k_attq5, k_quantq, k_lngq, k_dqk, k_dsm, k_dpv, k_qkvg4, k_dqkh, k_dpvh, k_dsmw, k_anq, k_aact, k_ares, k_aconv, k_aattn, k_lmconv, k_lmcst, k_lmkv, k_lmpf, k_lmdec})
         if (k) cl.clReleaseKernel(k);
     cl.clReleaseProgram(g_prog); cl.clReleaseCommandQueue(g_q); cl.clReleaseContext(g_ctx);
     g_ok = false;

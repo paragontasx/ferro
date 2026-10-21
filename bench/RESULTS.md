@@ -255,3 +255,62 @@ SLM chunk 32: 43.0; forcing SIMD16 via `intel_reqd_sub_group_size`: same; SIMD8:
 global loads: 117 ms (10 GMAC/s). Occupancy probes (SLM 16/32/48 KB per work-group) change nothing. Conclusion: the 64x64 SLM-staged kernel is
 at the practical plateau for this GPU/driver; a flash-style fusion (no S round trip) is the only remaining structural lever and was not attempted.
 A single work-group needs 310 us, at saturation ~30 us per group: about 10 groups are in flight.
+
+## 2026-10-22: LiquidAI LFM2.5-1.2B-Thinking (generative LFM2) on the iGPU + HTTP serving
+
+Model: `LFM2.5-1.2B-Thinking-Q8_0.gguf` (arch `lfm2`, causal; 16 blocks = 10 short-conv + 6 GQA attention (32 q / 8 kv heads, hd 64), d 2048, ffn 8192, vocab 65536, tied head).
+llama.cpp reference: same Q8_0 file (CPU, 2 threads) and the F16 GGUF as the high-precision oracle. All numbers N100, nothing else running.
+
+### Speed
+| | ferro iGPU | llama.cpp CPU |
+|---|---|---|
+| prefill 6 / 192 / 762 / 1522 tokens | 11 (warm-up) / 158 / 153 / 134 tok/s | 11.2 tok/s (767 tokens) |
+| decode, 1 stream | 15-19 tok/s (`generate` 15-17; HTTP stream 19.1 in the last run, 13.5-15 in earlier ones) | 6.1 tok/s |
+| decode aggregate, server, 1 / 2 / 4 concurrent streams (final build) | 18.3 / 22.2 / 34.5 tok/s (per stream 19.1 / 11.7 / 9.7) | |
+
+Decode progression: 9.2-9.6 tok/s with the batch-tiled GEMM (a 10-token tile at 1 token wastes ~90% of the DP4A work; per-op synced profile: GEMM = 70% of the step) ->
+**14.3-15** with 1/2/4-token tile variants of the same GEMM kernel (`FERRO_GPU_SMALL=0` to disable). A split-K GEMV
+(`q8gemv`: 16 row-groups x 8 k-splits per work-group, SLM reduce; more threads for the 2048-row matrices) gave **no gain** (14.86 -> 14.99 tok/s, logits cos 1.0): by then
+the step is bandwidth-bound. Enqueue time is 4 ms of a 53 ms step, so it is not launch-bound either. A pure streaming-read OpenCL kernel on this iGPU tops out at
+**25.9 GB/s**; decode moves 1.17 GB/token (1.03 GB layers + 0.13 GB tied head) in 53 ms = 22 GB/s = 85% of that. Only a smaller weight format (Q4) can go meaningfully faster.
+Remaining host cost per token ~10 ms (top-k selection over 65536 logits, 256 KB readback, embedding gather).
+Startup: 20-37 s -> 16 s for LM + EG2 (parallel 64-row-tile weight repack: LM load 10.4 -> 5.8 s; the 1/2/4-token GEMM variants are built at load, not on first use - the
+first request used to pay a ~1 s JIT stall).
+
+### Accuracy (what looked like a bug and was not)
+`scripts/lm_parity.py`, 12 prompts, next-token distribution, reference = llama.cpp **F16**:
+| candidate | top-1 agree | mean TV (top-20, renormalised) |
+|---|---|---|
+| llama.cpp Q8_0 (noise floor) | 12/12 | 0.0200 (max 0.065) |
+| **ferro iGPU (int8 activations)** | **12/12** | **0.0198** |
+Hidden-state check with truncated GGUFs (first N blocks, `gguf_trunc.py`), per-token relative L2 of the final normed hidden state, mean over 6 tokens:
+| blocks | llama.cpp Q8 vs F16 | ferro CPU (fp32 act.) vs F16 | ferro CPU vs llama.cpp Q8 |
+|---|---|---|---|
+| 3 | 1.88% | **1.06%** | 1.61% |
+| 8 | 2.62% | **1.36%** | 2.11% |
+So ferro is closer to the F16 oracle than llama.cpp's own int8-activation path; the "2-4% deviation from llama.cpp" seen first was llama.cpp's noise. Things that were ruled out by
+experiment (each variant scored 3-30x worse on the same metric, so the shipped wiring is the right one): reversed conv taps (113% error), swapping only the two history taps (70%),
+RoPE before the q/k norm (30%), interleaved RoPE pairs (11%); F32 KV + no flash-attention in llama.cpp changes nothing (attention numerics are not the source); int8 activations double ferro's
+own error (2.4% -> 5.2% vs F16) but the pipeline is still at llama.cpp's level.
+Lessons: (1) llama-server adds BOS itself - a `<|startoftext|>` in the prompt gives it a doubled BOS and a different input (that alone produced a spurious 6x worse TV);
+(2) always calibrate against the reference's own quantisation noise before calling a deviation a bug; (3) bisect by layer count with truncated GGUFs, not by guessing.
+Chat template: byte-identical to llama.cpp's jinja (`/apply-template`) for system / multi-turn / `<think>` stripping / tools; one real difference found and fixed - multi-part text content is joined with "\n".
+
+### Server (`scripts/test_serve_lm.py`, `scripts/test_serve.py`: all pass)
+Continuous batching over device slots: each slot = per-attention-layer KV rows + 2-token conv state; prefill is chunked (`FERRO_LM_TMAX`, default 1024 rows) and uses the causal tiled kernel,
+decode runs all active sequences in one pass. Prefill of a new request is serialised in front of decode steps (TTFT 0.19 s alone, 0.40 s with 2 and 0.89 s with 4 simultaneous new requests, final build; it was 1.2-1.6 s before the decode GEMM variants were pre-built at load).
+Embedding jobs run between decode steps: 0.12 s when idle-adjacent, up to ~1.8 s when they land behind a prefill.
+
+### Memory (this container is capped at 4 GiB; cgroup `memory.max`)
+iGPU buffers are system RAM and count as shmem. Measured: `--lm` 4 slots x 4096: anon 0.6 GB + device 1.8 GB; 1 slot: 1.5 GB device; `--model --mmproj`: anon 1.6 GB + device 0.8 GB;
+EG2 text only: anon 0.9 GB + device 0.2 GB. The first combined server (4 x 8192 KV, host weight copies kept) was **OOM-killed 3 times** (cgroup `oom_kill` counter) by the test
+suite spawning a second model process. Fixes: free the host copy of the device-resident LM weights after upload (-1.2 GB, no CPU fallback for that instance, `FERRO_LM_KEEP_HOST=1` keeps it),
+default `--lm-ctx 4096`, the server prints the KV size and warns near the container limit; CLI-spawning tests use `--no-cli` against a loaded server.
+
+### Regression (after all of the above)
+`make test` (kernels incl. iGPU GEMM, decision, media) ALL PASS; EG2 multimodal parity 12/12, worst cosine 0.99930 (gate 0.999); d1 media parity 12/12 token counts equal, 18/18 top answers;
+EG2 headline 218.6 ms (A/B with the small-tile GEMM off: 218.5 ms); d1 `bench` 510-524 tok/s with and without it.
+
+### Not done / limits
+Q4 weight path (decode is bandwidth-bound: ~2x); prefix caching for multi-turn chat (conv state is only valid at the end of a sequence - needs a snapshot at the end of the prompt);
+tool-call parsing of model output; `n > 1`, logprobs; sampling is on the host (~10 ms/token); 1522-token prefill drops to 134 tok/s (attention); the CPU reference decodes at ~0.5 tok/s.
