@@ -42,7 +42,8 @@ bool op_gemm(int slot, Buf X, int T, Buf Y);                // Y[T x rows] = X[T
 
 // ---- fused path: producers write the int8 GEMM input (shared scratch) directly ----
 bool ensure_qscratch(int T, int max_cols);
-bool warm_small_gemm();   // build the 1/2/4-token decode GEMM variants now instead of on first use
+bool warm_small_gemm(int n = 3);   // build the 1/2/4(/8)-token decode GEMM variants now instead of on first use
+void set_row_policy(int p);         // 0 auto; 1 rows (GEMV for any row count: batch-invariant decode); 2 tile (tile GEMM for any row count: chunk-invariant prefill)
 bool op_gemm_q(int slot, int T, Buf Y);                     // GEMM on the current quantized scratch
 // y = ((R?R:0) + (D? rms(D)*wd : 0))*scale -> OUT (if OUT); then quantize (norm_q ? rms(y)*wq : y) if do_q
 bool op_row_fused(Buf R, Buf D, Buf wd, float scale, Buf OUT, Buf wq, bool norm_q, bool do_q, int T, int cols, float eps);

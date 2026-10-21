@@ -71,7 +71,9 @@ public:
     void reset(LmSeq& s) const;
     // Advance every sequence by its tokens (toks[i][0..n[i]) are appended after s[i]->n_past) and return the logits of each sequence's
     // LAST token: logits[i * n_vocab ...]. Prefill (n large) and decode (n == 1) steps can be mixed in one call.
-    bool step(const std::vector<LmSeq*>& seqs, const std::vector<const int*>& toks, const std::vector<int>& n, float* logits, std::string* err);
+    // force_prefill: a 1-token entry is a prefill tail, not a decode step (it then uses the prefill kernels, so chunking never changes the bits).
+    bool step(const std::vector<LmSeq*>& seqs, const std::vector<const int*>& toks, const std::vector<int>& n, float* logits, std::string* err,
+              bool force_prefill = false);
     bool on_gpu() const;
     // Prefix caching (iGPU path only; null / false on the CPU path). snapshot: copy the state of `s` after s.n_past tokens; restore: make `s`
     // (taking a device slot if it has none) continue from a snapshot, so only the tokens after it need prefill. Exact: causal state only.
@@ -83,7 +85,8 @@ private:
     LmModel m_;
     int max_ctx_ = 0, n_slots_ = 1;
     std::shared_ptr<Impl> impl_;
-    bool forward_gpu(const std::vector<LmSeq*>& seqs, const std::vector<const int*>& toks, const std::vector<int>& n, float* logits, std::string* err);
+    bool forward_gpu(const std::vector<LmSeq*>& seqs, const std::vector<const int*>& toks, const std::vector<int>& n, float* logits, std::string* err,
+                     bool force_prefill = false);
     void forward_cpu(const std::vector<LmSeq*>& seqs, const std::vector<const int*>& toks, const std::vector<int>& n, float* logits);
 };
 

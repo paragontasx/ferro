@@ -344,14 +344,14 @@ static void gen_start(Server& S, const std::shared_ptr<GenJob>& jp) {
     }
     try {
         for (int c : cuts) {                                                        // prefill up to each boundary, leave a snapshot, go on
-            ok = ok && S.lm.step({&j.seq}, {j.prompt.data() + pos}, {c - pos}, S.lg.data(), &err);
+            ok = ok && S.lm.step({&j.seq}, {j.prompt.data() + pos}, {c - pos}, S.lg.data(), &err, true);
             if (!ok) break;
             pos = c;
             const auto ts = clk::now();
             pc_store(S, j.prompt, S.lm.snapshot(j.seq));
             if (getenv("FERRO_PC_DEBUG")) { gpu_sync_for_debug(); fprintf(stderr, "[prefix] snapshot of %d tokens took %.1f ms (alloc+copy, synced)\n", c, ms_since(ts)); }
         }
-        if (ok) ok = S.lm.step({&j.seq}, {j.prompt.data() + pos}, {n - pos}, S.lg.data(), &err);
+        if (ok) ok = S.lm.step({&j.seq}, {j.prompt.data() + pos}, {n - pos}, S.lg.data(), &err, true);
     } catch (const std::exception& e) { err = e.what(); ok = false; }
     j.prompt_ms = ms_since(t0);
     if (!ok) { gen_finish(S, jp, (err.empty() ? "prefill failed" : err).c_str()); return; }

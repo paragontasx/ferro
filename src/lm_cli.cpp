@@ -35,7 +35,7 @@ int run_generate(const GenArgs& a) {
             std::vector<int> pi = tok.tokenize("<|startoftext|>" + arr.arr[i].s, true);
             LmSeq sq; eng.reset(sq);
             auto t1 = clk::now();
-            if (!eng.step({&sq}, {pi.data()}, {(int)pi.size()}, lg.data(), &err)) { fprintf(stderr, "prompt %zu failed: %s\n", i, err.c_str()); return 1; }
+            if (!eng.step({&sq}, {pi.data()}, {(int)pi.size()}, lg.data(), &err, true)) { fprintf(stderr, "prompt %zu failed: %s\n", i, err.c_str()); return 1; }
             eng.release(sq);
             fprintf(stderr, "[lm] prompt %zu: %zu tokens, prefill %.3fs (%.0f tok/s)\n", i, pi.size(), secs(t1), pi.size() / secs(t1));
             FILE* o = fopen((a.dump_logits + "." + std::to_string(i) + ".bin").c_str(), "wb"); if (o) { fwrite(lg.data(), 4, lg.size(), o); fclose(o); }
@@ -68,7 +68,7 @@ int run_generate(const GenArgs& a) {
         const int N = (int)ids.size(), V = eng.n_vocab();
         std::vector<float> ref(V), cur(V);
         LmSeq s0; eng.reset(s0);
-        eng.step({&s0}, {ids.data()}, {N}, ref.data(), &err);
+        eng.step({&s0}, {ids.data()}, {N}, ref.data(), &err, true);
         eng.release(s0);
         auto cmp = [&](const char* name, const std::vector<float>& o) {
             double dot = 0, na = 0, nb = 0, mx = 0; int am = 0, bm = 0;
@@ -78,8 +78,8 @@ int run_generate(const GenArgs& a) {
         for (int split : {1, 2, 3, N / 2}) {
             if (split <= 0 || split >= N) continue;
             LmSeq s1; eng.reset(s1);
-            eng.step({&s1}, {ids.data()}, {split}, cur.data(), &err);
-            eng.step({&s1}, {ids.data() + split}, {N - split}, cur.data(), &err);
+            eng.step({&s1}, {ids.data()}, {split}, cur.data(), &err, true);
+            eng.step({&s1}, {ids.data() + split}, {N - split}, cur.data(), &err, true);
             eng.release(s1);
             char nm[64]; snprintf(nm, sizeof nm, "prefill %d + prefill %d", split, N - split); cmp(nm, cur);
         }
@@ -91,19 +91,19 @@ int run_generate(const GenArgs& a) {
         for (int split : {2, N / 2, N - 1}) {
             if (split <= 1 || split >= N || eng.n_slots() < 2) continue;
             LmSeq a; eng.reset(a);
-            eng.step({&a}, {ids.data()}, {split}, cur.data(), &err);
+            eng.step({&a}, {ids.data()}, {split}, cur.data(), &err, true);
             auto px = eng.snapshot(a);
             if (!px) { fprintf(stderr, "[selfcheck] snapshot unavailable (CPU path?)\n"); break; }
             LmSeq pad; eng.reset(pad);                                        // occupy slot 0/1 differently so the restore lands in a different slot
             LmSeq b; b.n_past = 0;
             if (!eng.restore(b, *px)) { fprintf(stderr, "[selfcheck] restore failed\n"); return 1; }
-            eng.step({&b}, {ids.data() + split}, {N - split}, cur.data(), &err);
+            eng.step({&b}, {ids.data() + split}, {N - split}, cur.data(), &err, true);
             char nm[64]; snprintf(nm, sizeof nm, "restore@%d (slot %d->%d) + prefill", split, a.gpu_slot, b.gpu_slot); cmp(nm, cur);
             // the snapshot must be unaffected by what the donor did afterwards, and reusable: restore again after the donor advanced
-            eng.step({&a}, {ids.data() + split}, {N - split}, cur.data(), &err);
+            eng.step({&a}, {ids.data() + split}, {N - split}, cur.data(), &err, true);
             eng.release(b);
             LmSeq c; if (!eng.restore(c, *px)) { fprintf(stderr, "[selfcheck] 2nd restore failed\n"); return 1; }
-            eng.step({&c}, {ids.data() + split}, {N - split}, cur.data(), &err);
+            eng.step({&c}, {ids.data() + split}, {N - split}, cur.data(), &err, true);
             snprintf(nm, sizeof nm, "restore@%d again (donor advanced)", split); cmp(nm, cur);
             const int nxt = 1098;                                              // one decode step after the restored prefill == after the donor's
             std::vector<float> d1(V), d2(V);
@@ -118,7 +118,7 @@ int run_generate(const GenArgs& a) {
     std::vector<float> logits((size_t)eng.n_vocab());
     auto tp = clk::now();
     const int n0 = (int)ids.size();
-    if (!eng.step({&seq}, {ids.data()}, {n0}, logits.data(), &err)) { fprintf(stderr, "prefill failed: %s\n", err.c_str()); return 1; }
+    if (!eng.step({&seq}, {ids.data()}, {n0}, logits.data(), &err, true)) { fprintf(stderr, "prefill failed: %s\n", err.c_str()); return 1; }
     const double t_pre = secs(tp);
     if (!a.dump_logits.empty()) { FILE* f = fopen(a.dump_logits.c_str(), "wb"); if (f) { fwrite(logits.data(), 4, logits.size(), f); fclose(f); } }
 

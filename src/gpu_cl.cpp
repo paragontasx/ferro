@@ -1518,7 +1518,7 @@ __kernel void lm_attn_dec(__global const float* C, int ldc, __global const float
   A.s3 = dot_acc_sat_4x8packed_ss_int(w[K].s3, XV, A.s3);
 __kernel void q8gemv(__global const uint* restrict Wp, __global const float* restrict Ws,
                      __global const uint* restrict Xp, __global const float* restrict Xs,
-                     __global float* restrict Y, int rows, int cols, int T) {
+                     __global float* restrict Y, int rows, int cols, int T, int t0) {
   __local float4 red[SKV * TT * LXV];
   const int lx = get_local_id(0), sk = get_local_id(1);
   const int R4 = rows >> 2, gx = get_group_id(0) * LXV + lx;
@@ -1533,7 +1533,7 @@ __kernel void q8gemv(__global const uint* restrict Wp, __global const float* res
     for (int k = 0; k < 8; ++k) w[k] = Wb[(size_t)(b * 8 + k) * R4];
     const float4 ws = Sb[(size_t)b * R4];
     for (int j = 0; j < TT; ++j) {
-      const int t = min(j, T - 1);
+      const int t = t0 + min(j, T - 1);
       const __global uint4* xp = (const __global uint4*)(Xp + (size_t)t * cw + b * 8);
       const uint4 xa = xp[0], xb = xp[1];
       int4 s = (int4)(0);
@@ -1548,7 +1548,7 @@ __kernel void q8gemv(__global const uint* restrict Wp, __global const float* res
     for (int j = 0; j < TT; ++j) {
       float4 a = red[j * LXV + lx];
       for (int q = 1; q < SKV; ++q) a += red[(q * TT + j) * LXV + lx];
-      if (j < T) vstore4(a, 0, Y + (size_t)j * rows + gx * 4);
+      if (j < T) vstore4(a, 0, Y + (size_t)(t0 + j) * rows + gx * 4);
     }
   }
 }
@@ -1699,10 +1699,11 @@ static cl_kernel k_gemm8 = nullptr, k_gemm_sw8 = nullptr;
 static cl_device_id g_dev = nullptr;
 static bool ensure_kb8();
 // decode-sized GEMM variants: the same kernel built with a 1/2/4-token tile (the default 10-token tile wastes ~90% of its DP4A work at T=1)
-static cl_program g_prog_small[3] = {nullptr, nullptr, nullptr};
-static cl_kernel k_gemm_small[3] = {nullptr, nullptr, nullptr}, k_gemv_small[3] = {nullptr, nullptr, nullptr}, k_gemvp_small[3] = {nullptr, nullptr, nullptr};
+static cl_program g_prog_small[4] = {nullptr, nullptr, nullptr, nullptr};
+static cl_kernel k_gemm_small[4] = {nullptr, nullptr, nullptr, nullptr}, k_gemv_small[4] = {nullptr, nullptr, nullptr, nullptr}, k_gemvp_small[4] = {nullptr, nullptr, nullptr, nullptr};
 static int small_idx(int T) { return T <= 1 ? 0 : T <= 2 ? 1 : 2; }
-static const int kSmallTT[3] = {1, 2, 4};
+static const int kSmallTT[4] = {1, 2, 4, 8};
+static int g_row_policy = 0;    // 0 auto, 1 rows (decode: GEMV for every row count), 2 tile (prefill: tile kernel for every row count)
 static bool ensure_small(int i);
 static cl_kernel k_quant = nullptr, k_gemm = nullptr, k_gemm_sw = nullptr, k_rms = nullptr, k_rope = nullptr, k_attn = nullptr,
                  k_gmul = nullptr, k_gmulv = nullptr, k_add = nullptr,
@@ -1935,18 +1936,34 @@ static bool use_swizzle(const Slot& s, int T) {
     return (size_t)s.rows * s.cols >= ((size_t)1 << 20) && (T + FERRO_GPU_TT - 1) / FERRO_GPU_TT >= 8;
 }
 
+void set_row_policy(int p) { g_row_policy = p; }
+
 bool op_gemm_q(int slot, int T, Buf Y) {
     if (slot < 0 || slot >= (int)g_slots.size()) return false;
     const Slot& s = g_slots[slot];
     const bool k8 = s.kb != FERRO_GPU_KB;
+    static const bool nogemv = getenv("FERRO_GPU_GEMV") && atoi(getenv("FERRO_GPU_GEMV")) == 0;
+    // Rows policy: every row goes through the split-K GEMV, whose per-row arithmetic does not depend on how many rows
+    // share the launch, so a stream decodes to the same bits alone or in a batch. More than 8 rows run as 8-row passes.
+    if (g_row_policy == 1 && !k8 && !nogemv && (s.rows / 4) % 16 == 0) {
+        bool ok = true;
+        for (int t0 = 0; t0 < T && ok; t0 += 8) {
+            const int n = std::min(8, T - t0), si = n <= 1 ? 0 : n <= 2 ? 1 : n <= 4 ? 2 : 3;
+            if (!ensure_small(si) || !k_gemv_small[si]) return false;
+            set_args(k_gemv_small[si], (Buf)s.wp, (Buf)s.ws, (Buf)g_Xp, (Buf)g_Xs, Y, (cl_int)s.rows, (cl_int)s.cols, (cl_int)n, (cl_int)t0);
+            size_t gv[2] = {(size_t)s.rows / 4, (size_t)8}, lv[2] = {16, 8};
+            ok = launch(k_gemv_small[si], 2, gv, lv);
+        }
+        return ok;
+    }
+    const bool tile_only = g_row_policy == 2;
     cl_kernel k = use_swizzle(s, T) ? (k8 ? k_gemm_sw8 : k_gemm_sw) : (k8 ? k_gemm8 : k_gemm);
     int tt = FERRO_GPU_TT;
-    if (T <= 4 && !k8 && !use_swizzle(s, T)) {
+    if (T <= 4 && !k8 && !tile_only && !use_swizzle(s, T)) {
         const int si = small_idx(T);
         if (ensure_small(si)) {
-            static const bool nogemv = getenv("FERRO_GPU_GEMV") && atoi(getenv("FERRO_GPU_GEMV")) == 0;
             if (k_gemv_small[si] && !nogemv && (s.rows / 4) % 16 == 0) {                  // split-K GEMV: far more threads than rows/4 lanes
-                set_args(k_gemv_small[si], (Buf)s.wp, (Buf)s.ws, (Buf)g_Xp, (Buf)g_Xs, Y, (cl_int)s.rows, (cl_int)s.cols, (cl_int)T);
+                set_args(k_gemv_small[si], (Buf)s.wp, (Buf)s.ws, (Buf)g_Xp, (Buf)g_Xs, Y, (cl_int)s.rows, (cl_int)s.cols, (cl_int)T, (cl_int)0);
                 size_t gv[2] = {(size_t)s.rows / 4, (size_t)8}, lv[2] = {16, 8};
                 return launch(k_gemv_small[si], 2, gv, lv);
             }
@@ -1987,7 +2004,7 @@ bool op_gemv_pro(int slot, int T, Buf Y, int mode, Buf A, Buf B, Buf wn, Buf Xo,
     return launch(k, 2, gv, lv);
 }
 
-bool warm_small_gemm() { bool ok = true; for (int i = 0; i < 3; ++i) ok = ensure_small(i) && ok; return ok; }
+bool warm_small_gemm(int n) { bool ok = true; for (int i = 0; i < n && i < 4; ++i) ok = ensure_small(i) && ok; return ok; }
 
 bool ensure_qscratch(int T, int max_cols) {
     return ensure(g_Xp, g_Xpcap, (size_t)T * max_cols) && ensure(g_Xs, g_Xscap, (size_t)T * (max_cols / 32) * 4);

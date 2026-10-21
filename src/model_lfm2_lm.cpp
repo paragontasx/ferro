@@ -158,7 +158,7 @@ static bool gpu_setup(LmEngine::Impl& in, LmModel& m, int max_ctx, int n_slots) 
     g.out_norm = up(m.out_norm); g.cosb = up(m.rope.cosb); g.sinb = up(m.rope.sinb);
     std::vector<float> z(2 * (size_t)d, 0.0f);
     g.zero = up(z);
-    gpu::warm_small_gemm();
+    gpu::warm_small_gemm(4);
     g.slots = n_slots; g.cap = max_ctx;
     g.Tmax = std::min(max_ctx, getenv("FERRO_LM_TMAX") ? atoi(getenv("FERRO_LM_TMAX")) : 1024);
     g.max_ns = std::max(n_slots, 1);
@@ -203,6 +203,9 @@ static bool lm_dup(const char* name) {            // FERRO_LM_DUP=a,b: launch th
 // One forward over `T` rows. Prefill (pf): rows are consecutive tokens of one sequence (positions pos0..), decode: one row per sequence.
 static bool gpu_forward(LmEngine::Impl& in, const LmModel& m, const std::vector<int>& ids, const std::vector<LmSeq*>& seqs, bool pf, int pos0, float* logits,
                         std::string* err) {
+    // Decode rows always use the split-K GEMV and prefill rows always use the tile GEMM, so a row's arithmetic does not
+    // depend on how many other rows share the launch (batch- and chunk-invariant; FERRO_ROW_POLICY=0 restores the old mix).
+    struct Policy { Policy(int p) { static const char* e = getenv("FERRO_ROW_POLICY"); gpu::set_row_policy(e && atoi(e) == 0 ? 0 : p); } ~Policy() { gpu::set_row_policy(0); } } policy_guard(pf ? 2 : 1);
     auto& g = in.g;
     const int d = m.n_embd, hd = m.head_dim, nq = m.n_head, nkv = m.n_kv, ff = m.n_ff, T = (int)ids.size(), ns = (int)seqs.size();
     const int qsz = nq * hd, ksz = nkv * hd, kvw = 2 * ksz, rowc = qsz + kvw;
@@ -388,7 +391,8 @@ bool LmEngine::restore(LmSeq& s, const LmPrefix& p) const {
     return ok;
 }
 
-bool LmEngine::step(const std::vector<LmSeq*>& seqs, const std::vector<const int*>& toks, const std::vector<int>& n, float* logits, std::string* err) {
+bool LmEngine::step(const std::vector<LmSeq*>& seqs, const std::vector<const int*>& toks, const std::vector<int>& n, float* logits, std::string* err,
+                    bool force_prefill) {
     int T = 0;
     for (size_t i = 0; i < seqs.size(); ++i) {
         if (n[i] <= 0) { if (err) *err = "empty token span"; return false; }
@@ -397,7 +401,7 @@ bool LmEngine::step(const std::vector<LmSeq*>& seqs, const std::vector<const int
     }
     if (impl_->g.ok) {
         for (LmSeq* s : seqs) if (s->gpu_slot < 0) { if (err) *err = "sequence has no device slot (call reset first)"; return false; }
-        if (forward_gpu(seqs, toks, n, logits, err)) { for (size_t i = 0; i < seqs.size(); ++i) seqs[i]->n_past += n[i]; return true; }
+        if (forward_gpu(seqs, toks, n, logits, err, force_prefill)) { for (size_t i = 0; i < seqs.size(); ++i) seqs[i]->n_past += n[i]; return true; }
         return false;
     }
     for (LmSeq* s : seqs) if ((int)s->conv.size() != m_.n_conv_layers) reset(*s);
@@ -406,12 +410,13 @@ bool LmEngine::step(const std::vector<LmSeq*>& seqs, const std::vector<const int
     return true;
 }
 
-bool LmEngine::forward_gpu(const std::vector<LmSeq*>& seqs, const std::vector<const int*>& toks, const std::vector<int>& n, float* logits, std::string* err) {
+bool LmEngine::forward_gpu(const std::vector<LmSeq*>& seqs, const std::vector<const int*>& toks, const std::vector<int>& n, float* logits, std::string* err,
+                           bool force_prefill) {
     Impl& in = *impl_;
     const int V = m_.n_vocab;
     std::vector<size_t> dec;                                           // single-token sequences are batched into one decode pass
     for (size_t i = 0; i < seqs.size(); ++i) {
-        if (n[i] == 1) { dec.push_back(i); continue; }
+        if (n[i] == 1 && !force_prefill) { dec.push_back(i); continue; }
         for (int off = 0; off < n[i]; off += in.g.Tmax) {              // prefill in chunks (each attends over the KV written so far)
             const int c = std::min(in.g.Tmax, n[i] - off);
             std::vector<int> ids(toks[i] + off, toks[i] + off + c);
