@@ -38,7 +38,7 @@ static void usage() {
         "                   (multimodal EmbeddingGemma 2: items are interleaved in order into one 768-d embedding; vision/audio encoders on the iGPU)\n"
         "       ferro-embed generate --lm LFM2.5.gguf (--prompt TEXT | --messages f.json) [--n-predict N] [--temp T] [--top-k K] [--rep-penalty P] [--seed S]\n"
         "                   (text generation with an LFM2 / LFM2.5 model, e.g. LFM2.5-1.2B-Thinking; chat template + sampler built in)\n"
-        "       ferro-embed serve [--model EG2.gguf [--mmproj P.gguf]] [--lm LFM2.5.gguf [--lm-ctx N] [--lm-slots N] [--prefix-cache-mb N] [--reasoning-format deepseek|none]] [--d1 d1-omni.gguf [--d1-mmproj P.gguf]] [--host H] [--port P] [--api-key K]\n"
+        "       ferro-embed serve [--model EG2.gguf [--mmproj P.gguf]] [--lm LFM2.5.gguf [--lm-ctx N] [--lm-slots N] [--prefix-cache-mb N] [--prefill-slice-ms N] [--decode-share N] [--reasoning-format deepseek|none]] [--d1 d1-omni.gguf [--d1-mmproj P.gguf]] [--host H] [--port P] [--api-key K]\n"
         "       (old form follows)  ferro-embed serve --model EG2.gguf [--mmproj P.gguf] [--host H] [--port N] [--api-key K] [--max-batch-tokens N] [--batch-wait-ms N]\n"
         "                   (resident OpenAI-compatible server: POST /v1/embeddings with text / image_url / input_audio / video_url parts, GET /v1/models, GET /health)\n"
         "       ferro-embed mm-embed --mmproj P.gguf --media image|audio --out f.bin     (per-chunk encoder output, mm_ref format)\n"
@@ -230,6 +230,8 @@ int main(int argc, char** argv) {
         else if (a == "--lm-ctx") so.lm_ctx = atoi(next("--lm-ctx"));
         else if (a == "--lm-slots") so.lm_slots = atoi(next("--lm-slots"));
         else if (a == "--prefix-cache-mb") so.prefix_cache_mb = atoi(next("--prefix-cache-mb"));
+        else if (a == "--prefill-slice-ms") so.prefill_slice_ms = std::max(20, atoi(next("--prefill-slice-ms")));
+        else if (a == "--decode-share") so.decode_share = std::min(90, std::max(1, atoi(next("--decode-share"))));
         else if (a == "--prefix-min-tokens") so.prefix_min_tokens = atoi(next("--prefix-min-tokens"));
         else if (a == "--lm-name") so.lm_name = next("--lm-name");
         else if (a == "--reasoning-format") so.reasoning_format = next("--reasoning-format");

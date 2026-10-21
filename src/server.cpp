@@ -166,6 +166,7 @@ struct GenJob {
     bool cache_prompt = true;                     // request field (llama.cpp name): false = neither use nor create prefix-cache entries
     int prefix_hint = 0;                          // tokens of the system message when it is an exact prefix of the prompt (a natural cache boundary)
     int cached = 0;                               // prompt tokens restored from the prefix cache instead of prefilled
+    int pf_pos = 0; std::vector<int> pf_cuts; bool pc_on = false; double pf_ms = 0;   // resumable prefill: next prompt position, snapshot boundaries still to leave, compute time so far
     int next = 0, n_gen = 0, mode = 0;            // mode: 0 = content, 1 = reasoning (inside <think>)
     std::string pend;                             // decoded text not yet emitted (incomplete UTF-8 / possible stop-string prefix)
     double prompt_ms = 0, gen_ms = 0;
@@ -207,7 +208,9 @@ struct Server {
     std::string lm_name; int think_open = -1, think_close = -1, eos_id = 7;
     std::deque<std::shared_ptr<GenJob>> gq;       // waiting for a slot (guarded by qm)
     std::vector<std::shared_ptr<GenJob>> active;  // worker only
-    std::atomic<int> n_active{0};
+    std::deque<std::shared_ptr<GenJob>> prefilling;   // worker only: prompts being filled slice by slice (each holds a slot)
+    std::atomic<int> n_active{0}, n_prefill{0};
+    double pf_rate = 0;                           // measured prefill tokens/s (EMA), sizes the slices
     std::vector<float> lg;                        // worker only: logits [slots][vocab]
     // prompt-prefix cache (worker only, except the atomics)
     std::vector<PrefixEntry> pcache; size_t pc_bytes = 0; uint64_t pc_tick = 0;
@@ -314,19 +317,17 @@ static void pc_store(Server& S, const std::vector<int>& prompt, std::shared_ptr<
 }
 
 static void gpu_sync_for_debug() { gpu::finish(); }
-static void gen_start(Server& S, const std::shared_ptr<GenJob>& jp) {
+// Start a request: take a slot, restore the longest cached prefix, plan where to leave snapshots. The prompt is then filled slice by
+// slice (gen_prefill_chunk) so decode streams, d1 requests and embeddings are served in between instead of waiting for the whole prompt.
+static void gen_begin(Server& S, const std::shared_ptr<GenJob>& jp) {
     GenJob& j = *jp;
-    const int V = S.lm.n_vocab();
     j.t_gen0 = clk::now();
     S.lm.reset(j.seq);
-    std::string err;
-    const auto t0 = clk::now();
     const int n = (int)j.prompt.size();
-    bool ok = true;
     int pos = 0;
-    const bool pc_on = S.o.prefix_cache_mb > 0 && j.cache_prompt && S.lm.on_gpu();
+    j.pc_on = S.o.prefix_cache_mb > 0 && j.cache_prompt && S.lm.on_gpu();
     std::vector<int> cuts;                                                          // where to leave a new cache entry behind while prefilling
-    if (pc_on) {
+    if (j.pc_on) {
         if (PrefixEntry* e = pc_longest(S, j.prompt)) {
             if (S.lm.restore(j.seq, *e->px)) { pos = e->px->n; e->used = ++S.pc_tick; S.pc_hits++; S.pc_saved += (uint64_t)pos; }
             else S.lm.reset(j.seq);                                                // a failed restore may have left partial conv state: start clean
@@ -342,40 +343,55 @@ static void gen_start(Server& S, const std::shared_ptr<GenJob>& jp) {
         }
         std::sort(cuts.begin(), cuts.end());
     }
-    try {
-        for (int c : cuts) {                                                        // prefill up to each boundary, leave a snapshot, go on
-            ok = ok && S.lm.step({&j.seq}, {j.prompt.data() + pos}, {c - pos}, S.lg.data(), &err, true);
-            if (!ok) break;
-            pos = c;
+    j.pf_pos = pos; j.pf_cuts = cuts; j.pf_ms = 0;
+    S.prefilling.push_back(jp); S.n_prefill = (int)S.prefilling.size();
+}
+static bool other_work_waiting(Server& S) {
+    std::lock_guard<std::mutex> lk(S.qm);
+    return !S.q.empty() || !S.dq.empty() || !S.gq.empty();
+}
+// Advance the oldest prefilling prompt by one slice; when it is complete, sample its first token and let it join the decode batch.
+static void gen_prefill_chunk(Server& S) {
+    const int V = S.lm.n_vocab();
+    std::shared_ptr<GenJob> jp = S.prefilling.front(); S.prefilling.pop_front();
+    GenJob& j = *jp;
+    auto upd = [&] { S.n_prefill = (int)S.prefilling.size(); };
+    if (j.cancelled || S.stop) { gen_finish(S, jp); upd(); return; }
+    const int n = (int)j.prompt.size();
+    // slice size: everything at once when nothing else is waiting (best throughput), else what fits the time slice at the measured rate
+    int end = n;
+    if (!S.active.empty() || other_work_waiting(S)) {
+        const double rate = S.pf_rate > 0 ? S.pf_rate : 300.0;
+        end = std::min(n, j.pf_pos + std::max(64, std::min(1024, (int)(rate * S.o.prefill_slice_ms / 1000.0))));
+    }
+    for (int c : j.pf_cuts) if (c > j.pf_pos && c < end) end = c;                    // never step over a snapshot boundary
+    std::string err; bool ok = true;
+    const auto t0 = clk::now();
+    try { ok = S.lm.step({&j.seq}, {j.prompt.data() + j.pf_pos}, {end - j.pf_pos}, S.lg.data(), &err, true); } catch (const std::exception& e) { err = e.what(); ok = false; }
+    const double ms = ms_since(t0);
+    if (!ok) { gen_finish(S, jp, (err.empty() ? "prefill failed" : err).c_str()); upd(); return; }
+    if (end - j.pf_pos >= 48 && ms > 0) { const double r = (end - j.pf_pos) * 1000.0 / ms; S.pf_rate = S.pf_rate > 0 ? 0.6 * S.pf_rate + 0.4 * r : r; }
+    j.pf_ms += ms; j.pf_pos = end;
+    if (end < n) {
+        if (std::find(j.pf_cuts.begin(), j.pf_cuts.end(), end) != j.pf_cuts.end()) {   // reached a boundary: leave a snapshot behind
             const auto ts = clk::now();
             pc_store(S, j.prompt, S.lm.snapshot(j.seq));
-            if (getenv("FERRO_PC_DEBUG")) { gpu_sync_for_debug(); fprintf(stderr, "[prefix] snapshot of %d tokens took %.1f ms (alloc+copy, synced)\n", c, ms_since(ts)); }
+            if (getenv("FERRO_PC_DEBUG")) { gpu_sync_for_debug(); fprintf(stderr, "[prefix] snapshot of %d tokens took %.1f ms (alloc+copy, synced)\n", end, ms_since(ts)); }
         }
-        if (ok) ok = S.lm.step({&j.seq}, {j.prompt.data() + pos}, {n - pos}, S.lg.data(), &err, true);
-    } catch (const std::exception& e) { err = e.what(); ok = false; }
-    j.prompt_ms = ms_since(t0);
-    if (!ok) { gen_finish(S, jp, (err.empty() ? "prefill failed" : err).c_str()); return; }
-    if (pc_on) { S.recent.push_back(j.prompt); if (S.recent.size() > 8) S.recent.pop_front(); }
+        S.prefilling.push_back(jp); upd(); return;                                  // round-robin with other prefilling prompts
+    }
+    upd();
+    j.prompt_ms = j.pf_ms;
+    if (j.pc_on) { S.recent.push_back(j.prompt); if (S.recent.size() > 8) S.recent.pop_front(); }
     j.hist = j.prompt;
     j.sampler.reset(new Sampler(j.sp));
     const int tok = j.sampler->sample(S.lg.data(), V, j.hist);
     if (gen_token(S, j, tok)) { gen_finish(S, jp); return; }
     S.active.push_back(jp); S.n_active = (int)S.active.size();
 }
-// One scheduler iteration for generation: admit waiting requests into free slots (prefill), then one batched decode step.
-static void gen_iteration(Server& S) {
+// One batched decode step for every active sequence.
+static void gen_decode_step(Server& S) {
     const int V = S.lm.n_vocab();
-    while (true) {
-        std::shared_ptr<GenJob> j;
-        {
-            std::lock_guard<std::mutex> lk(S.qm);
-            if (S.gq.empty() || (int)S.active.size() >= S.lm.n_slots()) break;
-            j = S.gq.front(); S.gq.pop_front();
-        }
-        if (j->cancelled) { gen_finish(S, j); continue; }
-        gen_start(S, j);
-        if (S.stop) break;
-    }
     // drop cancelled / shutting-down sequences
     for (size_t i = 0; i < S.active.size();) {
         if (S.active[i]->cancelled || S.stop) { gen_finish(S, S.active[i]); S.active.erase(S.active.begin() + (long)i); } else ++i;
@@ -397,6 +413,31 @@ static void gen_iteration(Server& S) {
         if (gen_token(S, *j, tok)) gen_finish(S, j); else keep.push_back(j);
     }
     S.active.swap(keep); S.n_active = (int)S.active.size();
+}
+// One scheduler iteration for generation: admit waiting requests into free slots, fill ONE slice of one prompt, then run `decode_share`
+// batched decode steps. Between iterations the worker loop serves d1 and embedding work, so no job waits for another's whole prefill.
+static void gen_iteration(Server& S) {
+    while (true) {
+        std::shared_ptr<GenJob> j;
+        {
+            std::lock_guard<std::mutex> lk(S.qm);
+            if (S.gq.empty() || (int)(S.active.size() + S.prefilling.size()) >= S.lm.n_slots()) break;
+            j = S.gq.front(); S.gq.pop_front();
+        }
+        if (j->cancelled) { gen_finish(S, j); continue; }
+        gen_begin(S, j);
+        if (S.stop) break;
+    }
+    for (size_t i = 0; i < S.prefilling.size();) {                                    // cancelled prompts give their slot back at once
+        if (S.prefilling[i]->cancelled) { gen_finish(S, S.prefilling[i]); S.prefilling.erase(S.prefilling.begin() + (long)i); } else ++i;
+    }
+    S.n_prefill = (int)S.prefilling.size();
+    if (!S.prefilling.empty()) gen_prefill_chunk(S);
+    if (S.prefilling.empty()) { gen_decode_step(S); return; }
+    // a prompt is still filling: give the decode streams their share of the time (at least one step) before the next slice
+    const double budget = S.o.prefill_slice_ms * (double)S.o.decode_share / (100.0 - S.o.decode_share);
+    const auto td = clk::now();
+    do gen_decode_step(S); while (!S.active.empty() && ms_since(td) < budget);
 }
 
 // ---------------------------------------------------------------- inference worker
@@ -456,8 +497,8 @@ static void worker_loop(Server& S, std::promise<std::string>& ready) {
         std::vector<std::shared_ptr<Job>> batch;
         {
             std::unique_lock<std::mutex> lk(S.qm);
-            S.qcv.wait(lk, [&] { return S.stop || !S.q.empty() || !S.gq.empty() || !S.dq.empty() || S.n_active.load() > 0; });
-            if (S.stop && S.q.empty() && S.gq.empty() && S.dq.empty() && S.n_active.load() == 0) break;
+            S.qcv.wait(lk, [&] { return S.stop || !S.q.empty() || !S.gq.empty() || !S.dq.empty() || S.n_active.load() > 0 || S.n_prefill.load() > 0; });
+            if (S.stop && S.q.empty() && S.gq.empty() && S.dq.empty() && S.n_active.load() == 0 && S.n_prefill.load() == 0) break;
             if (!S.q.empty()) {
                 batch.push_back(S.q.front()); S.q.pop_front();
                 if (batch[0]->text_only) {
@@ -647,10 +688,10 @@ static std::string health_json(Server& S) {
     std::string out = b;
     if (S.has_lm) {
         size_t gq; { std::lock_guard<std::mutex> g(S.qm); gq = S.gq.size(); }
-        char l[900];
+        char l[1100];
         const double tg = S.gen_us.load() > 0 ? (double)S.n_gen_tok.load() / (S.gen_us.load() / 1e6) : 0;
-        snprintf(l, sizeof l, ",\"lm\":{\"model\":\"%s\",\"device\":\"%s\",\"slots\":%d,\"active\":%d,\"queued\":%zu,\"ctx\":%d,\"requests\":%llu,\"prompt_tokens\":%llu,\"generated_tokens\":%llu,\"tokens_per_s_busy\":%.2f,\"prefix_cache\":{\"entries\":%llu,\"mb\":%.1f,\"hits\":%llu,\"misses\":%llu,\"cached_tokens\":%llu,\"evictions\":%llu}}}",
-                 jesc(S.lm_name).c_str(), S.lm.on_gpu() ? "igpu" : "cpu", S.lm.n_slots(), S.n_active.load(), gq, S.lm.max_ctx(), (unsigned long long)S.n_gen_req.load(),
+        snprintf(l, sizeof l, ",\"lm\":{\"model\":\"%s\",\"device\":\"%s\",\"slots\":%d,\"active\":%d,\"prefilling\":%d,\"queued\":%zu,\"ctx\":%d,\"requests\":%llu,\"prompt_tokens\":%llu,\"generated_tokens\":%llu,\"tokens_per_s_busy\":%.2f,\"prefix_cache\":{\"entries\":%llu,\"mb\":%.1f,\"hits\":%llu,\"misses\":%llu,\"cached_tokens\":%llu,\"evictions\":%llu}}}",
+                 jesc(S.lm_name).c_str(), S.lm.on_gpu() ? "igpu" : "cpu", S.lm.n_slots(), S.n_active.load(), S.n_prefill.load(), gq, S.lm.max_ctx(), (unsigned long long)S.n_gen_req.load(),
                  (unsigned long long)S.n_prompt_tok.load(), (unsigned long long)S.n_gen_tok.load(), tg,
                  (unsigned long long)S.pc_entries.load(), S.pc_used.load() / 1048576.0, (unsigned long long)S.pc_hits.load(), (unsigned long long)S.pc_miss.load(), (unsigned long long)S.pc_saved.load(), (unsigned long long)S.pc_evict.load());
         out.pop_back(); out += l;
@@ -750,7 +791,7 @@ static int handle_generate(Server& S, int fd, bool keep, const std::string& text
     catch (const BadRequest& e) { body = err_json(e.what(), "invalid_request_error"); return 400; }
     {
         std::lock_guard<std::mutex> lk(S.qm);
-        if ((int)S.gq.size() + S.n_active.load() >= S.o.max_queue) { body = err_json("server is busy (queue full), retry later", "server_error"); return 503; }
+        if ((int)S.gq.size() + S.n_active.load() + S.n_prefill.load() >= S.o.max_queue) { body = err_json("server is busy (queue full), retry later", "server_error"); return 503; }
         S.gq.push_back(j);
     }
     S.qcv.notify_all();

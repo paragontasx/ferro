@@ -16,6 +16,8 @@ struct ServerOptions {
     std::string lm_name;                       // id reported for the language model (default: file name)
     int lm_ctx = 4096;                         // context per sequence slot; the KV cache is allocated up front (LFM2.5-1.2B: ~25 MB per 1k tokens per slot)
     int prefix_cache_mb = 128;                 // LM prompt-prefix cache budget (device memory, LRU); 0 = off. A snapshot costs ~25 KB per cached token (LFM2.5, 6 attention layers)
+    int prefill_slice_ms = 250;                // while other work waits (decode streams, d1, embeddings) a long prompt is prefilled in slices of about this many ms
+    int decode_share = 40;                     // percent of the time decode steps get while a prompt is filling (decode runs ~slice*share/(100-share) ms after each slice)
     int prefix_min_tokens = 32;                // do not cache prefixes shorter than this (the saving would not pay for the copy)
     int lm_slots = 4;                          // concurrent generations (decode of all active slots runs as one batched pass)
     std::string reasoning_format = "deepseek"; // "deepseek": <think>..</think> -> reasoning_content; "none": keep it inline in content
