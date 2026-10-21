@@ -167,6 +167,7 @@ struct GenJob {
     int prefix_hint = 0;                          // tokens of the system message when it is an exact prefix of the prompt (a natural cache boundary)
     int cached = 0;                               // prompt tokens restored from the prefix cache instead of prefilled
     int pf_pos = 0; std::vector<int> pf_cuts; bool pc_on = false; double pf_ms = 0;   // resumable prefill: next prompt position, snapshot boundaries still to leave, compute time so far
+    int think_budget = -1, think_n = 0; bool in_think = false, forced_close = false, ignore_eos = false;   // reasoning-token cap and tracker (independent of reasoning_format)
     int next = 0, n_gen = 0, mode = 0;            // mode: 0 = content, 1 = reasoning (inside <think>)
     std::string pend;                             // decoded text not yet emitted (incomplete UTF-8 / possible stop-string prefix)
     double prompt_ms = 0, gen_ms = 0;
@@ -275,9 +276,12 @@ static bool gen_drain(GenJob& j, bool final) {
 // Consume one sampled token. Returns true when the sequence is finished (j.finish says why).
 static bool gen_token(Server& S, GenJob& j, int id) {
     const bool split = S.o.reasoning_format != "none";
-    if (id == S.eos_id) { gen_drain(j, true); j.finish = "stop"; return true; }
+    if (id == S.eos_id && !j.ignore_eos) { gen_drain(j, true); j.finish = "stop"; return true; }
+    if (j.in_think && id != S.think_close && j.think_budget >= 0 && j.think_n >= j.think_budget && S.think_close >= 0) { id = S.think_close; j.forced_close = true; }   // budget spent: close the block, the answer comes next
+    if (id == S.think_open) { j.in_think = true; j.think_n = 0; } else if (id == S.think_close) j.in_think = false; else if (j.in_think) j.think_n++;
     j.hist.push_back(id); j.n_gen++; j.next = id;
-    if (split && id == S.think_open) { gen_drain(j, true); j.mode = 1; }
+    if (id == S.eos_id) { /* ignore_eos: keep generating, show nothing for the end token */ }
+    else if (split && id == S.think_open) { gen_drain(j, true); j.mode = 1; }
     else if (split && id == S.think_close) { gen_drain(j, true); j.mode = 0; }
     else {
         j.pend += S.ltok.decode_piece(id);
@@ -289,6 +293,7 @@ static bool gen_token(Server& S, GenJob& j, int id) {
 static void gen_finish(Server& S, const std::shared_ptr<GenJob>& jp, const char* err = nullptr, int status = 500) {
     GenJob& j = *jp;
     S.lm.release(j.seq);
+    if (!err && j.finish == "length" && j.in_think) fprintf(stderr, "[serve] warning: reply reached max_tokens inside the reasoning block (content is empty); raise max_tokens or set thinking_budget\n");
     j.gen_ms = ms_since(j.t_gen0);
     S.n_gen_req++; S.n_gen_tok += (uint64_t)j.n_gen; S.n_prompt_tok += j.prompt.size(); S.gen_us += (uint64_t)(j.gen_ms * 1000); S.pp_us += (uint64_t)(j.prompt_ms * 1000);
     { std::lock_guard<std::mutex> g(j.m); if (err) { j.err = err; j.status = status; } j.done = true; }
@@ -736,6 +741,8 @@ static std::shared_ptr<GenJob> parse_gen_request(Server& S, const std::string& t
     j->prompt = S.ltok.tokenize(rendered, true);
     if (j->prompt.empty()) throw BadRequest("empty prompt");
     if (const Json* cp = b.find("cache_prompt")) j->cache_prompt = !(cp->t == Json::Bool && !cp->b);
+    j->think_budget = (int)jnum(b.find("thinking_budget"), jnum(b.find("reasoning_budget"), S.o.thinking_budget));
+    if (const Json* ie = b.find("ignore_eos")) j->ignore_eos = ie->t == Json::Bool && ie->b;
     if (chat && j->cache_prompt && S.o.prefix_cache_mb > 0) {      // natural cache boundary: the end of a leading system message (checked, not assumed, to be an exact prefix)
         const Json& m0 = b.find("messages")->arr[0];
         const Json* role = m0.is_object() ? m0.find("role") : nullptr;
@@ -774,6 +781,13 @@ static std::shared_ptr<GenJob> parse_gen_request(Server& S, const std::string& t
     return j;
 }
 
+// A reply that stops at max_tokens while still inside <think> has empty content: say so (and say how many reasoning tokens a forced close cut).
+static std::string warn_json(const GenJob& j) {
+    std::string w;
+    if (j.finish == "length" && j.in_think) w += "\"reply reached max_tokens inside the reasoning block, so content is empty: raise max_tokens or set thinking_budget\"";
+    if (j.forced_close) w += std::string(w.empty() ? "" : ",") + "\"reasoning was closed at thinking_budget=" + std::to_string(j.think_budget) + " tokens\"";
+    return w.empty() ? std::string() : ",\"warnings\":[" + w + "]";
+}
 static std::string usage_json(const GenJob& j) {
     char b[640];
     const size_t fresh = j.prompt.size() - (size_t)j.cached;                 // tokens actually prefilled (the rest came from the prefix cache)
@@ -820,11 +834,11 @@ static int handle_generate(Server& S, int fd, bool keep, const std::string& text
         if (chat) {
             body = "{\"id\":" + dquote(idstr) + ",\"object\":\"chat.completion\",\"created\":" + std::to_string(created) + ",\"model\":" + model +
                    ",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":" + dquote(content) +
-                   (reasoning.empty() ? "" : ",\"reasoning_content\":" + dquote(reasoning)) + "},\"finish_reason\":" + dquote(finish_str()) + "}]," + usage_json(*j) + "}";
+                   (reasoning.empty() ? "" : ",\"reasoning_content\":" + dquote(reasoning)) + "},\"finish_reason\":" + dquote(finish_str()) + "}]," + usage_json(*j) + warn_json(*j) + "}";
         } else {
             body = "{\"id\":" + dquote(idstr) + ",\"object\":\"text_completion\",\"created\":" + std::to_string(created) + ",\"model\":" + model +
                    ",\"choices\":[{\"index\":0,\"text\":" + dquote(content) + (reasoning.empty() ? "" : ",\"reasoning_content\":" + dquote(reasoning)) +
-                   ",\"finish_reason\":" + dquote(finish_str()) + "}]," + usage_json(*j) + "}";
+                   ",\"finish_reason\":" + dquote(finish_str()) + "}]," + usage_json(*j) + warn_json(*j) + "}";
         }
         logline = summary();
         return 200;
@@ -836,6 +850,7 @@ static int handle_generate(Server& S, int fd, bool keep, const std::string& text
         std::string c = "{\"id\":" + dquote(idstr) + ",\"object\":\"" + (chat ? "chat.completion.chunk" : "text_completion") + "\",\"created\":" + std::to_string(created) + ",\"model\":" + model + ",\"choices\":[{\"index\":0,";
         c += chat ? "\"delta\":" + delta : "\"text\":" + delta;
         c += std::string(",\"finish_reason\":") + (fin ? dquote(fin) : "null") + "}]";
+        if (fin) c += warn_json(*j);
         return c;
     };
     auto sse = [&](const std::string& json) { if (alive) alive = send_chunk(fd, "data: " + json + "\n\n"); };
