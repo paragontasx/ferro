@@ -946,7 +946,8 @@ int run_server(const ServerOptions& opt) {
     }
     S.listen_fd = fd;
     signal(SIGINT, on_signal); signal(SIGTERM, on_signal); signal(SIGPIPE, SIG_IGN);
-    fprintf(stderr, "[serve] listening on http://%s:%d  (%s%sGET /v1/models, GET /health)%s\n", opt.host.c_str(), opt.port, S.has_emb ? "POST /v1/embeddings, " : "", S.has_lm ? "POST /v1/chat/completions, POST /v1/completions, " : "", opt.api_key.empty() ? "" : "  [API key required]");
+    fprintf(stderr, "[serve] listening on http://%s:%d  (%s%s%sGET /v1/models, GET /health)%s\n", opt.host.c_str(), opt.port, S.has_emb ? "POST /v1/embeddings, " : "", S.has_lm ? "POST /v1/chat/completions, POST /v1/completions, " : "",
+            S.has_d1 ? "POST /v1/systemone, " : "", opt.api_key.empty() ? "" : "  [API key required]");
     while (!S.stop) {
         pollfd p{fd, POLLIN, 0};
         if (poll(&p, 1, 500) <= 0) continue;
