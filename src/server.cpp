@@ -9,6 +9,7 @@
 #include "server.h"
 #include "memplan.h"
 #include "prefix_store.h"
+#include "webui.h"
 #include <malloc.h>
 #include "gpu_cl.h"
 #include "decision_service.h"
@@ -1256,7 +1257,7 @@ static void handle_conn(Server* Sp, int fd) {
         if (S.keys_reload.exchange(false)) reload_api_keys(S);
         bool authed = true; std::string who;
         if (!S.keys.empty()) {
-            authed = r.path == "/health" || r.path == "/" || (r.path == "/metrics" && S.o.metrics_open);
+            authed = r.path == "/health" || r.path == "/" || r.path == "/chat" || r.path == "/ui" || (r.path == "/metrics" && S.o.metrics_open);
             if (!authed) {
                 std::string presented;
                 if (r.h.count("authorization") && r.h["authorization"].compare(0, 7, "Bearer ") == 0) presented = r.h["authorization"].substr(7);
@@ -1266,6 +1267,7 @@ static void handle_conn(Server* Sp, int fd) {
         }
         if (!authed) { status = 401; body = err_json("invalid or missing API key", "authentication_error"); }
         else if (r.path == "/health" || r.path == "/v1/health") body = health_json(S);
+        else if (r.path == "/chat" || r.path == "/ui") { if (r.method != "GET") { status = 405; body = err_json("use GET", "invalid_request_error"); } else { body = kChatHtml; ctype = "text/html; charset=utf-8"; } }
         else if (r.path == "/metrics") { body = metrics_text(S); ctype = "text/plain; version=0.0.4; charset=utf-8"; }
         else if (r.path == "/tokenize" || r.path == "/v1/tokenize" || r.path == "/detokenize" || r.path == "/v1/detokenize") {      // vLLM's fields
             const bool detok = r.path.find("detokenize") != std::string::npos;
