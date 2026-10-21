@@ -88,7 +88,7 @@ interleaved in the order given; video is ffmpeg frames (4 fps by default) with `
 ./ferro-embed embed-media --model models/embeddinggemma-2-Q8_0.gguf --mmproj models/mmproj-embeddinggemma-2-Q8_0.gguf \
     --item text:"two cats on a sofa" --item image:cats.jpg --item audio:clip.wav --item video:clip.mp4 --out emb.bin   # f32[768], L2-normalised
 ```
-Both encoders and the text model run on the iGPU; the CPU path is a working fallback (`FERRO_GPU=0`, `FERRO_MM_GPU=0`).
+Both encoders and the text model run on the iGPU (the audio conformer blocks - GEMMs, chunked local attention, conv module, norms - stay on the device; only the SSCP conv front-end and the tail run on the CPU); the CPU path is a working fallback (`FERRO_GPU=0`, `FERRO_MM_GPU=0`).
 Audio is cut into 30 s pieces inside one `<|audio> .. <audio|>` span (as mtmd does). Measured on the N100 (iGPU, quiet machine,
 `embed-media` time = encoders + text model, excludes process start and weight load):
 
@@ -98,15 +98,15 @@ Audio is cut into 30 s pieces inside one `<|audio> .. <audio|>` span (as mtmd do
 | image 100x80 | 84 | 1.5 s | 9 s |
 | image 640x480 | 134 | 2.8 s | 17 s |
 | image 1920x1080 | 924 | ~74 s | does not finish |
-| audio 11 s | 279 | 1.9 s | 6.9 s |
-| audio 44 s (two 30 s chunks) | 1104 | 8.6 s | 46 s |
+| audio 11 s | 279 | 1.4 s | 6.9 s |
+| audio 44 s (two 30 s chunks) | 1104 | 6.5 s | 46 s |
 | video 2 s, 8 frames | 669 | 12 s | |
 
 llama.cpp's CPU encoder needs 183 s for the 1080p photo (ferro 67 s encode); its Vulkan path was not benchmarked for these encoders.
 **Parity** (`scripts/eg2_parity_mm.py`: final embedding cosine vs llama-server `/v1/embeddings`, gate 0.999, 12 cases, all pass): text .99995,
-images .99936-.99985, audio .99990 (mp3 .99993, flac .99994, 44 s .99986), text+image .9993, text+image+audio .9998, video .99965;
+images .99936-.99985, audio .99992 (mp3 .99992, flac .99995, 44 s .99992), text+image .9993, text+image+audio .9998, video .99965;
 token counts identical to the server. Per-chunk encoder cosine vs libmtmd (`bench/mm/mm_ref`): audio mean .99987 on the CPU path /
-.99976 on the iGPU, vision mean .9962 (.9972 on the CPU path): int8 activations compound smoothly over the 16 ViT layers
+.99985 on the iGPU (conformer blocks fully on-device), vision mean .9962 (.9972 on the CPU path): int8 activations compound smoothly over the 16 ViT layers
 (layer-wise relative error 0.24% -> 6.4%, no step anywhere); the pooled embedding averages it out.
 Limits: video frames are upscaled to the model's 70-token minimum image (a 320x240 frame costs 1.3 s), so video is ~1.5 s/frame;
 large images are bound by ViT attention (88% of the 1080p time); text/audio sequences up to ~2900 tokens use the iGPU,
@@ -169,5 +169,5 @@ d1: faster than llama.cpp CPU (1.5×), but ~7× slower than the iGPU — use the
 `FERRO_GPU_SWIZZLE=0|1` · `FERRO_GPU_ATTN_NO5=1` / `FERRO_GPU_UNFUSED=1` / `FERRO_GPU_V2=1` (older kernel
 paths, for A/B) · `FERRO_DECISION_BATCH=N` (tokens per d1 forward, default 4096) ·
 `FERRO_MM_GPU=0` / `FERRO_MM_DENSE=0` (media encoder fallbacks) · `FERRO_DECISION_DUMP=1` (rendered d1 prompts + token ids) · `FERRO_DEBUG_LAYERS=1` · `FERRO_TIME=1` ·
-`FERRO_MM_AUDIO_GPU=0` (audio GEMMs on CPU) · `FERRO_GPU_DENSE_TEXT=0` / `FERRO_GPU_DENSE_MIN=N` (dense long-sequence text attention) · `FERRO_G4_SYNC=1` / `FERRO_G4_DUMP=dir` / `G4A_TIME=1` / `EMB_TIME=1` (multimodal debugging) ·
+`FERRO_MM_AUDIO_GPU=0` (audio GEMMs on CPU) · `FERRO_MM_AUDIO_DEV=0` (audio blocks back to host-driven GEMMs) · `FERRO_GPU_DENSE_TEXT=0` / `FERRO_GPU_DENSE_MIN=N` (dense long-sequence text attention) · `FERRO_G4_SYNC=1` / `FERRO_G4_DUMP=dir` / `G4A_TIME=1` / `EMB_TIME=1` (multimodal debugging) ·
 `FERRO_LOW_MEM=1` · `FERRO_DBGDIR=/path` (CPU stage dumps for golden diffing)

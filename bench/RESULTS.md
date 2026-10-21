@@ -194,11 +194,11 @@ final L2-normalised embedding >= 0.999. Encoder ground truth: `bench/mm/mm_ref` 
 | image 640x480 | 134 | 0.999652 | 2.8 s |
 | image 1920x1080 | 924 | 0.999848 | 70 s |
 | text + image | 139 | 0.999300 | 2.9 s |
-| audio 11 s (wav / mp3 / flac 44.1 kHz) | 279 | 0.999902 / 0.999932 / 0.999936 | 2.0 s |
-| text + audio | 284 | 0.999923 | 2.1 s |
-| audio 44 s (two 30 s chunks, one span) | 1104 | 0.999859 | 8.8 s |
+| audio 11 s (wav / mp3 / flac 44.1 kHz) | 279 | 0.999924 / 0.999915 / 0.999947 | 1.4 s |
+| text + audio | 284 | 0.999943 | 1.4 s |
+| audio 44 s (two 30 s chunks, one span) | 1104 | 0.999920 | 6.5 s |
 | video 2 s (8 frames @ 4 fps) | 669 | 0.999646 | 12.3 s |
-| text + image + audio | 412 | 0.999819 | 5.2 s |
+| text + image + audio | 412 | 0.999831 | 4.3 s |
 Token counts equal the server's in every case (1104 for 44 s: ONE `<|audio>..<audio|>` span for all 30 s chunks, as mtmd).
 
 ### What moved the numbers
@@ -222,6 +222,36 @@ Token counts equal the server's in every case (1104 for 44 s: ONE `<|audio>..<au
 - 1080p photos are slow (~70 s): ViT attention runs at ~27% of fp32 peak (29 GMAC/s), so kernel tuning has real headroom.
 - Video costs ~1.5 s/frame: small frames are upscaled to the 70-token minimum image (a 320x240 frame becomes 480x384 = 720 patches).
   Batching frames into one forward (segment-masked attention) would amortise the weight traffic; not done.
-- Audio attention / conv module / SSCP still run on the CPU (the audio GEMMs are on the iGPU).
+- The audio SSCP conv front-end (147 ms per 11 s: im2col 39, conv gemm 33, transpose 24, layernorm 38, input proj 9) and the tail still run on the CPU; most of it is memory-layout overhead, not math.
 - Text/audio sequences beyond ~2900 tokens fall back to the CPU layer loop (score scratch cap 128 MB).
 - Llama.cpp's Vulkan path was not benchmarked for the EmbeddingGemma-2 encoders.
+
+
+## 2026-10-21 (later): audio conformer on the iGPU, attention tuning study, video batching ruled out
+
+### Audio conformer blocks fully on the iGPU
+Five kernels (`a_norm_quant`, `a_act_quant`, `a_resid`, `a_conv_mid`, `a_attn`) mirror the validated CPU reference; the residual stream
+stays on the device (per call: X up, X down). q/k/v share their clamps in all 12 blocks, so one fused qkv GEMM + one clamp inside the
+attention kernel serves them; Pk = k_rel(pos_emb) is precomputed per layer. 11 s clip, audio encode 1456 -> 796 ms; the device part is
+615 ms, of which the GEMMs are ~470 ms (79 GMAC at ~170 GMAC/s) and all new kernels together ~150 ms (attention 67, act_quant 52, resid 36,
+norm_quant 29, conv_mid 26). Per-chunk mean cosine vs libmtmd .99985 (host-driven version .99976). Device vs CPU path at 4..205
+tokens (incl. lengths that are not a multiple of the 12-token block): mean cos >= .9998.
+`FERRO_MM_AUDIO_DEV=0` returns to the host-driven GEMMs; any device failure falls back to them automatically.
+
+### SWA band skipping (text model)
+`dattn_qk_h` returns early for 64x64 tiles entirely outside the sliding window, `dattn_pv_h` only walks the keys in the band.
+1154 tokens 3.7 -> 3.46 s, 1591 tokens 6.4 -> 5.1 s; cos vs the CPU path >= .9999 (gain grows with length).
+
+### Video: frame batching does not help (measured, not built)
+GEMM cost per token is 0.82 ms (T = 720, one frame) vs 0.80 ms (T = 8280, the 1080p photo): batching the 8 frames into one forward pass
+saves ~3% of the GEMM time. Attention stays per frame either way. The 1.3 s per frame is 0.6 s GEMM (int8 DP4A, ~190 GMAC/s) + 0.57 s
+attention + 0.13 s elementwise; none of it is launch or weight-streaming overhead.
+
+### Attention kernel study (pyopencl ablation, T = 1104, nq = 4, hd = 256, QK: 44 ms = 28 GMAC/s = 26% of the 109 GFMA/s peak)
+Decomposition by ablation: FMA loop ~14 ms (82% of peak - the inner loop is fine), S store 6, barriers 7, global-load latency 15.
+Variants, all bit-identical or within 2e-5 of the baseline: register prefetch of the next chunk 49.7 ms (more private memory: spills);
+128x64 tile (8 rows per lane) 49.6; coalesced loads + vstore4 + k-vector inner loop 46.5; smaller work-groups (16x8: 65 ms, 16x4: 130 ms);
+SLM chunk 32: 43.0; forcing SIMD16 via `intel_reqd_sub_group_size`: same; SIMD8: 50.4; no SLM at all with Q/K stored transposed and direct
+global loads: 117 ms (10 GMAC/s). Occupancy probes (SLM 16/32/48 KB per work-group) change nothing. Conclusion: the 64x64 SLM-staged kernel is
+at the practical plateau for this GPU/driver; a flash-style fusion (no S round trip) is the only remaining structural lever and was not attempted.
+A single work-group needs 310 us, at saturation ~30 us per group: about 10 groups are in flight.

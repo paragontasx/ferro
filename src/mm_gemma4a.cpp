@@ -76,6 +76,9 @@ void load_audio_weights(const GgufFile& g, Gemma4Proj::Impl& I) {
 // ---- SSCP: two (conv3x3 s2 p1 -> LayerNorm over channels -> ReLU), flatten freq-major, input projection
 // mel.data is [mel][frame]; the conv input is x[frame][mel]. Output [n_pos][a_d].
 static std::vector<float> sscp(const Gemma4Proj::Impl& I, const Mel& mel, int& n_pos) {
+    static const bool prof = getenv("G4A_TIME") != nullptr;   // SSCP_PROF
+    double ph[6] = {0, 0, 0, 0, 0, 0}; auto tq = std::chrono::steady_clock::now();
+    auto pl = [&](int k) { if (!prof) return; auto t = std::chrono::steady_clock::now(); ph[k] += std::chrono::duration<double, std::milli>(t - tq).count(); tq = t; };
     const int F0 = mel.n_mel, T0 = mel.n_len;
     std::vector<float> x((size_t)T0 * F0);
     for (int t = 0; t < T0; ++t) for (int f = 0; f < F0; ++f) x[(size_t)t * F0 + f] = to_h(mel.data[(size_t)f * T0 + t]);
@@ -101,11 +104,14 @@ static std::vector<float> sscp(const Gemma4Proj::Impl& I, const Mel& mel, int& n
                         }
                 }
         });
+        pl(0);
         gemm_f32(I.a_conv_w[li].data(), Co, K, col.data(), NP, gem.data(), Co);
+        pl(1);
         std::vector<float> out((size_t)Co * NP);                 // back to [Co][Ho][Wo]
         Pool::get().parallel_for(Co, [&](int lo, int hi) {
             for (int o = lo; o < hi; ++o) for (int p = 0; p < NP; ++p) out[(size_t)o * NP + p] = gem[(size_t)p * Co + o];
         });
+        pl(2);
         // LayerNorm over channels at every (y, x): weight, no bias, eps 1e-6; then ReLU; round for the next conv's im2col
         const float* nw = I.a_conv_norm[li].data();
         Pool::get().parallel_for(Ho, [&](int lo, int hi) {
@@ -122,6 +128,7 @@ static std::vector<float> sscp(const Gemma4Proj::Impl& I, const Mel& mel, int& n
                     }
                 }
         });
+        pl(3);
         cur = std::move(out); C = Co; H = Ho; W = Wo;
     }
     n_pos = H;                                                   // time
@@ -130,7 +137,10 @@ static std::vector<float> sscp(const Gemma4Proj::Impl& I, const Mel& mel, int& n
     for (int t = 0; t < n_pos; ++t) for (int f = 0; f < W; ++f) for (int c = 0; c < C; ++c)
         flat[(size_t)t * feat + (size_t)f * C + c] = cur[((size_t)c * H + t) * W + f];
     std::vector<float> proj((size_t)n_pos * I.a_d);
+    pl(4);
     gemm_f32(I.a_inp_proj.data(), I.a_d, feat, flat.data(), n_pos, proj.data(), I.a_d);
+    pl(5);
+    if (prof) fprintf(stderr, "[sscp] im2col %.0f  conv gemm %.0f  transpose %.0f  layernorm+relu %.0f  flatten %.0f  input proj %.0f ms\n", ph[0], ph[1], ph[2], ph[3], ph[4], ph[5]);
     return proj;
 }
 
