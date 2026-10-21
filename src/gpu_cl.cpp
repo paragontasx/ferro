@@ -1119,12 +1119,16 @@ __kernel void dattn_stats_w(__global const float* S, int n, float scale, __globa
 
 // ---- head-dim generic dense attention (hd multiple of 64), grouped-query: head h reads kv head h / (nq/nkv).
 // QK: identical tile layout to dattn_qk; the 64-wide dot is repeated over hd/64 dim chunks, accumulating in registers.
-__kernel void dattn_qk_h(__global const float* C, int ldc, int qoff, int koff, int n, int hd, int grp, __global float* S, int q0, int nr) {
+__kernel void dattn_qk_h(__global const float* C, int ldc, int qoff, int koff, int n, int hd, int grp, __global float* S, int q0, int nr, int window) {
   __local float As[64 * 64];
   __local float Bs[64 * 64];
   const int h = get_group_id(2), tx = get_local_id(0), ty = get_local_id(1);
   const int kvh = h / grp;
   const int i0 = get_group_id(1) * 64, j0 = get_group_id(0) * 64, lid = ty * 16 + tx;
+  if (window > 0) {                                  // band mask: a 64x64 tile with every |i - j| >= window is never read (stats / PV skip it)
+    const int gi0 = q0 + i0;
+    if (j0 - (gi0 + 63) >= window || gi0 - (j0 + 63) >= window) return;
+  }
   float4 acc0 = (float4)(0.f), acc1 = acc0, acc2 = acc0, acc3 = acc0;
   for (int d0 = 0; d0 < hd; d0 += 64) {
     barrier(CLK_LOCAL_MEM_FENCE);
@@ -1175,7 +1179,9 @@ __kernel void dattn_pv_h(__global const float* S, __global const float2* st, flo
   const float sl2 = scale * L2E, ml2 = rok ? st[(size_t)h * nr + i0 + r].x * sl2 : 0.f;
   float psum = 0.f;
   __local float tot[256];
-  for (int k0 = 0; k0 < n; k0 += 32) {
+  int kbeg = 0, kend = n;                                  // band: only keys within (window - 1) of some query row of this tile
+  if (window > 0) { const int gi0 = q0 + i0; kbeg = (max(0, gi0 - window + 1) / 32) * 32; kend = min(n, gi0 + 63 + window); }
+  for (int k0 = kbeg; k0 < kend; k0 += 32) {
     barrier(CLK_LOCAL_MEM_FENCE);
     for (int c4 = g; c4 < 8; c4 += 4) {
       const int kk = k0 + c4 * 4;
@@ -1219,6 +1225,133 @@ __kernel void dattn_pv_h(__global const float* S, __global const float2* st, flo
   DPVH_ROW(0, acc0) DPVH_ROW(1, acc1) DPVH_ROW(2, acc2) DPVH_ROW(3, acc3)
 #undef DPVH_ROW
 }
+
+// ================= Gemma 4 audio conformer (cols = 1024 -> LS = 256 for the row kernels) =================
+// y = [rms(x)] [* w] -> clamp(lo, hi) -> int8 (the next GEMM's input; the linear's INPUT clamp is applied before quantizing)
+__kernel void a_norm_quant(__global const float* X, __global const float* w, int has_w, int do_rms, float lo, float hi,
+                           __global uint* Xp, __global float* Xs, int cols, float eps) {
+  __local float red[32];
+  __local float am[1024];
+  const int t = get_group_id(0), lid = get_local_id(0);
+  float4 y = vload4(lid, X + (size_t)t * cols);
+  if (do_rms) y = y * (1.0f / sqrt(wg_add(dot(y, y), red) / (float)cols + eps));
+  if (has_w) y *= vload4(lid, w);
+  y = clamp(y, (float4)(lo), (float4)(hi));
+  quant_lane4(y, am, Xp, Xs, t, cols);
+}
+// GEMM output Y -> clamp(out) -> [silu] -> clamp(in of the NEXT linear) -> int8. Any cols (LS = cols/4 <= 1024), no reductions.
+__kernel void a_act_quant(__global const float* Y, int act, float olo, float ohi, float ilo, float ihi,
+                          __global uint* Xp, __global float* Xs, int cols) {
+  __local float am[1024];
+  const int t = get_group_id(0), lid = get_local_id(0);
+  float4 v = clamp(vload4(lid, Y + (size_t)t * cols), (float4)(olo), (float4)(ohi));
+  if (act == 1) v = v / (1.0f + exp(-v));
+  v = clamp(v, (float4)(ilo), (float4)(ihi));
+  quant_lane4(v, am, Xp, Xs, t, cols);
+}
+// X += scale * ([rms(] clamp(Y, out) [)] * w);  optionally X = rms(X) * w2 (the conformer layer's output norm). In place.
+__kernel void a_resid(__global float* X, __global const float* Y, float olo, float ohi, int do_rms, __global const float* w,
+                      float scale, int has_ln2, __global const float* w2, int cols, float eps) {
+  __local float red[32];
+  const int t = get_group_id(0), lid = get_local_id(0);
+  float4 y = clamp(vload4(lid, Y + (size_t)t * cols), (float4)(olo), (float4)(ohi));
+  if (do_rms) y = y * (1.0f / sqrt(wg_add(dot(y, y), red) / (float)cols + eps)) * vload4(lid, w);
+  float4 x = vload4(lid, X + (size_t)t * cols) + scale * y;
+  if (has_ln2) x = x * (1.0f / sqrt(wg_add(dot(x, x), red) / (float)cols + eps)) * vload4(lid, w2);
+  vstore4(x, lid, X + (size_t)t * cols);
+}
+// conv module middle: G2 [T][2d] (pw1 output, raw) -> clamp(out) -> GLU (a * sigmoid(b)) -> causal depthwise conv k = 5
+// (dw [d][5], rows t-4..t) -> rms * wn -> silu -> clamp(in of pw2) -> int8.  LS = d/4.
+__kernel void a_conv_mid(__global const float* G2, int d, float olo, float ohi, __global const float* dw, __global const float* wn,
+                         float ilo, float ihi, __global uint* Xp, __global float* Xs, float eps) {
+  __local float red[32];
+  __local float am[1024];
+  const int t = get_group_id(0), lid = get_local_id(0);
+  float4 acc = (float4)(0.f);
+  for (int k = 0; k < 5; ++k) {
+    const int src = t - 4 + k;
+    if (src < 0) continue;
+    const __global float* row = G2 + (size_t)src * 2 * d;
+    const float4 a = clamp(vload4(lid, row), (float4)(olo), (float4)(ohi));
+    const float4 b = clamp(vload4(lid, row + d), (float4)(olo), (float4)(ohi));
+    const float4 g = a / (1.0f + exp(-b));
+    const float4 wk = (float4)(dw[(4 * lid + 0) * 5 + k], dw[(4 * lid + 1) * 5 + k], dw[(4 * lid + 2) * 5 + k], dw[(4 * lid + 3) * 5 + k]);
+    acc = mad(wk, g, acc);
+  }
+  acc = acc * (1.0f / sqrt(wg_add(dot(acc, acc), red) / (float)d + eps)) * vload4(lid, wn);
+  acc = acc / (1.0f + exp(-acc));
+  acc = clamp(acc, (float4)(ilo), (float4)(ihi));
+  quant_lane4(acc, am, Xp, Xs, t, d);
+}
+// chunked local self-attention with sinusoidal relative positions: one WG per (head, block of C = 12 queries), hd = 128.
+// C: fused qkv [T][ldc] (q | k | v, each d wide); the qkv OUTPUT clamp is applied while loading; q is scaled by qs * per_dim_scale,
+// k by ks. Pk [13][d] = attn_k_rel(pos_emb) (constant per layer). Window: 12 past keys + the block (S = 24), blocked
+// Transformer-XL shift, softcap 50, causal band mask (mask value -1e9 like upstream). Output O f32 [T][d].
+#define AC 12
+#define AP 12
+#define AS 24
+#define AR 13
+#define AHD 128
+__kernel void a_attn(__global const float* C, int ldc, __global const float* Pk, __global const float* pds,
+                     float lo, float hi, float qs, float ks, int N, int d, __global float* O) {
+  const int h = get_group_id(0), b = get_group_id(1), lid = get_local_id(0), LS = get_local_size(0);
+  __local float Qs[AC * AHD];
+  __local float Ks[AS * AHD];
+  __local float Vs[AS * AHD];
+  __local float Pks[AR * AHD];
+  __local float bdr[AC * AR];
+  __local float sc[AC * AS];
+  for (int i = lid; i < AC * AHD; i += LS) {
+    const int q = i / AHD, e = i % AHD, gq = b * AC + q;
+    Qs[i] = gq < N ? clamp(C[(size_t)gq * ldc + h * AHD + e], lo, hi) * qs * pds[e] : 0.f;
+  }
+  for (int i = lid; i < AS * AHD; i += LS) {
+    const int s2 = i / AHD, e = i % AHD, gk = b * AC - AP + s2;
+    const bool ok = gk >= 0 && gk < N;
+    Ks[i] = ok ? clamp(C[(size_t)gk * ldc + d + h * AHD + e], lo, hi) * ks : 0.f;
+    Vs[i] = ok ? clamp(C[(size_t)gk * ldc + 2 * d + h * AHD + e], lo, hi) : 0.f;
+  }
+  for (int i = lid; i < AR * AHD; i += LS) Pks[i] = Pk[(size_t)(i / AHD) * d + h * AHD + (i % AHD)];
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (int i = lid; i < AC * AR; i += LS) {
+    const int q = i / AR, r = i % AR;
+    float a = 0.f;
+    for (int e = 0; e < AHD; ++e) a += Qs[q * AHD + e] * Pks[r * AHD + e];
+    bdr[i] = a;
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (int i = lid; i < AC * AS; i += LS) {
+    const int q = i / AS, s2 = i % AS, gq = b * AC + q, gk = b * AC - AP + s2;
+    float v = -1e9f;
+    if (gq < N && gk >= 0 && gk < N && gk <= gq && (gq - gk) < AP) {
+      float ac = 0.f;
+      for (int e = 0; e < AHD; ++e) ac += Qs[q * AHD + e] * Ks[s2 * AHD + e];
+      const int f = q * AS + s2, row = f / (AS + 1), col = f % (AS + 1);     // blocked relative shift
+      const float bd = col < AR ? bdr[row * AR + col] : 0.f;
+      v = 50.0f * tanh((ac + bd) / 50.0f);
+    }
+    sc[i] = v;
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  if (lid < AC) {
+    const int q = lid, gq = b * AC + q;
+    if (gq < N) {
+      float mx = -3.0e38f;
+      for (int s2 = 0; s2 < AS; ++s2) mx = fmax(mx, sc[q * AS + s2]);
+      float den = 0.f;
+      for (int s2 = 0; s2 < AS; ++s2) { const float e = exp(sc[q * AS + s2] - mx); sc[q * AS + s2] = e; den += e; }
+      for (int s2 = 0; s2 < AS; ++s2) sc[q * AS + s2] /= den;
+    }
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (int i = lid; i < AC * AHD; i += LS) {
+    const int q = i / AHD, e = i % AHD, gq = b * AC + q;
+    if (gq >= N) continue;
+    float acc = 0.f;
+    for (int s2 = 0; s2 < AS; ++s2) acc += sc[q * AS + s2] * Vs[s2 * AHD + e];
+    O[(size_t)gq * d + h * AHD + e] = acc;
+  }
+}
 )CL";
 
 // ---------------------------------------------------------------- state
@@ -1239,7 +1372,7 @@ static cl_kernel k_quant = nullptr, k_gemm = nullptr, k_gemm_sw = nullptr, k_rms
                  k_attq2 = nullptr, k_gmq2 = nullptr, k_gmvq2 = nullptr,
                  k_rowf3 = nullptr, k_qkvp3 = nullptr, k_attq3 = nullptr, k_gmq3 = nullptr, k_gmvq3 = nullptr,
                  k_rnq = nullptr, k_hinq = nullptr, k_convq = nullptr, k_siluq = nullptr, k_bactq = nullptr,
-                 k_badd = nullptr, k_score = nullptr, k_attq4 = nullptr, k_attq5 = nullptr, k_quantq = nullptr, k_lngq = nullptr, k_dqk = nullptr, k_dsm = nullptr, k_dpv = nullptr, k_qkvg4 = nullptr, k_dqkh = nullptr, k_dpvh = nullptr, k_dsmw = nullptr;
+                 k_badd = nullptr, k_score = nullptr, k_attq4 = nullptr, k_attq5 = nullptr, k_quantq = nullptr, k_lngq = nullptr, k_dqk = nullptr, k_dsm = nullptr, k_dpv = nullptr, k_qkvg4 = nullptr, k_dqkh = nullptr, k_dpvh = nullptr, k_dsmw = nullptr, k_anq = nullptr, k_aact = nullptr, k_ares = nullptr, k_aconv = nullptr, k_aattn = nullptr;
 static std::vector<Slot> g_slots;
 static size_t g_bytes = 0;
 static cl_mem g_Xp = nullptr, g_Xs = nullptr;           // quantized-activation scratch
@@ -1307,7 +1440,7 @@ bool init(bool verbose) {
         {&k_attn, "attention"}, {&k_gmul, "gelu_mul"}, {&k_gmulv, "gelu_mulvec"}, {&k_add, "add_scale"},
         {&k_rowf, "row_fused"}, {&k_qkvp, "qkv_post"}, {&k_attq, "attention_q"}, {&k_gmq, "gelu_mul_q"},
         {&k_gmvq, "gelu_mulvec_q"}, {&k_attq2, "attention_q2"}, {&k_gmq2, "gelu_mul_q2"}, {&k_gmvq2, "gelu_mulvec_q2"},
-        {&k_qkvg4, "qkv_post_g4"}, {&k_dsmw, "dattn_stats_w"}, {&k_dqkh, "dattn_qk_h"}, {&k_dpvh, "dattn_pv_h"}, {&k_rowf3, "row_fused3"}, {&k_qkvp3, "qkv_post3"}, {&k_attq3, "attention_q3"}, {&k_gmq3, "gelu_mul_q3"},
+        {&k_qkvg4, "qkv_post_g4"}, {&k_dsmw, "dattn_stats_w"}, {&k_anq, "a_norm_quant"}, {&k_aact, "a_act_quant"}, {&k_ares, "a_resid"}, {&k_aconv, "a_conv_mid"}, {&k_aattn, "a_attn"}, {&k_dqkh, "dattn_qk_h"}, {&k_dpvh, "dattn_pv_h"}, {&k_rowf3, "row_fused3"}, {&k_qkvp3, "qkv_post3"}, {&k_attq3, "attention_q3"}, {&k_gmq3, "gelu_mul_q3"},
         {&k_gmvq3, "gelu_mulvec_q3"}, {&k_rnq, "resid_norm_q3"}, {&k_hinq, "head_in_q3"}, {&k_convq, "conv_gate_q3"},
         {&k_siluq, "silu_mul_q8"}, {&k_bactq, "bias_act_q8"}, {&k_badd, "bias_add"}, {&k_score, "score_out"}, {&k_attq4, "attention_q4"}, {&k_attq5, "attention_q5"}, {&k_quantq, "quant_q3"}, {&k_lngq, "ln_gather_q3"}, {&k_dqk, "dattn_qk"}, {&k_dsm, "dattn_stats"}, {&k_dpv, "dattn_pv"}};
     for (auto& k : ks) { *k.k = cl.clCreateKernel(g_prog, k.n, &err); CK(err); }
@@ -1502,7 +1635,7 @@ bool op_dense_attention_h(Buf C, int ldc, int qoff, int koff, int voff, int n, i
         auto ta0 = std::chrono::steady_clock::now();
         const int nr = std::min(rows, n - q0);
         const size_t qt = (size_t)(nr + 63) / 64, kt = (size_t)(n + 63) / 64;
-        set_args(k_dqkh, C, (cl_int)ldc, (cl_int)qoff, (cl_int)koff, (cl_int)n, (cl_int)hd, (cl_int)grp, S, (cl_int)q0, (cl_int)nr);
+        set_args(k_dqkh, C, (cl_int)ldc, (cl_int)qoff, (cl_int)koff, (cl_int)n, (cl_int)hd, (cl_int)grp, S, (cl_int)q0, (cl_int)nr, (cl_int)window);
         size_t g1[3] = {kt * 16, qt * 16, (size_t)nq}, l1[3] = {16, 16, 1};
         if (!launch(k_dqkh, 3, g1, l1)) return false;
         lapa(0, ta0);
@@ -1517,6 +1650,52 @@ bool op_dense_attention_h(Buf C, int ldc, int qoff, int koff, int voff, int n, i
         if (q0 + rows < n && !finish()) return false;                 // bounded submissions (i915 watchdog); also orders the scratch reuse
     }
     return true;
+}
+
+// per-op timing for the audio kernels (FERRO_TIME=1 adds a finish() around each, so only for profiling)
+static double g_aprof[5] = {0, 0, 0, 0, 0};
+static bool plaunch_a(int k, cl_kernel kk, cl_uint dims, const size_t* g, const size_t* l) {
+    static const bool on = getenv("FERRO_TIME") != nullptr;
+    static bool reg = false;
+    if (!on) return launch(kk, dims, g, l);
+    if (!reg) { reg = true; atexit([] { fprintf(stderr, "[gpu] audio kernels: norm_quant %.0f  act_quant %.0f  resid %.0f  conv_mid %.0f  attn %.0f ms\n", g_aprof[0] * 1e3, g_aprof[1] * 1e3, g_aprof[2] * 1e3, g_aprof[3] * 1e3, g_aprof[4] * 1e3); }); }
+    finish(); auto t0 = std::chrono::steady_clock::now();
+    const bool r = launch(kk, dims, g, l);
+    finish(); g_aprof[k] += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    return r;
+}
+
+// ---- Gemma 4 audio conformer ops (cols multiple of 32, LS = cols/4 <= 1024; reductions need cols <= 2048)
+bool op_a_norm_quant(Buf X, Buf w, bool do_rms, float lo, float hi, int T, int cols, float eps) {
+    if (cols % 128 || cols > 2048) return false;
+    set_args(k_anq, X, w ? w : X, (cl_int)(w != nullptr), (cl_int)do_rms, lo, hi, (Buf)g_Xp, (Buf)g_Xs, (cl_int)cols, eps);
+    size_t g[1] = {(size_t)T * (cols / 4)}, l[1] = {(size_t)cols / 4};
+    return plaunch_a(0, k_anq, 1, g, l);
+}
+bool op_a_act_quant(Buf Y, int act, float olo, float ohi, float ilo, float ihi, int T, int cols) {
+    if (cols % 128 || cols > 4096) return false;
+    set_args(k_aact, Y, (cl_int)act, olo, ohi, ilo, ihi, (Buf)g_Xp, (Buf)g_Xs, (cl_int)cols);
+    size_t g[1] = {(size_t)T * (cols / 4)}, l[1] = {(size_t)cols / 4};
+    return plaunch_a(1, k_aact, 1, g, l);
+}
+bool op_a_resid(Buf X, Buf Y, float olo, float ohi, bool do_rms, Buf w, float scale, Buf w2, int T, int cols, float eps) {
+    if (cols % 128 || cols > 2048) return false;
+    set_args(k_ares, X, Y, olo, ohi, (cl_int)do_rms, w ? w : X, scale, (cl_int)(w2 != nullptr), w2 ? w2 : X, (cl_int)cols, eps);
+    size_t g[1] = {(size_t)T * (cols / 4)}, l[1] = {(size_t)cols / 4};
+    return plaunch_a(2, k_ares, 1, g, l);
+}
+bool op_a_conv_mid(Buf G2, int d, float olo, float ohi, Buf dw, Buf wn, float ilo, float ihi, int T, float eps) {
+    if (d % 128 || d > 2048) return false;
+    set_args(k_aconv, G2, (cl_int)d, olo, ohi, dw, wn, ilo, ihi, (Buf)g_Xp, (Buf)g_Xs, eps);
+    size_t g[1] = {(size_t)T * (d / 4)}, l[1] = {(size_t)d / 4};
+    return plaunch_a(3, k_aconv, 1, g, l);
+}
+bool op_a_attn(Buf C, int ldc, Buf Pk, Buf pds, float lo, float hi, float qs, float ks, int N, int nh, int d, Buf O) {
+    if (nh * 128 != d) return false;
+    const int B = (N + 11) / 12;
+    set_args(k_aattn, C, (cl_int)ldc, Pk, pds, lo, hi, qs, ks, (cl_int)N, (cl_int)d, O);
+    size_t g[2] = {(size_t)nh * 256, (size_t)B}, l[2] = {256, 1};
+    return plaunch_a(4, k_aattn, 2, g, l);
 }
 
 bool op_qkv_post(Buf C, int rowc, int T, int nq, int nkv, int hd, Buf qw, Buf kw, Buf cosb, Buf sinb, Buf pos, int hlf, float eps, bool norm_v) {
@@ -1762,7 +1941,7 @@ void shutdown() {
     g_Xp = g_Xs = g_hX = g_hY = nullptr;
     for (cl_kernel k : {k_quant, k_gemm, k_gemm_sw, k_rms, k_rope, k_attn, k_gmul, k_gmulv, k_add, k_rowf, k_qkvp, k_attq, k_gmq, k_gmvq,
                         k_attq2, k_gmq2, k_gmvq2, k_rowf3, k_qkvp3, k_attq3, k_gmq3, k_gmvq3,
-                        k_rnq, k_hinq, k_convq, k_siluq, k_bactq, k_badd, k_score, k_attq4, k_attq5, k_quantq, k_lngq, k_dqk, k_dsm, k_dpv, k_qkvg4, k_dqkh, k_dpvh, k_dsmw})
+                        k_rnq, k_hinq, k_convq, k_siluq, k_bactq, k_badd, k_score, k_attq4, k_attq5, k_quantq, k_lngq, k_dqk, k_dsm, k_dpv, k_qkvg4, k_dqkh, k_dpvh, k_dsmw, k_anq, k_aact, k_ares, k_aconv, k_aattn})
         if (k) cl.clReleaseKernel(k);
     cl.clReleaseProgram(g_prog); cl.clReleaseCommandQueue(g_q); cl.clReleaseContext(g_ctx);
     g_ok = false;

@@ -39,6 +39,14 @@ struct Gemma4Proj::Impl {
     gpu::Buf bS = nullptr, bsrc = nullptr, ones = nullptr, bxs = nullptr, bys = nullptr, blo = nullptr, bhi = nullptr;
     size_t cap = 0, capS = 0, capm = 0;
     bool gpu_ok = false;
+    // ---- audio conformer resident on the device (upload_audio_dev, mm_gemma4a.cpp)
+    struct AGL { WMat qkv; gpu::Buf n_ffn = nullptr, p_ffn = nullptr, n_ffn1 = nullptr, p_ffn1 = nullptr, n_att = nullptr, p_att = nullptr,
+                                    n_conv = nullptr, w_conv = nullptr, ln2 = nullptr, pds = nullptr, dw = nullptr, pk = nullptr; };
+    std::vector<AGL> agl;
+    gpu::Buf aX = nullptr, aY = nullptr, aO = nullptr;
+    size_t a_cap = 0;                                   // tokens the three activation buffers hold
+    bool a_dev_ok = false;
 };
+bool upload_audio_dev(Gemma4Proj::Impl& I);             // mm_gemma4a.cpp
 
 }  // namespace ferro

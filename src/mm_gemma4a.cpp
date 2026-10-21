@@ -134,6 +134,105 @@ static std::vector<float> sscp(const Gemma4Proj::Impl& I, const Mel& mel, int& n
     return proj;
 }
 
+
+namespace {
+constexpr int AC_ = 12, AP_ = 12, AR_ = AP_ + 1;
+// sinusoidal relative positions [R][d]: position = P - p, sin | cos halves
+std::vector<float> audio_pos_emb(int d) {
+    std::vector<float> pe((size_t)AR_ * d);
+    const int nts = d / 2; const float inc = std::log(10000.0f) / std::max(nts - 1, 1);
+    for (int p = 0; p < AR_; ++p) for (int i = 0; i < nts; ++i) {
+        const float sc = (float)(AP_ - p) * std::exp(-(float)i * inc);
+        pe[(size_t)p * d + i] = std::sin(sc); pe[(size_t)p * d + i + nts] = std::cos(sc);
+    }
+    return pe;
+}
+inline float attn_q_scale(int hd) { return (1.0f / std::sqrt((float)hd)) / std::log(2.0f); }
+inline float attn_k_scale() { return std::log(1.0f + std::exp(1.0f)) / std::log(2.0f); }
+}  // namespace
+
+// Conformer blocks on the device: weights, constants (norm vectors, per_dim_scale, depthwise kernel, Pk = k_rel(pos_emb)) are
+// uploaded once; per call only X goes up and comes back. Returns false (host path stays in charge) on anything unexpected.
+bool upload_audio_dev(Gemma4Proj::Impl& I) {
+    using gpu::Buf;
+    if (I.a_hd != 128 || I.a_d != I.a_heads * 128 || I.a_d % 128 || I.a_d > 2048 || I.a_ffn % 128 || I.a_ffn > 4096) return false;
+    const int d = I.a_d;
+    static const bool pds_sp = getenv("FERRO_G4A_PDS") && !strcmp(getenv("FERRO_G4A_PDS"), "softplus");
+    const std::vector<float> pe = audio_pos_emb(d);
+    std::vector<float> scratch;
+    I.agl.assign(I.a_layers, Gemma4Proj::Impl::AGL());
+    auto up = [&](const std::vector<float>& x) { return gpu::upload(x.data(), x.size() * 4); };
+    for (int l = 0; l < I.a_layers; ++l) {
+        auto& L = I.al[l]; auto& g = I.agl[l];
+        // q, k, v must share their clamps (they do in every block of the shipped file) so one fused GEMM + one clamp serves all three
+        if (L.q.imin != L.k.imin || L.q.imin != L.v.imin || L.q.imax != L.k.imax || L.q.imax != L.v.imax ||
+            L.q.omin != L.k.omin || L.q.omin != L.v.omin || L.q.omax != L.k.omax || L.q.omax != L.v.omax) return false;
+        if (L.q.w.q.empty() || L.k.w.q.empty() || L.v.w.q.empty()) return false;
+        g.qkv = pack_concat({&L.q.w.q, &L.k.w.q, &L.v.w.q}, "g4a.qkv");
+        g.qkv.gpu_slot = gpu::upload_q8(g.qkv);
+        if (g.qkv.gpu_slot < 0) return false;
+        g.n_ffn = up(L.ffn_norm); g.p_ffn = up(L.ffn_post_norm); g.n_ffn1 = up(L.ffn_norm1); g.p_ffn1 = up(L.ffn_post_norm1);
+        g.n_att = up(L.attn_pre_norm); g.p_att = up(L.attn_post_norm); g.n_conv = up(L.norm_conv); g.w_conv = up(L.conv_norm); g.ln2 = up(L.ln2);
+        std::vector<float> pds(I.a_hd);
+        for (int e = 0; e < I.a_hd; ++e) pds[e] = pds_sp ? std::log1p(std::exp(L.per_dim_scale[e])) : L.per_dim_scale[e];
+        g.pds = up(pds); g.dw = up(L.conv_dw);
+        std::vector<float> Pk((size_t)AR_ * d);
+        capply(L.k_rel, pe.data(), AR_, Pk.data(), scratch);
+        g.pk = up(Pk);
+        if (!g.n_ffn || !g.p_ffn || !g.n_ffn1 || !g.p_ffn1 || !g.n_att || !g.p_att || !g.n_conv || !g.w_conv || !g.ln2 || !g.pds || !g.dw || !g.pk) return false;
+    }
+    return true;
+}
+
+static bool audio_blocks_gpu(Gemma4Proj::Impl& I, std::vector<float>& X, int N) {
+    const int d = I.a_d, ffn = I.a_ffn, H = I.a_heads, hd = I.a_hd;
+    const float eps = 1e-6f, qs = attn_q_scale(hd), ks = attn_k_scale();
+    const size_t wide = (size_t)std::max({ffn, 3 * d, 2 * d});
+    if ((size_t)N > I.a_cap) {
+        gpu::release(I.aX); gpu::release(I.aY); gpu::release(I.aO);
+        I.a_cap = (size_t)N;
+        I.aX = gpu::alloc(I.a_cap * d * 4); I.aY = gpu::alloc(I.a_cap * wide * 4); I.aO = gpu::alloc(I.a_cap * d * 4);
+        if (!I.aX || !I.aY || !I.aO) { I.aX = I.aY = I.aO = nullptr; I.a_cap = 0; return false; }
+    }
+    if (!gpu::ensure_qscratch(N, (int)wide)) return false;
+    static const bool verbose = getenv("FERRO_VERBOSE") != nullptr;
+    int stage = 0;
+    bool ok = gpu::write(I.aX, X.data(), (size_t)N * d * 4);
+    auto ffn_half = [&](const CLin& up, const CLin& dn, gpu::Buf nw, gpu::Buf pw, gpu::Buf ln2) {
+        return gpu::op_a_norm_quant(I.aX, nw, true, up.imin, up.imax, N, d, eps) &&
+               gpu::op_gemm_q(up.w.q.gpu_slot, N, I.aY) &&
+               gpu::op_a_act_quant(I.aY, 1, up.omin, up.omax, dn.imin, dn.imax, N, ffn) &&
+               gpu::op_gemm_q(dn.w.q.gpu_slot, N, I.aY) &&
+               gpu::op_a_resid(I.aX, I.aY, dn.omin, dn.omax, true, pw, 0.5f, ln2, N, d, eps);
+    };
+    for (int l = 0; l < I.a_layers && ok; ++l) {
+        auto& L = I.al[l]; auto& g = I.agl[l];
+        stage = 1; ok = ffn_half(L.ffn_up, L.ffn_down, g.n_ffn, g.p_ffn, nullptr);
+        if (!ok) break;
+        stage = 2;
+        ok = gpu::op_a_norm_quant(I.aX, g.n_att, true, L.q.imin, L.q.imax, N, d, eps) &&
+             gpu::op_gemm_q(g.qkv.gpu_slot, N, I.aY) &&
+             gpu::op_a_attn(I.aY, 3 * d, g.pk, g.pds, L.q.omin, L.q.omax, qs, ks, N, H, d, I.aO) &&
+             gpu::op_a_act_quant(I.aO, 0, -FLT_MAX, FLT_MAX, L.o.imin, L.o.imax, N, d) &&
+             gpu::op_gemm_q(L.o.w.q.gpu_slot, N, I.aY) &&
+             gpu::op_a_resid(I.aX, I.aY, L.o.omin, L.o.omax, true, g.p_att, 1.0f, nullptr, N, d, eps);
+        if (!ok) break;
+        stage = 3;
+        ok = gpu::op_a_norm_quant(I.aX, g.n_conv, true, L.pw1.imin, L.pw1.imax, N, d, eps) &&
+             gpu::op_gemm_q(L.pw1.w.q.gpu_slot, N, I.aY) &&
+             gpu::op_a_conv_mid(I.aY, d, L.pw1.omin, L.pw1.omax, g.dw, g.w_conv, L.pw2.imin, L.pw2.imax, N, eps) &&
+             gpu::op_gemm_q(L.pw2.w.q.gpu_slot, N, I.aY) &&
+             gpu::op_a_resid(I.aX, I.aY, L.pw2.omin, L.pw2.omax, false, nullptr, 1.0f, nullptr, N, d, eps);
+        if (!ok) break;
+        stage = 4; ok = ffn_half(L.ffn_up1, L.ffn_down1, g.n_ffn1, g.p_ffn1, g.ln2);
+        if (!ok) break;
+        stage = 5; ok = gpu::finish();                      // one submission per layer (i915 watchdog), also surfaces errors
+    }
+    if (ok) { stage = 6; ok = gpu::read(I.aX, X.data(), (size_t)N * d * 4); }
+    if (!ok && verbose) fprintf(stderr, "[g4a] on-device conformer failed at stage %d (1 ffn, 2 attention, 3 conv, 4 ffn2, 5 finish, 6 read)\n", stage);
+    return ok;
+}
+
 std::vector<float> Gemma4Proj::encode_audio(const Mel& mel) {
     if (!a_ok_) throw std::runtime_error("mmproj has no gemma4a audio encoder");
     Impl& I = *impl_;
@@ -148,15 +247,7 @@ std::vector<float> Gemma4Proj::encode_audio(const Mel& mel) {
     constexpr int C = 12, P = 12, S = C + P, R = P + 1;
     const int B = (N + C - 1) / C;
     static const bool pds_sp = getenv("FERRO_G4A_PDS") && !strcmp(getenv("FERRO_G4A_PDS"), "softplus");
-    // sinusoidal relative positions [R][d]: position = P - p, sin | cos halves
-    std::vector<float> pos_emb((size_t)R * d);
-    {
-        const int nts = d / 2; const float inc = std::log(10000.0f) / std::max(nts - 1, 1);
-        for (int p = 0; p < R; ++p) for (int i = 0; i < nts; ++i) {
-            const float sc = (float)(P - p) * std::exp(-(float)i * inc);
-            pos_emb[(size_t)p * d + i] = std::sin(sc); pos_emb[(size_t)p * d + i + nts] = std::cos(sc);
-        }
-    }
+    const std::vector<float> pos_emb = audio_pos_emb(d);
     std::vector<float> scratch, xn((size_t)N * d), F((size_t)N * ffn), Y((size_t)N * d), Q((size_t)N * d), K((size_t)N * d), V((size_t)N * d), O((size_t)N * d);
     auto ffn_block = [&](const CLin& up, const CLin& down, const std::vector<float>& nw, const std::vector<float>& pw) {
         rms_rows(X.data(), N, d, nw.data(), eps, xn.data());
@@ -166,7 +257,10 @@ std::vector<float> Gemma4Proj::encode_audio(const Mel& mel) {
         rms_rows(Y.data(), N, d, pw.data(), eps, Y.data());
         for (size_t i = 0; i < (size_t)N * d; ++i) X[i] += 0.5f * Y[i];            // half-step residual
     };
-    for (int l = 0; l < I.a_layers; ++l) {
+    bool dev_done = false;
+    if (I.a_dev_ok) { dev_done = audio_blocks_gpu(I, X, N); lap(1); }
+    const int n_host_layers = dev_done ? 0 : I.a_layers;
+    for (int l = 0; l < n_host_layers; ++l) {
         auto& L = I.al[l];
         ffn_block(L.ffn_up, L.ffn_down, L.ffn_norm, L.ffn_post_norm);
         lap(1);

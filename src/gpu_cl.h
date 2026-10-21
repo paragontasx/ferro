@@ -51,6 +51,12 @@ bool op_qkv_post(Buf C, int rowc, int T, int nq, int nkv, int hd, Buf qw, Buf kw
 bool op_qkv_post_g4(Buf C, int rowc, int T, int nq, int nkv, int hd, Buf qw, Buf kw, Buf invf, Buf posx, Buf posy, float eps);
 // dense attention for one fully visible segment, any head dim multiple of 64 (<= 512), grouped-query; f32 out O[n][nq*hd]
 bool op_dense_attention_h(Buf C, int ldc, int qoff, int koff, int voff, int n, int nq, int nkv, int hd, float scale, Buf S, Buf O, int ldo, int window = -1, size_t s_floats = (size_t)1 << 62);   // S capacity in floats: queries are tiled to fit   // window > 0: keys with |i-j| >= window are masked (SWA)
+// ---- Gemma 4 audio conformer (see mm_gemma4a.cpp); all rows are f32 [T][cols], quantized outputs go to the shared int8 scratch
+bool op_a_norm_quant(Buf X, Buf w, bool do_rms, float lo, float hi, int T, int cols, float eps);   // [rms] [*w] clamp -> int8
+bool op_a_act_quant(Buf Y, int act, float olo, float ohi, float ilo, float ihi, int T, int cols);   // clamp [silu] clamp -> int8 (act 1 = silu)
+bool op_a_resid(Buf X, Buf Y, float olo, float ohi, bool do_rms, Buf w, float scale, Buf w2, int T, int cols, float eps);  // X += scale*[rms](clamp Y)*w; w2: X = rms(X)*w2
+bool op_a_conv_mid(Buf G2, int d, float olo, float ohi, Buf dw, Buf wn, float ilo, float ihi, int T, float eps);          // GLU + causal dw conv k5 + rms + silu -> int8
+bool op_a_attn(Buf C, int ldc, Buf Pk, Buf pds, float lo, float hi, float qs, float ks, int N, int nh, int d, Buf O);      // chunked local attention, hd 128
 bool op_attention_q(Buf C, int ldc, int qoff, int koff, int voff, int T, int nq, int nkv, int hd,
                     Buf seg_lo, Buf seg_hi, int window, float scale,
                     Buf pre_lo = nullptr, Buf pre_hi = nullptr);

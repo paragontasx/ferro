@@ -115,6 +115,13 @@ void Gemma4Proj::upload_gpu() {
             for (auto& L : I.al) for (CLin* c : {&L.ffn_up, &L.ffn_down, &L.ffn_up1, &L.ffn_down1, &L.q, &L.k, &L.v, &L.o, &L.k_rel, &L.pw1, &L.pw2}) slot(*c);
             slot(I.a_out_proj); slot(I.a_mm_proj);
             if (getenv("FERRO_VERBOSE")) fprintf(stderr, "[g4a] %d/%d audio linears resident on the iGPU\n", up, tot);
+            if (up == tot) {
+                const char* de = getenv("FERRO_MM_AUDIO_DEV");
+                if (!de || atoi(de) != 0) {
+                    I.a_dev_ok = upload_audio_dev(I);
+                    if (getenv("FERRO_VERBOSE")) fprintf(stderr, "[g4a] conformer blocks on-device: %s\n", I.a_dev_ok ? "yes" : "no (host-driven GEMMs)");
+                }
+            }
         }
     }
     if (!v_ok_) return;
