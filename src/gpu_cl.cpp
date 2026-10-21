@@ -2089,6 +2089,7 @@ static bool use_swizzle(const Slot& s, int T) {
 }
 
 void set_row_policy(int p) { g_row_policy = p; }
+const char* build_id() { return __DATE__ " " __TIME__; }
 
 bool op_gemm_q(int slot, int T, Buf Y) {
     if (slot < 0 || slot >= (int)g_slots.size()) return false;

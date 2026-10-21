@@ -38,7 +38,7 @@ static void usage() {
         "                   (multimodal EmbeddingGemma 2: items are interleaved in order into one 768-d embedding; vision/audio encoders on the iGPU)\n"
         "       ferro-embed generate --lm LFM2.5.gguf (--prompt TEXT | --messages f.json) [--n-predict N] [--temp T] [--top-k K] [--rep-penalty P] [--seed S]\n"
         "                   (text generation with an LFM2 / LFM2.5 model, e.g. LFM2.5-1.2B-Thinking; chat template + sampler built in)\n"
-        "       ferro-embed serve [--model EG2.gguf [--mmproj P.gguf]] [--lm LFM2.5.gguf [--lm-ctx N] [--lm-slots N] [--prefix-cache-mb N] [--no-memory-check] [--kv-dtype f32|int8] [--thinking-budget N] [--prefill-slice-ms N] [--decode-share N] [--reasoning-format deepseek|none]] [--d1 d1-omni.gguf [--d1-mmproj P.gguf]] [--host H] [--port P] [--api-key K]\n"
+        "       ferro-embed serve [--model EG2.gguf [--mmproj P.gguf]] [--lm LFM2.5.gguf [--lm-ctx N] [--lm-slots N] [--prefix-cache-mb N] [--snapshot-dir D [--snapshot-mb N]] [--no-memory-check] [--kv-dtype f32|int8] [--thinking-budget N] [--prefill-slice-ms N] [--decode-share N] [--reasoning-format deepseek|none]] [--d1 d1-omni.gguf [--d1-mmproj P.gguf]] [--host H] [--port P] [--api-key K]\n"
         "       (old form follows)  ferro-embed serve --model EG2.gguf [--mmproj P.gguf] [--host H] [--port N] [--api-key K] [--max-batch-tokens N] [--batch-wait-ms N]\n"
         "                   (resident OpenAI-compatible server: POST /v1/embeddings with text / image_url / input_audio / video_url parts, GET /v1/models, GET /health)\n"
         "       ferro-embed mm-embed --mmproj P.gguf --media image|audio --out f.bin     (per-chunk encoder output, mm_ref format)\n"
@@ -230,6 +230,8 @@ int main(int argc, char** argv) {
         else if (a == "--lm-ctx") so.lm_ctx = atoi(next("--lm-ctx"));
         else if (a == "--lm-slots") so.lm_slots = atoi(next("--lm-slots"));
         else if (a == "--prefix-cache-mb") so.prefix_cache_mb = atoi(next("--prefix-cache-mb"));
+        else if (a == "--snapshot-dir") so.snapshot_dir = next("--snapshot-dir");
+        else if (a == "--snapshot-mb") so.snapshot_mb = std::max(1, atoi(next("--snapshot-mb")));
         else if (a == "--no-memory-check") so.no_memory_check = true;
         else if (a == "--kv-dtype") { const std::string v = next("--kv-dtype"); if (v != "f32" && v != "int8") { fprintf(stderr, "--kv-dtype must be f32 or int8\n"); return 2; } so.kv_int8 = v == "int8"; }
         else if (a == "--thinking-budget") so.thinking_budget = atoi(next("--thinking-budget"));

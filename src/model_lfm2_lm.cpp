@@ -327,6 +327,19 @@ bool LmEngine::init(const std::string& path, int n_threads, int max_ctx, std::st
     max_ctx_ = max_ctx; n_slots_ = std::max(1, n_slots);
     if (const char* e = getenv("FERRO_KV")) kv_int8 = std::string(e) == "int8";
     kv_int8_ = kv_int8;
+    {   // identity of persisted device state: model file (size + head + tail), KV dtype, and the build of the kernels that produced it
+        uint64_t h = 1469598103934665603ull;
+        auto mix = [&](const void* d, size_t n) { const uint8_t* p = (const uint8_t*)d; for (size_t i = 0; i < n; ++i) { h ^= p[i]; h *= 1099511628211ull; } };
+        if (FILE* f = fopen(path.c_str(), "rb")) {
+            fseek(f, 0, SEEK_END); const long sz = ftell(f); mix(&sz, sizeof sz);
+            std::vector<uint8_t> buf(1 << 20);
+            for (long off : {0L, std::max(0L, sz - (1L << 20))}) { fseek(f, off, SEEK_SET); const size_t n = fread(buf.data(), 1, buf.size(), f); mix(buf.data(), n); }
+            fclose(f);
+        }
+        const int abi = 1; mix(&abi, sizeof abi); mix(&kv_int8_, sizeof kv_int8_);
+        mix(gpu::build_id(), strlen(gpu::build_id())); const char* me = __DATE__ " " __TIME__; mix(me, strlen(me));
+        state_id_ = h;
+    }
     if (!m_.load(path, max_ctx, err)) return false;
     impl_ = std::make_shared<Impl>();
     const char* ge = getenv("FERRO_GPU"); const char* gl = getenv("FERRO_LM_GPU");
@@ -386,6 +399,32 @@ std::shared_ptr<LmPrefix> LmEngine::snapshot(const LmSeq& s) const {
         if (!gpu::copy(b, 0, g.cst[l], (size_t)s.gpu_slot * 2 * d * 4, 2 * d * 4)) return nullptr;
     }
     p->bytes = prefix_bytes(s.n_past);
+    return p;
+}
+
+bool LmEngine::export_prefix(const LmPrefix& p, std::vector<uint8_t>* out) const {
+    if (!impl_ || !impl_->g.ok || p.kv.size() != impl_->g.kv.size()) return false;
+    const size_t kvw = (size_t)2 * m_.n_kv * m_.head_dim, d = (size_t)m_.n_embd, esz = kv_int8_ ? 1 : 4;
+    out->resize(prefix_bytes(p.n)); size_t off = 0;
+    auto rd = [&](void* b, size_t n) { const bool ok = gpu::read(b, out->data() + off, n); off += n; return ok; };
+    bool ok = true;
+    for (size_t l = 0; ok && l < p.kv.size(); ++l) { ok = rd(p.kv[l], (size_t)p.n * kvw * esz); if (ok && kv_int8_) ok = rd(p.kvs[l], (size_t)p.n * (kvw / 32) * 4); }
+    for (size_t l = 0; ok && l < p.cst.size(); ++l) ok = rd(p.cst[l], 2 * d * 4);
+    return ok && off == out->size();
+}
+
+std::shared_ptr<LmPrefix> LmEngine::import_prefix(int n_tokens, const uint8_t* data, size_t len) const {
+    if (!impl_ || !impl_->g.ok || n_tokens <= 0 || n_tokens >= max_ctx_ || len != prefix_bytes(n_tokens)) return nullptr;
+    auto& g = impl_->g;
+    const size_t kvw = (size_t)2 * m_.n_kv * m_.head_dim, d = (size_t)m_.n_embd, esz = kv_int8_ ? 1 : 4;
+    auto p = std::make_shared<LmPrefix>(); p->n = n_tokens; size_t off = 0;
+    auto up = [&](size_t n) -> void* { void* b = gpu::upload(data + off, n); off += n; return b; };
+    for (size_t l = 0; l < g.kv.size(); ++l) {
+        void* b = up((size_t)n_tokens * kvw * esz); if (!b) return nullptr; p->kv.push_back(b);
+        if (kv_int8_) { void* sb = up((size_t)n_tokens * (kvw / 32) * 4); if (!sb) return nullptr; p->kvs.push_back(sb); }
+    }
+    for (size_t l = 0; l < g.cst.size(); ++l) { void* b = up(2 * d * 4); if (!b) return nullptr; p->cst.push_back(b); }
+    p->bytes = prefix_bytes(n_tokens);
     return p;
 }
 

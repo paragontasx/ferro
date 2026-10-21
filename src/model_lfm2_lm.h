@@ -65,6 +65,11 @@ public:
     // kv_int8: keep the KV cache as int8 with one fp32 scale per 32 values (about 3.6x smaller than fp32); FERRO_KV=f32|int8 overrides
     bool init(const std::string& path, int n_threads, int max_ctx, std::string* err, int n_slots = 1, bool kv_int8 = false);
     bool kv_int8() const { return kv_int8_; }
+    // Persist / reload a prefix snapshot through host memory (layout: per attention layer [K/V data][scales if int8], per conv layer 2*d floats; exactly
+    // prefix_bytes(n) bytes). state_id() hashes what the state depends on (model file, KV dtype, kernel build): only equal ids may exchange snapshots.
+    bool export_prefix(const LmPrefix& p, std::vector<uint8_t>* out) const;
+    std::shared_ptr<LmPrefix> import_prefix(int n_tokens, const uint8_t* data, size_t len) const;
+    uint64_t state_id() const { return state_id_; }
     int n_slots() const { return n_slots_; }
     void release(LmSeq& s);                          // give the sequence's device slot back (no-op on CPU)
     const LmModel& model() const { return m_; }
@@ -87,6 +92,7 @@ private:
     LmModel m_;
     int max_ctx_ = 0, n_slots_ = 1;
     bool kv_int8_ = false;
+    uint64_t state_id_ = 0;
     std::shared_ptr<Impl> impl_;
     bool forward_gpu(const std::vector<LmSeq*>& seqs, const std::vector<const int*>& toks, const std::vector<int>& n, float* logits, std::string* err,
                      bool force_prefill = false);

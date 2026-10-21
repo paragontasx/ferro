@@ -8,6 +8,7 @@
 // alone, in arrival order.
 #include "server.h"
 #include "memplan.h"
+#include "prefix_store.h"
 #include <malloc.h>
 #include "gpu_cl.h"
 #include "decision_service.h"
@@ -235,6 +236,8 @@ struct Server {
     std::atomic<uint64_t> busy_us{0};
     std::mutex mem_m; double mem_inflight = 0;     // MB reserved by admitted media requests that are not finished
     std::atomic<uint64_t> n_mem_rejected{0};
+    std::unique_ptr<PrefixStore> pstore;           // on-disk prefix snapshots (null = off)
+    std::atomic<uint64_t> ps_hits{0};              // requests that restored a snapshot from disk
     std::atomic<bool> trim_pending{false};         // a media request ran: return freed heap to the OS when the worker is idle
     clk::time_point t_start = clk::now();
 };
@@ -314,7 +317,7 @@ static bool pc_has(Server& S, const std::vector<int>& prompt, int c) {
     for (auto& e : S.pcache) if ((int)e.toks.size() == c && pc_starts(prompt, e.toks)) return true;
     return false;
 }
-static void pc_store(Server& S, const std::vector<int>& prompt, std::shared_ptr<LmPrefix> px) {
+static void pc_store(Server& S, const std::vector<int>& prompt, std::shared_ptr<LmPrefix> px, bool persist = true) {
     const size_t budget = (size_t)S.o.prefix_cache_mb << 20;
     if (!px || px->bytes > budget) return;
     while (!S.pcache.empty() && S.pc_bytes + px->bytes > budget) {                 // evict least recently used
@@ -324,6 +327,10 @@ static void pc_store(Server& S, const std::vector<int>& prompt, std::shared_ptr<
     PrefixEntry e; e.toks.assign(prompt.begin(), prompt.begin() + px->n); e.used = ++S.pc_tick; S.pc_bytes += px->bytes; e.px = std::move(px);
     S.pcache.push_back(std::move(e));
     S.pc_entries = S.pcache.size(); S.pc_used = S.pc_bytes;
+    if (persist && S.pstore && !S.pstore->has(S.pcache.back().toks)) {             // a new snapshot also goes to disk (written in the background)
+        std::vector<uint8_t> blob;
+        if (S.lm.export_prefix(*S.pcache.back().px, &blob)) S.pstore->save_async(S.pcache.back().toks, std::move(blob));
+    }
 }
 
 static void gpu_sync_for_debug() { gpu::finish(); }
@@ -338,7 +345,18 @@ static void gen_begin(Server& S, const std::shared_ptr<GenJob>& jp) {
     j.pc_on = S.o.prefix_cache_mb > 0 && j.cache_prompt && S.lm.on_gpu();
     std::vector<int> cuts;                                                          // where to leave a new cache entry behind while prefilling
     if (j.pc_on) {
-        if (PrefixEntry* e = pc_longest(S, j.prompt)) {
+        PrefixEntry* e = pc_longest(S, j.prompt);
+        PrefixStore::Entry de;
+        if (S.pstore && S.pstore->longest(j.prompt, &de) && (!e || de.toks.size() > e->toks.size() + 32)) {   // the disk has a longer prefix than the device cache: bring it in
+            std::vector<uint8_t> blob;
+            if (S.pstore->load(de, &blob)) {
+                if (auto px = S.lm.import_prefix((int)de.toks.size(), blob.data(), blob.size())) {
+                    pc_store(S, j.prompt, std::move(px), false); S.pstore->touch(de); S.ps_hits++;
+                    e = pc_longest(S, j.prompt);
+                }
+            }
+        }
+        if (e) {
             if (S.lm.restore(j.seq, *e->px)) { pos = e->px->n; e->used = ++S.pc_tick; S.pc_hits++; S.pc_saved += (uint64_t)pos; }
             else S.lm.reset(j.seq);                                                // a failed restore may have left partial conv state: start clean
         } else S.pc_miss++;
@@ -498,6 +516,11 @@ static void worker_loop(Server& S, std::promise<std::string>& ready) {
             S.chat_opt.typed_content = lfm_template_is_typed(S.lm.model().gguf.get_str("tokenizer.chat_template"));
             S.think_open = S.ltok.token_id("<think>"); S.think_close = S.ltok.token_id("</think>"); S.eos_id = S.lm.model().eos_id;
             S.lg.assign((size_t)S.lm.n_slots() * (size_t)S.lm.n_vocab(), 0.0f);
+            if (!S.o.snapshot_dir.empty() && S.o.prefix_cache_mb > 0 && S.lm.on_gpu()) {
+                S.pstore.reset(new PrefixStore); std::string e;
+                if (!S.pstore->open(S.o.snapshot_dir, S.lm.state_id(), (uint64_t)S.o.snapshot_mb << 20, &e)) { fprintf(stderr, "[serve] prefix snapshots disabled: %s\n", e.c_str()); S.pstore.reset(); }
+                else fprintf(stderr, "[serve] prefix snapshots: %zu stored for this model (%.1f MB) in %s, budget %d MB\n", S.pstore->entries(), S.pstore->bytes() / 1048576.0, S.o.snapshot_dir.c_str(), S.o.snapshot_mb);
+            }
         }
         if (S.has_d1 && !S.d1.init(S.o.d1, S.o.d1_mmproj, S.o.threads, &err, true)) { ready.set_value(err.empty() ? "decision model init failed" : "decision model: " + err); return; }
         ready.set_value(std::string());
@@ -572,6 +595,7 @@ static void worker_loop(Server& S, std::promise<std::string>& ready) {
             if (S.q.empty() && S.dq.empty() && S.gq.empty()) { S.trim_pending = false; malloc_trim(0); }
         }
     }
+    if (S.pstore) S.pstore->flush();               // finish queued snapshot writes before exiting
     // shutting down: fail whatever is still queued
     std::lock_guard<std::mutex> lk(S.qm);
     for (auto& j : S.q) { j->err = "server is shutting down"; j->status = 503; { std::lock_guard<std::mutex> g(j->m); j->done = true; } j->cv.notify_all(); }
@@ -723,7 +747,9 @@ static std::string health_json(Server& S) {
         const double lim = cgroup_limit_mb(), used = cgroup_used_mb();
         char l[300];
         snprintf(l, sizeof l, ",\"memory\":{\"limit_mb\":%.0f,\"used_mb\":%.0f,\"headroom_mb\":%.0f,\"reserved_mb\":%.0f,\"rejected\":%llu}", lim, used, lim > 0 ? lim - used : 0.0, inflight, (unsigned long long)S.n_mem_rejected.load());
-        out.pop_back(); out += l; out += '}';
+        out.pop_back(); out += l;
+        if (S.pstore) { char sn[300]; snprintf(sn, sizeof sn, ",\"prefix_snapshots\":{\"entries\":%zu,\"mb\":%.1f,\"saved\":%llu,\"disk_hits\":%llu}", S.pstore->entries(), S.pstore->bytes() / 1048576.0, (unsigned long long)S.pstore->saved(), (unsigned long long)S.ps_hits.load()); out += sn; }
+        out += '}';
     }
     return out;
 }
