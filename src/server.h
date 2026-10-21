@@ -5,6 +5,7 @@
 // Either or both can be loaded; they share the iGPU through one worker thread.
 #pragma once
 #include <string>
+#include <vector>
 
 namespace ferro {
 
@@ -29,6 +30,9 @@ struct ServerOptions {
     std::string reasoning_format = "deepseek"; // "deepseek": <think>..</think> -> reasoning_content; "none": keep it inline in content
     std::string host = "127.0.0.1";            // bind address (use 0.0.0.0 to expose it)
     int port = 8080;
+    std::vector<std::string> api_keys;         // repeatable --api-key; each key may be "label: key"
+    std::string api_key_file;                  // --api-key-file: one "label: key" (or bare key) per line, '#' comments; re-read on SIGHUP
+    bool metrics_open = false;                 // --metrics-open: /metrics without a key (it needs one when keys are set)
     std::string api_key;                       // non-empty: require "Authorization: Bearer <key>" (everything but /health)
     std::string model_name;                    // id reported by /v1/models and echoed in responses (default: GGUF general.name)
     int threads = 2;

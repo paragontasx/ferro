@@ -170,6 +170,7 @@ struct GenJob {
     int prefix_hint = 0;                          // tokens of the system message when it is an exact prefix of the prompt (a natural cache boundary)
     int cached = 0;                               // prompt tokens restored from the prefix cache instead of prefilled
     int pf_pos = 0; std::vector<int> pf_cuts; bool pc_on = false; double pf_ms = 0;   // resumable prefill: next prompt position, snapshot boundaries still to leave, compute time so far
+    double ttft_ms = -1;                          // time from enqueue to the first generated token
     int think_budget = -1, think_n = 0; bool in_think = false, forced_close = false, ignore_eos = false;   // reasoning-token cap and tracker (independent of reasoning_format)
     int next = 0, n_gen = 0, mode = 0;            // mode: 0 = content, 1 = reasoning (inside <think>)
     std::string pend;                             // decoded text not yet emitted (incomplete UTF-8 / possible stop-string prefix)
@@ -197,8 +198,45 @@ struct DecJob {
 struct PrefixEntry { std::vector<int> toks; std::shared_ptr<LmPrefix> px; uint64_t used = 0; };
 
 // ---------------------------------------------------------------- server state
+// API keys: any number, each with a label (for the log); matched in constant time; the file form is re-read on SIGHUP.
+struct ApiKeys {
+    std::mutex m; std::vector<std::pair<std::string, std::string>> keys;               // label, key
+    bool empty() { std::lock_guard<std::mutex> g(m); return keys.empty(); }
+    bool match(const std::string& presented, std::string* label) {
+        std::lock_guard<std::mutex> g(m); bool found = false;
+        for (const auto& k : keys) {
+            unsigned diff = (unsigned)(k.second.size() ^ presented.size());
+            for (size_t i = 0; i < k.second.size(); ++i) diff |= (unsigned char)k.second[i] ^ (unsigned char)(i < presented.size() ? presented[i] : 0);
+            if (diff == 0 && !found) { found = true; *label = k.first; }
+        }
+        return found;
+    }
+    void add_line(std::string line, int idx) {                                          // "label: key" or a bare key
+        auto trim = [](std::string& t) { while (!t.empty() && isspace((unsigned char)t.back())) t.pop_back(); size_t i = 0; while (i < t.size() && isspace((unsigned char)t[i])) ++i; t.erase(0, i); };
+        trim(line); if (line.empty() || line[0] == '#') return;
+        const size_t c = line.find(": "); std::string label = "key" + std::to_string(idx), key = line;
+        if (c != std::string::npos) { label = line.substr(0, c); key = line.substr(c + 2); trim(label); trim(key); }
+        if (!key.empty()) keys.push_back({label, key});
+    }
+};
+// Rolling rate over the last `win` seconds of activity (tokens per second while something was running, not averaged with idle time).
+struct RateWin {
+    std::mutex m; std::deque<std::tuple<double, int, double>> ev;                     // (end time s, tokens, busy seconds)
+    static double now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+    void add(int n, double busy_ms) { std::lock_guard<std::mutex> g(m); const double t = now(); ev.emplace_back(t, n, busy_ms / 1000.0); while (!ev.empty() && t - std::get<0>(ev.front()) > 30) ev.pop_front(); }
+    double rate(double win = 10) {                                                  // tokens per busy second over the last `win` s; 0 once idle for 3 s
+        std::lock_guard<std::mutex> g(m); const double t = now(); double tok = 0, busy = 0;
+        if (ev.empty() || t - std::get<0>(ev.back()) > 3.0) return 0.0;
+        for (auto it = ev.rbegin(); it != ev.rend() && t - std::get<0>(*it) <= win; ++it) { tok += std::get<1>(*it); busy += std::get<2>(*it); }
+        return busy > 0 ? tok / busy : 0.0;
+    }
+};
+
 struct Server {
     ServerOptions o;
+    ApiKeys keys; std::atomic<bool> keys_reload{false};
+    RateWin rw_decode, rw_prefill;                 // live token rates (/health, /metrics)
+    std::atomic<uint64_t> ttft_n{0}, ttft_us{0}, ttft_b[8]{};   // time-to-first-token histogram (buckets 0.1 .25 .5 1 2.5 5 10 s, then +Inf)
     MmEmbedder me;
     bool has_emb = false;
     // language model
@@ -242,6 +280,7 @@ struct Server {
     clk::time_point t_start = clk::now();
 };
 static Server* g_srv = nullptr;
+static void on_hup(int) { if (g_srv) g_srv->keys_reload = true; }
 static void on_signal(int) { if (g_srv) { g_srv->stop = true; if (g_srv->listen_fd >= 0) shutdown(g_srv->listen_fd, SHUT_RDWR); } }
 
 // ---------------------------------------------------------------- generation (worker side)
@@ -288,6 +327,7 @@ static bool gen_token(Server& S, GenJob& j, int id) {
     if (j.in_think && id != S.think_close && j.think_budget >= 0 && j.think_n >= j.think_budget && S.think_close >= 0) { id = S.think_close; j.forced_close = true; }   // budget spent: close the block, the answer comes next
     if (id == S.think_open) { j.in_think = true; j.think_n = 0; } else if (id == S.think_close) j.in_think = false; else if (j.in_think) j.think_n++;
     j.hist.push_back(id); j.n_gen++; j.next = id;
+    if (j.n_gen == 1) j.ttft_ms = ms_since(j.t_enq);
     if (id == S.eos_id) { /* ignore_eos: keep generating, show nothing for the end token */ }
     else if (split && id == S.think_open) { gen_drain(j, true); j.mode = 1; }
     else if (split && id == S.think_close) { gen_drain(j, true); j.mode = 0; }
@@ -303,6 +343,7 @@ static void gen_finish(Server& S, const std::shared_ptr<GenJob>& jp, const char*
     S.lm.release(j.seq);
     if (!err && j.finish == "length" && j.in_think) fprintf(stderr, "[serve] warning: reply reached max_tokens inside the reasoning block (content is empty); raise max_tokens or set thinking_budget\n");
     j.gen_ms = ms_since(j.t_gen0);
+    if (j.ttft_ms >= 0) { static const double ub[7] = {100, 250, 500, 1000, 2500, 5000, 10000}; int b = 0; while (b < 7 && j.ttft_ms > ub[b]) ++b; S.ttft_b[b]++; S.ttft_n++; S.ttft_us += (uint64_t)(j.ttft_ms * 1000); }
     S.n_gen_req++; S.n_gen_tok += (uint64_t)j.n_gen; S.n_prompt_tok += j.prompt.size(); S.gen_us += (uint64_t)(j.gen_ms * 1000); S.pp_us += (uint64_t)(j.prompt_ms * 1000);
     { std::lock_guard<std::mutex> g(j.m); if (err) { j.err = err; j.status = status; } j.done = true; }
     j.cv.notify_all();
@@ -399,6 +440,7 @@ static void gen_prefill_chunk(Server& S) {
     const double ms = ms_since(t0);
     if (!ok) { gen_finish(S, jp, (err.empty() ? "prefill failed" : err).c_str()); upd(); return; }
     if (end - j.pf_pos >= 48 && ms > 0) { const double r = (end - j.pf_pos) * 1000.0 / ms; S.pf_rate = S.pf_rate > 0 ? 0.6 * S.pf_rate + 0.4 * r : r; }
+    S.rw_prefill.add(end - j.pf_pos, ms);
     j.pf_ms += ms; j.pf_pos = end;
     if (end < n) {
         if (std::find(j.pf_cuts.begin(), j.pf_cuts.end(), end) != j.pf_cuts.end()) {   // reached a boundary: leave a snapshot behind
@@ -429,7 +471,9 @@ static void gen_decode_step(Server& S) {
     std::vector<LmSeq*> seqs; std::vector<const int*> toks; std::vector<int> ns;
     for (auto& j : S.active) { seqs.push_back(&j->seq); toks.push_back(&j->next); ns.push_back(1); }
     std::string err; bool ok = false;
+    const auto tstep = clk::now();
     try { ok = S.lm.step(seqs, toks, ns, S.lg.data(), &err); } catch (const std::exception& e) { err = e.what(); }
+    const double step_ms = ms_since(tstep);
     if (!ok) {
         for (auto& j : S.active) gen_finish(S, j, (err.empty() ? "decode failed" : err).c_str());
         S.active.clear(); S.n_active = 0; return;
@@ -440,6 +484,7 @@ static void gen_decode_step(Server& S) {
         const int tok = j->sampler->sample(S.lg.data() + i * (size_t)V, V, j->hist);
         if (gen_token(S, *j, tok)) gen_finish(S, j); else keep.push_back(j);
     }
+    S.rw_decode.add((int)S.active.size(), step_ms);
     S.active.swap(keep); S.n_active = (int)S.active.size();
 }
 // One scheduler iteration for generation: admit waiting requests into free slots, fill ONE slice of one prompt, then run `decode_share`
@@ -743,6 +788,10 @@ static std::string health_json(Server& S) {
         out.pop_back(); out += l;
     }
     {   // container memory: what is resident now vs the limit, and what admitted media requests have reserved
+        size_t gqn = 0; { std::lock_guard<std::mutex> g(S.qm); gqn = S.gq.size() + S.q.size() + S.dq.size(); }
+        char lv[260]; snprintf(lv, sizeof lv, ",\"live\":{\"decode_tokens_per_second\":%.2f,\"prefill_tokens_per_second\":%.2f,\"connections\":%d,\"waiting\":%zu,\"ttft_ms_mean\":%.1f}",
+                               S.rw_decode.rate(), S.rw_prefill.rate(), S.conns.load(), gqn, S.ttft_n.load() ? S.ttft_us.load() / 1000.0 / (double)S.ttft_n.load() : 0.0);
+        out.pop_back(); out += lv; out += '}';
         double inflight; { std::lock_guard<std::mutex> g(S.mem_m); inflight = S.mem_inflight; }
         const double lim = cgroup_limit_mb(), used = cgroup_used_mb();
         char l[300];
@@ -1040,6 +1089,75 @@ static int handle_systemone(Server& S, const std::string& text, std::string& bod
     return 200;
 }
 
+// Load (or re-load) the API keys: --api-key (repeatable) + --api-key-file. A failed re-read keeps the keys that were loaded.
+static void reload_api_keys(Server& S) {
+    ApiKeys fresh;
+    for (const auto& k : S.o.api_keys) fresh.add_line(k, (int)fresh.keys.size() + 1);
+    if (!S.o.api_key_file.empty()) {
+        FILE* f = fopen(S.o.api_key_file.c_str(), "r");
+        if (!f) { fprintf(stderr, "[serve] cannot read --api-key-file %s: %s (keeping the loaded keys)\n", S.o.api_key_file.c_str(), strerror(errno)); return; }
+        char line[1024]; while (fgets(line, sizeof line, f)) fresh.add_line(line, (int)fresh.keys.size() + 1);
+        fclose(f);
+    }
+    { std::lock_guard<std::mutex> g(S.keys.m); S.keys.keys = fresh.keys; }
+    fprintf(stderr, "[serve] API keys loaded: %zu\n", fresh.keys.size());
+}
+
+// Prometheus text exposition (GET /metrics).
+static std::string metrics_text(Server& S) {
+    std::string o; char b[512];
+    auto metric = [&](const char* name, const char* type, const char* help, double v) { snprintf(b, sizeof b, "# HELP %s %s\n# TYPE %s %s\n%s %.10g\n", name, help, name, type, name, v); o += b; };
+    const double up = std::chrono::duration<double>(clk::now() - S.t_start).count();
+    metric("ferro_uptime_seconds", "gauge", "Seconds since the server started.", up);
+    metric("ferro_http_requests_total", "counter", "HTTP requests received.", (double)S.n_req.load());
+    metric("ferro_http_errors_total", "counter", "HTTP responses with status >= 400.", (double)S.n_err.load());
+    metric("ferro_connections", "gauge", "Open client connections.", S.conns.load());
+    metric("ferro_gpu_busy_ratio", "gauge", "Share of uptime the embedding worker spent computing.", up > 0 ? S.busy_us.load() / 1e6 / up : 0.0);
+    if (S.has_emb) {
+        metric("ferro_embeddings_total", "counter", "Embedding vectors returned.", (double)S.n_emb.load());
+        metric("ferro_embedding_tokens_total", "counter", "Tokens embedded.", (double)S.n_tok.load());
+        metric("ferro_embedding_batches_total", "counter", "Embedding forward passes.", (double)S.n_batches.load());
+    }
+    if (S.has_lm) {
+        size_t gq; { std::lock_guard<std::mutex> g(S.qm); gq = S.gq.size(); }
+        metric("ferro_lm_requests_total", "counter", "Generation requests finished.", (double)S.n_gen_req.load());
+        metric("ferro_lm_prompt_tokens_total", "counter", "Prompt tokens (including cached ones).", (double)S.n_prompt_tok.load());
+        metric("ferro_lm_generated_tokens_total", "counter", "Tokens generated.", (double)S.n_gen_tok.load());
+        metric("ferro_lm_active_sequences", "gauge", "Sequences in the decode batch.", S.n_active.load());
+        metric("ferro_lm_prefilling_sequences", "gauge", "Prompts being filled slice by slice.", S.n_prefill.load());
+        metric("ferro_lm_queued_requests", "gauge", "Generation requests waiting for a slot.", (double)gq);
+        metric("ferro_lm_decode_tokens_per_second", "gauge", "Decode speed over the last 10 s of activity (tokens per busy second, all streams).", S.rw_decode.rate());
+        metric("ferro_lm_prefill_tokens_per_second", "gauge", "Prefill speed over the last 10 s of activity.", S.rw_prefill.rate());
+        metric("ferro_lm_prefix_cache_hits_total", "counter", "Requests that restored a cached prefix.", (double)S.pc_hits.load());
+        metric("ferro_lm_prefix_cache_misses_total", "counter", "Requests with no usable cached prefix.", (double)S.pc_miss.load());
+        metric("ferro_lm_prefix_cache_cached_tokens_total", "counter", "Prompt tokens served from the prefix cache.", (double)S.pc_saved.load());
+        metric("ferro_lm_prefix_cache_evictions_total", "counter", "Prefix cache entries evicted.", (double)S.pc_evict.load());
+        metric("ferro_lm_prefix_cache_entries", "gauge", "Entries in the device prefix cache.", (double)S.pc_entries.load());
+        metric("ferro_lm_prefix_cache_bytes", "gauge", "Device memory held by the prefix cache.", (double)S.pc_used.load());
+        if (S.pstore) {
+            metric("ferro_lm_prefix_snapshots_entries", "gauge", "Prefix snapshots on disk for this model.", (double)S.pstore->entries());
+            metric("ferro_lm_prefix_snapshots_bytes", "gauge", "Disk used by prefix snapshots.", (double)S.pstore->bytes());
+            metric("ferro_lm_prefix_snapshot_disk_hits_total", "counter", "Requests that brought a snapshot in from disk.", (double)S.ps_hits.load());
+        }
+        o += "# HELP ferro_lm_ttft_seconds Time from request arrival to the first generated token.\n# TYPE ferro_lm_ttft_seconds histogram\n";
+        static const char* le[8] = {"0.1", "0.25", "0.5", "1", "2.5", "5", "10", "+Inf"}; uint64_t cum = 0;
+        for (int i = 0; i < 8; ++i) { cum += S.ttft_b[i].load(); snprintf(b, sizeof b, "ferro_lm_ttft_seconds_bucket{le=\"%s\"} %llu\n", le[i], (unsigned long long)cum); o += b; }
+        snprintf(b, sizeof b, "ferro_lm_ttft_seconds_sum %.6f\nferro_lm_ttft_seconds_count %llu\n", S.ttft_us.load() / 1e6, (unsigned long long)S.ttft_n.load()); o += b;
+    }
+    if (S.has_d1) {
+        metric("ferro_d1_requests_total", "counter", "Decision requests answered.", (double)S.n_d1_req.load());
+        metric("ferro_d1_questions_total", "counter", "Decision questions scored.", (double)S.n_d1_q.load());
+        metric("ferro_d1_tokens_total", "counter", "Tokens run through the decision model.", (double)S.n_d1_tok.load());
+        metric("ferro_d1_passes_total", "counter", "Packed decision forward passes.", (double)S.n_d1_pass.load());
+    }
+    double inflight; { std::lock_guard<std::mutex> g(S.mem_m); inflight = S.mem_inflight; }
+    metric("ferro_memory_limit_bytes", "gauge", "Container memory limit (0 = none found).", cgroup_limit_mb() * 1048576.0);
+    metric("ferro_memory_used_bytes", "gauge", "Container anon + shmem memory in use.", cgroup_used_mb() * 1048576.0);
+    metric("ferro_memory_reserved_bytes", "gauge", "Memory reserved by admitted media requests still in flight.", inflight * 1048576.0);
+    metric("ferro_memory_rejected_total", "counter", "Media requests refused because they would not fit.", (double)S.n_mem_rejected.load());
+    return o;
+}
+
 static void handle_conn(Server* Sp, int fd) {
     Server& S = *Sp;
     struct timeval tv; tv.tv_sec = 60; tv.tv_usec = 0;
@@ -1052,10 +1170,49 @@ static void handle_conn(Server* Sp, int fd) {
         const auto t0 = clk::now();
         int status = 200; std::string body, logline; const char* ctype = "application/json";
         S.n_req++;
-        const bool authed = S.o.api_key.empty() || r.path == "/health" || r.path == "/" ||
-                            (r.h.count("authorization") && r.h["authorization"] == "Bearer " + S.o.api_key);
+        if (S.keys_reload.exchange(false)) reload_api_keys(S);
+        bool authed = true; std::string who;
+        if (!S.keys.empty()) {
+            authed = r.path == "/health" || r.path == "/" || (r.path == "/metrics" && S.o.metrics_open);
+            if (!authed) {
+                std::string presented;
+                if (r.h.count("authorization") && r.h["authorization"].compare(0, 7, "Bearer ") == 0) presented = r.h["authorization"].substr(7);
+                else if (r.h.count("x-api-key")) presented = r.h["x-api-key"];
+                authed = !presented.empty() && S.keys.match(presented, &who);
+            }
+        }
         if (!authed) { status = 401; body = err_json("invalid or missing API key", "authentication_error"); }
         else if (r.path == "/health" || r.path == "/v1/health") body = health_json(S);
+        else if (r.path == "/metrics") { body = metrics_text(S); ctype = "text/plain; version=0.0.4; charset=utf-8"; }
+        else if (r.path == "/tokenize" || r.path == "/v1/tokenize" || r.path == "/detokenize" || r.path == "/v1/detokenize") {      // vLLM's fields
+            const bool detok = r.path.find("detokenize") != std::string::npos;
+            try {
+                if (r.method != "POST") throw BadRequest("use POST");
+                if (!S.has_lm) throw BadRequest("no language model loaded (start the server with --lm)");
+                Json b = json_parse(r.body); if (!b.is_object()) throw BadRequest("body must be a JSON object");
+                if (detok) {
+                    const Json* t = b.find("tokens"); if (!t || !t->is_array()) throw BadRequest("\"tokens\" must be an array of token ids");
+                    if (t->arr.size() > 400000) throw BadRequest("at most 400000 tokens");
+                    std::string text; for (const Json& x : t->arr) { const long id = x.t == Json::Int ? (long)x.i : -1; if (id < 0 || id >= S.lm.n_vocab()) throw BadRequest("token id out of range"); text += S.ltok.decode_piece((int)id); }
+                    body = "{\"prompt\":" + dquote(text) + "}";
+                } else {
+                    std::string rendered; const Json* m = b.find("messages");
+                    if (m && m->is_array()) { try { rendered = lfm_chat_render(*m, b.find("tools"), S.chat_opt); } catch (const std::exception& e) { throw BadRequest(std::string("messages: ") + e.what()); } }
+                    else {
+                        const Json* p = b.find("prompt"); if (!p || !p->is_string()) throw BadRequest("give \"prompt\" (a string) or \"messages\"");
+                        const Json* sp = b.find("add_special_tokens"); const bool bos = !(sp && sp->t == Json::Bool && !sp->b);
+                        rendered = (bos ? "<|startoftext|>" : "") + p->s;
+                    }
+                    const std::vector<int> ids = S.ltok.tokenize(rendered, true);
+                    const Json* rs = b.find("return_token_strs"); const bool strs = rs && rs->t == Json::Bool && rs->b;
+                    body = "{\"count\":" + std::to_string(ids.size()) + ",\"max_model_len\":" + std::to_string(S.lm.max_ctx()) + ",\"tokens\":[";
+                    for (size_t i = 0; i < ids.size(); ++i) body += (i ? "," : "") + std::to_string(ids[i]);
+                    body += "]";
+                    if (strs) { body += ",\"token_strs\":["; for (size_t i = 0; i < ids.size(); ++i) body += (i ? "," : "") + dquote(S.ltok.decode_piece(ids[i])); body += "]"; }
+                    body += "}";
+                }
+            } catch (const std::exception& e) { status = 400; body = err_json(e.what(), "invalid_request_error"); }
+        }
         else if (r.path == "/v1/models" || r.path == "/models") body = models_json(S);
         else if (r.path == "/") body = "{\"name\":\"ferro-embed\",\"endpoints\":[\"POST /v1/embeddings\",\"POST /v1/systemone\",\"POST /v1/chat/completions\",\"POST /v1/completions\",\"GET /v1/models\",\"GET /health\"]}";
         else if (r.path == "/apply-template" || r.path == "/v1/apply-template") {              // same contract as llama.cpp: {"messages": [...], "tools": [...]} -> {"prompt": "..."}
@@ -1090,7 +1247,7 @@ static void handle_conn(Server* Sp, int fd) {
         if (status >= 400) S.n_err++;
         const bool ok = respond(fd, status, body, r.keep && !S.stop, ctype, status == 503 ? "Retry-After: 1\r\n" : "");
         if (r.path != "/health")
-            fprintf(stderr, "[serve] %s %s %d %.0fms %s\n", r.method.c_str(), r.path.c_str(), status, ms_since(t0), logline.c_str());
+            fprintf(stderr, "[serve] %s %s %d %.0fms %s%s\n", r.method.c_str(), r.path.c_str(), status, ms_since(t0), logline.c_str(), who.empty() ? "" : (" key=" + who).c_str());
         if (!ok || !r.keep) break;
     }
     close(fd);
@@ -1112,6 +1269,7 @@ int run_server(const ServerOptions& opt) {
     }
     Server& S = *new Server;                       // intentionally leaked: detached connection threads may outlive this function
     S.o = opt; S.has_mm = !opt.mmproj.empty(); S.has_emb = !opt.model.empty(); S.has_lm = !opt.lm.empty(); S.has_d1 = !opt.d1.empty(); g_srv = &S;
+    if (!opt.api_keys.empty() || !opt.api_key_file.empty()) { reload_api_keys(S); if (S.keys.empty()) { fprintf(stderr, "[serve] no usable API key found\n"); return 1; } }
     std::promise<std::string> ready; auto ready_f = ready.get_future();
     fprintf(stderr, "[serve] loading%s%s%s%s ...\n", S.has_emb ? (" " + opt.model).c_str() : "", S.has_mm ? " + mmproj" : "", S.has_lm ? " and LM " : "", S.has_lm ? opt.lm.c_str() : "");
     if (S.has_d1) fprintf(stderr, "[serve] + decision model %s\n", opt.d1.c_str());
@@ -1152,9 +1310,9 @@ int run_server(const ServerOptions& opt) {
         close(fd); S.stop = true; S.qcv.notify_all(); worker.join(); Pool::get().shutdown(); return 1;
     }
     S.listen_fd = fd;
-    signal(SIGINT, on_signal); signal(SIGTERM, on_signal); signal(SIGPIPE, SIG_IGN);
+    signal(SIGINT, on_signal); signal(SIGTERM, on_signal); signal(SIGPIPE, SIG_IGN); signal(SIGHUP, on_hup);
     fprintf(stderr, "[serve] listening on http://%s:%d  (%s%s%sGET /v1/models, GET /health)%s\n", opt.host.c_str(), opt.port, S.has_emb ? "POST /v1/embeddings, " : "", S.has_lm ? "POST /v1/chat/completions, POST /v1/completions, " : "",
-            S.has_d1 ? "POST /v1/systemone, " : "", opt.api_key.empty() ? "" : "  [API key required]");
+            S.has_d1 ? "POST /v1/systemone, " : "", S.keys.empty() ? "" : "  [API key required]");
     while (!S.stop) {
         pollfd p{fd, POLLIN, 0};
         if (poll(&p, 1, 500) <= 0) continue;

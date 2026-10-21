@@ -38,7 +38,7 @@ static void usage() {
         "                   (multimodal EmbeddingGemma 2: items are interleaved in order into one 768-d embedding; vision/audio encoders on the iGPU)\n"
         "       ferro-embed generate --lm LFM2.5.gguf (--prompt TEXT | --messages f.json) [--n-predict N] [--temp T] [--top-k K] [--rep-penalty P] [--seed S]\n"
         "                   (text generation with an LFM2 / LFM2.5 model, e.g. LFM2.5-1.2B-Thinking; chat template + sampler built in)\n"
-        "       ferro-embed serve [--model EG2.gguf [--mmproj P.gguf]] [--lm LFM2.5.gguf [--lm-ctx N] [--lm-slots N] [--prefix-cache-mb N] [--snapshot-dir D [--snapshot-mb N]] [--no-memory-check] [--kv-dtype f32|int8] [--thinking-budget N] [--prefill-slice-ms N] [--decode-share N] [--reasoning-format deepseek|none]] [--d1 d1-omni.gguf [--d1-mmproj P.gguf]] [--host H] [--port P] [--api-key K]\n"
+        "       ferro-embed serve [--model EG2.gguf [--mmproj P.gguf]] [--lm LFM2.5.gguf [--lm-ctx N] [--lm-slots N] [--prefix-cache-mb N] [--snapshot-dir D [--snapshot-mb N]] [--api-key K]... [--api-key-file F] [--metrics-open] [--no-memory-check] [--kv-dtype f32|int8] [--thinking-budget N] [--prefill-slice-ms N] [--decode-share N] [--reasoning-format deepseek|none]] [--d1 d1-omni.gguf [--d1-mmproj P.gguf]] [--host H] [--port P] [--api-key K]\n"
         "       (old form follows)  ferro-embed serve --model EG2.gguf [--mmproj P.gguf] [--host H] [--port N] [--api-key K] [--max-batch-tokens N] [--batch-wait-ms N]\n"
         "                   (resident OpenAI-compatible server: POST /v1/embeddings with text / image_url / input_audio / video_url parts, GET /v1/models, GET /health)\n"
         "       ferro-embed mm-embed --mmproj P.gguf --media image|audio --out f.bin     (per-chunk encoder output, mm_ref format)\n"
@@ -258,7 +258,9 @@ int main(int argc, char** argv) {
         else if (a == "--logits-batch") ga.logits_batch = next("--logits-batch");
         else if (a == "--host") so.host = next("--host");
         else if (a == "--port") so.port = atoi(next("--port"));
-        else if (a == "--api-key") so.api_key = next("--api-key");
+        else if (a == "--api-key") so.api_keys.push_back(next("--api-key"));
+        else if (a == "--api-key-file") so.api_key_file = next("--api-key-file");
+        else if (a == "--metrics-open") so.metrics_open = true;
         else if (a == "--model-name") so.model_name = next("--model-name");
         else if (a == "--max-batch-tokens") so.max_batch_tokens = atoi(next("--max-batch-tokens"));
         else if (a == "--batch-wait-ms") so.batch_wait_ms = atoi(next("--batch-wait-ms"));
@@ -281,6 +283,7 @@ int main(int argc, char** argv) {
         if (so.lm_ctx < 256 || so.lm_slots < 1 || so.lm_slots > 32 || (so.reasoning_format != "deepseek" && so.reasoning_format != "none")) { fprintf(stderr, "bad --lm-ctx / --lm-slots / --reasoning-format (deepseek|none)\n"); return 2; }
         so.model = model; so.mmproj = mmproj; so.lm = ga.lm; so.threads = threads > 0 ? threads : 2; so.video_fps = video_fps;
         if (so.api_key.empty()) if (const char* k = getenv("FERRO_API_KEY")) so.api_key = k;
+        if (!so.api_key.empty()) so.api_keys.insert(so.api_keys.begin(), so.api_key);
         return run_server(so);
     }
     if (cmd == "embed-media") {
