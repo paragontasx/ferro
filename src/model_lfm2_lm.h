@@ -51,7 +51,7 @@ struct LmSeq {
 // Produced by LmEngine::snapshot, consumed by LmEngine::restore (any slot, any number of times). Owns its device buffers.
 struct LmPrefix {
     int n = 0;
-    std::vector<void*> kv, cst;                       // per attention layer: n * kvw floats; per conv layer: 2 * d floats
+    std::vector<void*> kv, kvs, cst;                  // per attention layer: n * kvw floats (int8 KV: n * kvw bytes + kvs: n * kvw/32 fp32 scales); per conv layer: 2 * d floats
     size_t bytes = 0;
     LmPrefix() = default;
     LmPrefix(const LmPrefix&) = delete; LmPrefix& operator=(const LmPrefix&) = delete;
@@ -62,7 +62,9 @@ class LmEngine {
 public:
     struct Impl;
     // n_slots: number of concurrent sequences with device-resident state (KV cache for max_ctx tokens each + conv state)
-    bool init(const std::string& path, int n_threads, int max_ctx, std::string* err, int n_slots = 1);
+    // kv_int8: keep the KV cache as int8 with one fp32 scale per 32 values (about 3.6x smaller than fp32); FERRO_KV=f32|int8 overrides
+    bool init(const std::string& path, int n_threads, int max_ctx, std::string* err, int n_slots = 1, bool kv_int8 = false);
+    bool kv_int8() const { return kv_int8_; }
     int n_slots() const { return n_slots_; }
     void release(LmSeq& s);                          // give the sequence's device slot back (no-op on CPU)
     const LmModel& model() const { return m_; }
@@ -84,6 +86,7 @@ public:
 private:
     LmModel m_;
     int max_ctx_ = 0, n_slots_ = 1;
+    bool kv_int8_ = false;
     std::shared_ptr<Impl> impl_;
     bool forward_gpu(const std::vector<LmSeq*>& seqs, const std::vector<const int*>& toks, const std::vector<int>& n, float* logits, std::string* err,
                      bool force_prefill = false);

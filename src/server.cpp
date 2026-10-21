@@ -488,7 +488,7 @@ static void worker_loop(Server& S, std::promise<std::string>& ready) {
         std::string err;
         if (S.has_emb && !S.me.init(S.o.model, S.o.mmproj, S.o.threads, &err)) { ready.set_value(err.empty() ? "embedding model init failed" : err); return; }
         if (S.has_lm) {
-            if (!S.lm.init(S.o.lm, S.o.threads, S.o.lm_ctx, &err, S.o.lm_slots)) { ready.set_value(err.empty() ? "language model init failed" : "language model: " + err); return; }
+            if (!S.lm.init(S.o.lm, S.o.threads, S.o.lm_ctx, &err, S.o.lm_slots, S.o.kv_int8)) { ready.set_value(err.empty() ? "language model init failed" : "language model: " + err); return; }
             if (!S.ltok.load(S.lm.model().gguf, &err)) { ready.set_value("language model tokenizer: " + err); return; }
             S.chat_opt.typed_content = lfm_template_is_typed(S.lm.model().gguf.get_str("tokenizer.chat_template"));
             S.think_open = S.ltok.token_id("<think>"); S.think_close = S.ltok.token_id("</think>"); S.eos_id = S.lm.model().eos_id;
@@ -1051,7 +1051,7 @@ int run_server(const ServerOptions& opt) {
                 S.chat_opt.typed_content ? "typed-content variant" : "plain-content variant");
         {   // device buffers on an iGPU are system RAM and cannot be swapped out: say how much the KV cache takes and compare with any container limit
             const LmModel& lm = S.lm.model();
-            const double kv_mb = (double)lm.n_attn_layers * S.lm.n_slots() * S.lm.max_ctx() * 2 * lm.n_kv * lm.head_dim * 4 / 1048576.0;
+            const double kv_mb = (double)lm.n_attn_layers * S.lm.n_slots() * S.lm.max_ctx() * 2 * lm.n_kv * lm.head_dim * (S.lm.kv_int8() ? 1.125 : 4.0) / 1048576.0;
             double lim_mb = 0; if (FILE* f = fopen("/sys/fs/cgroup/memory.max", "r")) { unsigned long long v = 0; if (fscanf(f, "%llu", &v) == 1) lim_mb = v / 1048576.0; fclose(f); }
             fprintf(stderr, "[serve] KV cache %.0f MB (%d slot(s) x %d ctx)%s\n", kv_mb, S.lm.n_slots(), S.lm.max_ctx(), lim_mb > 0 ? (" | container memory limit " + std::to_string((long)lim_mb) + " MB").c_str() : "");
         }
@@ -1065,7 +1065,7 @@ int run_server(const ServerOptions& opt) {
         double lim_mb = 0; if (FILE* f = fopen("/sys/fs/cgroup/memory.max", "r")) { unsigned long long v = 0; if (fscanf(f, "%llu", &v) == 1) lim_mb = v / 1048576.0; fclose(f); }
         auto mb = [](const std::string& path) { struct stat st; return !path.empty() && stat(path.c_str(), &st) == 0 ? st.st_size / 1048576.0 : 0.0; };
         double w_mb = mb(opt.model) + mb(opt.mmproj) + mb(opt.lm) + mb(opt.d1) + (S.has_d1 ? mb(S.d1.mmproj_path()) : 0.0);
-        double kv_mb = 0; if (S.has_lm) { const LmModel& lm = S.lm.model(); kv_mb = (double)lm.n_attn_layers * S.lm.n_slots() * S.lm.max_ctx() * 2 * lm.n_kv * lm.head_dim * 4 / 1048576.0; }
+        double kv_mb = 0; if (S.has_lm) { const LmModel& lm = S.lm.model(); kv_mb = (double)lm.n_attn_layers * S.lm.n_slots() * S.lm.max_ctx() * 2 * lm.n_kv * lm.head_dim * (S.lm.kv_int8() ? 1.125 : 4.0) / 1048576.0; }
         const double need_mb = 700 + 1.3 * w_mb + kv_mb + (S.has_lm ? (double)opt.prefix_cache_mb : 0.0);      // + the prefix cache at its full budget
         if (lim_mb > 0 && need_mb > lim_mb)
             fprintf(stderr, "[serve] WARNING: ~%.0f MB needed (weights %.0f MB + KV %.0f MB + runtime) vs a %.0f MB container limit -> drop a model, or lower --lm-slots / --lm-ctx\n", need_mb, w_mb, kv_mb, lim_mb);
