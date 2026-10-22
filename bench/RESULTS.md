@@ -465,3 +465,36 @@ with 727 tokens cached, 4 concurrent identical prompts bit-identical to the sing
 **Still not run** (no oracle in this container - `which llama-server` is empty, so llama.cpp has to be built first): LM parity, d1 parity,
 EG2 cosine, `test_batch_invariance.py`, `test_serve_spec.py`, the speculative-window self-check under real batching, and the hydra A/B with
 and without `--penalty-scope generated`.
+
+**2026-10-22 validation window** (llama.cpp oracle built locally, CPU, `baselines/llama.cpp/build-cpu/bin/llama-server` on :8095, same Q8_0 file;
+`scripts/lm_parity.py` per dtype via `FERRO_KV`):
+
+| dtype | top-1 | per-prompt TV | TV <= 0.06 gate |
+|---|---|---|---|
+| f32 | 12/12 | 0.0066 - 0.0118 | 12/12 |
+| int8 | 12/12 | 0.0045 - 0.0065 | 10/12 |
+| f16 | 12/12 | 0.0013 - 0.0092 | 11/12 |
+
+The int8/f16 gate outliers are the known quantisation-sensitive prompts (worst 0.096 at int8 in the earlier matrix): split-K, the pool and the dtype
+plumbing cost nothing measurable. f16 lands between f32 and int8 on this metric, as a 10-bit mantissa predicts, and in practice nearer f32.
+
+`test_batch_invariance.py` (throwaway 8-slot instance on :8096): **ALL PASS** - temperature 0 and 0.8, 4/4 prompts identical alone vs 6 and 8
+concurrent streams. That is the end-to-end check of split-K together with speculative windows, which the kernel unit test could only approximate.
+
+**#3 verified** - six-turn synthetic agent conversation, each turn appending to the previous prompt, temperature 0, int8 KV, old binary vs new:
+
+| turn (prompt tokens) | old: cached / wall | new: cached / wall |
+|---|---|---|
+| 1 (590) | 0 / 1417 ms | 0 / 1413 ms |
+| 2 (620) | 567 / 339 ms | 590 / 195 ms |
+| 3 (650) | 590 / 343 ms | 620 / 177 ms |
+| 4 (680) | 620 / 316 ms | 650 / 206 ms |
+| 5 (710) | 650 / 353 ms | 680 / 217 ms |
+| 6 (740) | 680 / 358 ms | 710 / 217 ms |
+
+The old build cached the previous prompt minus its tail (a turn behind); the new one restores the previous prompt exactly, so each turn prefills only
+its new reply plus tool output: 1.6-1.7x lower TTFT per turn after the first, ~30 fewer prompt tokens per turn in steady state.
+
+Still open: `test_serve_spec.py`, `test_serve_lm.py`, `test_serve_prefix.py` (they take `--url`; a positional URL makes them exit), d1/EG2 parity,
+f16 at 4 streams, one hydra round, and the copy-heavy penalty A/B. #6 and #7 are unimplemented: the measured decode floor leaves #6 about 1 ms per
+token (~4%) behind a per-slot exactness flag across every GEMM variant, and #7's shared-token fraction has not been dumped yet.
