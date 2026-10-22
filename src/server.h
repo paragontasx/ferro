@@ -27,6 +27,7 @@ struct ServerOptions {
     int prefill_slice_ms = 250;                // while other work waits (decode streams, d1, embeddings) a long prompt is prefilled in slices of about this many ms
     int decode_share = 40;                     // percent of the time decode steps get while a prompt is filling (decode runs ~slice*share/(100-share) ms after each slice)
     int prefix_min_tokens = 32;                // do not cache prefixes shorter than this (the saving would not pay for the copy)
+    bool prefix_tail = true;                   // --no-prefix-tail sets false: chats with several messages or tools also leave a snapshot at the end of the prompt (the next turn of an agent loop extends exactly that prompt)
     int lm_slots = 4;                          // concurrent generations (decode of all active slots runs as one batched pass)
     std::string reasoning_format = "deepseek"; // "deepseek": <think>..</think> -> reasoning_content; "none": keep it inline in content
     float repeat_penalty = 0.f;                // --repeat-penalty: server default for repetition_penalty (<= 0: the sampler's 1.05, LiquidAI's recommendation)

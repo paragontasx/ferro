@@ -192,7 +192,7 @@ It is exact (causal state only, restore == prefill within the usual chunking noi
 Measured on a 1400-token system prompt + 8 different ~30-token digests (24 generated tokens each): per request 4.3 s -> 1.1 s on the 350M (3.9x warm, 2.8x over all 8 incl. the cold first) and 12.4 s -> 2.3 s on the 1.2B (5.5x, 3.5x over 8);
 the restored part costs a device-side copy (writing a 732-token snapshot measured 10-17 ms) instead of ~2.9 s of prefill. Costs: ~25 KB of device memory per cached token (a 1400-token prompt = 33 MB), and the first request of each new prefix pays ~4% for writing the snapshot (workloads that never
 repeat a prefix: turn it off or lower the budget). Per request `"cache_prompt": false` neither reads nor writes the cache (llama.cpp's field name). Boundaries are exact token prefixes, so the cached part must be byte-identical:
-same system text, same tools, same template variant.
+same system text, same tools, same template variant. Chats with several messages or tools also leave a snapshot at the end of the prompt (`--no-prefix-tail` turns it off): the next turn of an agent loop extends exactly that prompt, so it restores it and prefills only the new reply + tool output, instead of restoring the previous turn's boundary and prefilling two turns of text.
 
 **Decisions over HTTP (`--d1`).** `POST /v1/systemone` takes exactly the request documented in "Using d1-omni" (single object or array) and returns the same JSON; text decisions of ~3 questions take ~0.25 s, and they stay at
 ~0.14 s while three chat streams decode (the worker interleaves them). **Regions:** a frame plus a detector box needs no client-side crop / JPEG re-encode. Any image entry (`files` / `images` item or `image_url` part) can be an object:

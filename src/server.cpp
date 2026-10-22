@@ -169,6 +169,7 @@ struct GenJob {
     std::vector<int> hist;
     bool cache_prompt = true;                     // request field (llama.cpp name): false = neither use nor create prefix-cache entries
     int prefix_hint = 0;                          // tokens of the system message when it is an exact prefix of the prompt (a natural cache boundary)
+    bool tail_cut = false;                        // also leave a snapshot at the end of the prompt (several messages or tools: the next turn extends exactly this prompt)
     int cached = 0;                               // prompt tokens restored from the prefix cache instead of prefilled
     int pf_pos = 0; std::vector<int> pf_cuts; bool pc_on = false; double pf_ms = 0;   // resumable prefill: next prompt position, snapshot boundaries still to leave, compute time so far
     bool spec = true; int spec_fail = 0, spec_skip = 0; uint64_t spec_d = 0, spec_a = 0; double spec_acc = 0.55;     // speculative decoding: allowed, back-off state, drafted / accepted tokens
@@ -392,7 +393,8 @@ static void gen_begin(Server& S, const std::shared_ptr<GenJob>& jp) {
     if (j.pc_on) {
         PrefixEntry* e = pc_longest(S, j.prompt);
         PrefixStore::Entry de;
-        if (S.pstore && S.pstore->longest(j.prompt, &de) && (!e || de.toks.size() > e->toks.size() + 32)) {   // the disk has a longer prefix than the device cache: bring it in
+        const std::vector<int> head(j.prompt.begin(), j.prompt.end() - 1);         // usable prefixes leave >= 1 token to prefill (an identical prompt's end-of-prompt snapshot is not one)
+        if (S.pstore && S.pstore->longest(head, &de) && (!e || de.toks.size() > e->toks.size() + 32)) {   // the disk has a longer prefix than the device cache: bring it in
             std::vector<uint8_t> blob;
             if (S.pstore->load(de, &blob)) {
                 if (auto px = S.lm.import_prefix((int)de.toks.size(), blob.data(), blob.size())) {
@@ -414,6 +416,10 @@ static void gen_begin(Server& S, const std::shared_ptr<GenJob>& jp) {
             if (S.lm.prefix_bytes(c) > ((size_t)S.o.prefix_cache_mb << 20)) continue;
             cuts.push_back(c);
         }
+        // the end of the prompt (stored by gen_prefill_chunk when the prompt is complete): the next turn of a chat / agent loop extends exactly this
+        // prompt, while the learned cut above lags one turn behind (it can only find the previous prompt), so each turn re-prefilled two turns of text
+        if (S.o.prefix_tail && j.tail_cut && n >= S.o.prefix_min_tokens && n > pos + 8 && !pc_has(S, j.prompt, n)
+            && S.lm.prefix_bytes(n) <= ((size_t)S.o.prefix_cache_mb << 20)) cuts.push_back(n);
         std::sort(cuts.begin(), cuts.end());
     }
     j.pf_pos = pos; j.pf_cuts = cuts; j.pf_ms = 0;
@@ -456,6 +462,11 @@ static void gen_prefill_chunk(Server& S) {
     }
     upd();
     j.prompt_ms = j.pf_ms;
+    if (std::find(j.pf_cuts.begin(), j.pf_cuts.end(), n) != j.pf_cuts.end()) {      // end-of-prompt snapshot (several messages or tools), before the first token
+        const auto ts = clk::now();
+        pc_store(S, j.prompt, S.lm.snapshot(j.seq));
+        if (getenv("FERRO_PC_DEBUG")) { gpu_sync_for_debug(); fprintf(stderr, "[prefix] end-of-prompt snapshot of %d tokens took %.1f ms (alloc+copy, synced)\n", n, ms_since(ts)); }
+    }
     if (j.pc_on) { S.recent.push_back(j.prompt); if (S.recent.size() > 8) S.recent.pop_front(); }
     j.hist = j.prompt;
     j.sampler.reset(new Sampler(j.sp));
@@ -927,6 +938,10 @@ static std::shared_ptr<GenJob> parse_gen_request(Server& S, const std::string& t
                 if (!pre.empty() && pre.size() < j->prompt.size() && std::equal(pre.begin(), pre.end(), j->prompt.begin())) j->prefix_hint = (int)pre.size();
             } catch (const std::exception&) {}
         }
+    }
+    if (chat && j->cache_prompt && S.o.prefix_cache_mb > 0) {      // a conversation that continues (several messages or tools): also snapshot the end of the prompt
+        const Json* tl = b.find("tools");
+        j->tail_cut = b.find("messages")->arr.size() >= 2 || (tl && tl->is_array() && !tl->arr.empty());
     }
     const int ctx = S.lm.max_ctx();
     if ((int)j->prompt.size() >= ctx) throw BadRequest("prompt is " + std::to_string(j->prompt.size()) + " tokens but the context is " + std::to_string(ctx) + " (start with --lm-ctx N)");
