@@ -19,6 +19,30 @@ binary, **on the integrated GPU by default** (OpenCL, int8 DP4A) with automatic 
 The model kind is detected from the GGUF metadata. libOpenCL is `dlopen`'d, so the binary also runs on
 GPU-less hosts. Native GGUF loading and native tokenizers (Gemma SPM-BPE; LFM2 byte-level BPE).
 
+## What's new (2026-10-22, tag `validated-2026-10-22-2`)
+
+- **Split-K decode attention** (default): context is no longer a tax. A 1.9k-token prompt decodes
+  27-45% faster - 350M at ~1.9k context: 31.7 -> **40.2 tok/s** (f32 KV), 26.8 -> **38.8** (int8).
+  Per attention layer at 1921 keys: 2.82 -> 1.20 ms (f32), 3.76 -> 1.30 ms (int8); a row's output stays
+  bit-identical alone, in any batch order, with any launch stride (speculative windows stay exact).
+- **fp16 KV cache** (`--kv-dtype f16`, opt-in): half the storage of f32 with fp32 arithmetic
+  (4 x 4096: 192 MB vs 108 int8 / 384 f32). After split-K, f32 is both the fast *and* the accurate
+  default - int8 KV is no longer faster anywhere measured.
+- **End-of-prompt prefix snapshots ("tails")**: an agent turn now restores the *previous prompt
+  exactly* and prefills only the new reply + tool output - **1.6-1.7x lower TTFT per turn**. Tails
+  are their own cache class: one per conversation, quarter-budget cap, skipped rather than evicting
+  a shared entry, never written to disk.
+- **CPU pool parking**: idle workers futex-park after a 200 us spin - an idle server now draws
+  **0% of a core** (it used to burn one fully, 62% in-kernel, inside the shared CPU+iGPU power budget).
+- Repetition penalty gained llama.cpp-convention `repeat_last_n` windows and `--penalty-scope generated`
+  for agents that must copy ids/paths/JSON keys out of their prompt.
+- Built-in **`GET /chat`** test page (single file, no external requests): streaming chat + per-reply
+  stats + a d1 "Decide" tab with image/audio upload.
+
+Validation for the whole branch: llama.cpp-oracle parity top-1 **12/12 on f32, int8 and f16** KV,
+batch invariance **ALL PASS** at 6 and 8 concurrent streams (temperature 0 and 0.8), speculative-window
+suites all pass, `make test` green. Per-window logs: `bench/RESULTS.md`.
+
 ## Results (Intel N100, same model files + inputs as llama.cpp, interleaved runs)
 
 **EmbeddingGemma-2** (real embedding path):
@@ -148,7 +172,22 @@ device slots, prefill uses a causal tiled attention kernel, decode batches one t
 | decode, 1 stream | **36-37 tok/s** | 31.8 tok/s |
 | decode, aggregate over 2 / 4 / 8 streams (server) | **58 / 98 / 132 tok/s** | |
 
-Parity vs llama.cpp Q8_0 on the same weights: top-1 12/12, mean TV 0.017 (every prompt < 0.06). This model is far more sensitive to Q8 than the 1.2B (llama.cpp's own Q8 vs F16 is TV 0.040; ferro vs F16 0.043; both flip the same near-tie on an out-of-distribution `<think>` prompt), so compare against the same-weights Q8 oracle for it. Decode streams ~510 MB/token (int8 + fp32 scales) = 19.7 ms at the 25.9 GB/s ceiling against a ~26 ms step; the rest is ~70 small-kernel launches at ~40 us each (after the default conv/qkv fusions), so it is only ~1.2x llama.cpp CPU single-stream; prefill and batched serving are where the iGPU wins (details: `bench/RESULTS.md`, "Decode kernel fusion study").
+**Long-context decode, old vs new binary** (2026-10-22, same file: 64 tokens greedy, `FERRO_LM_STEPTIME`,
+median of the 64 steps, nothing else running; "old" predates split-K attention and the pool fix; the
+table above is short-context and predates the change too):
+
+| ~1.9k-token prompt | f32 KV | int8 KV | f16 KV (new) |
+|---|---|---|---|
+| old binary | 31.7 tok/s | 26.8 tok/s | — |
+| **new (default)** | **40.2** | **38.8** | 35.1 |
+
+Split-K pays only with context (+27% / +45% at 1.9k tokens, nothing at 200) — the old kernel was
+latency-bound, which is also why int8 KV used to beat f32 at decode and now does not. Post-change
+parity against the llama.cpp oracle: top-1 12/12 on all three dtypes (per-prompt TV ≤ 0.06: 12/12
+f32, 10/12 int8, 11/12 f16 — outliers are the known quantisation-sensitive prompts), and
+`test_batch_invariance.py` ALL PASS at 6 and 8 streams (temperature 0 and 0.8).
+
+Parity vs llama.cpp Q8_0 on the same weights: top-1 12/12, mean TV 0.017 (every prompt < 0.06). This model is far more sensitive to Q8 than the 1.2B (llama.cpp's own Q8 vs F16 is TV 0.040; ferro vs F16 0.043; both flip the same near-tie on an out-of-distribution `<think>` prompt), so compare against the same-weights Q8 oracle for it. Decode streams ~510 MB/token (int8 + fp32 scales) = 19.7 ms at the 25.9 GB/s ceiling against a ~26 ms step; the rest is ~70 small-kernel launches at ~40 us each (after the default conv/qkv fusions), so single-stream decode sat ~1.2x llama.cpp CPU before the 2026-10-22 attention fix (at ~1.9k tokens it now runs ~40 vs 32 tok/s; llama.cpp CPU not re-measured at long context); prefill and batched serving are where the iGPU wins (details: `bench/RESULTS.md`, "Decode kernel fusion study").
 The chat template is read from each GGUF: the 350M template walks content arrays itself (text parts concatenated, system arrays too) while the Thinking template does not (llama.cpp's server joins parts with `\n` there); `serve` logs the detected variant and `/apply-template` is byte-identical to llama.cpp's jinja for both.
 
 Decode streams 1.17 GB of weights per token at ~22 GB/s; a pure-streaming read kernel reaches 25.9 GB/s on this iGPU, so Q8 decode is ~85% of the
@@ -178,6 +217,7 @@ curl localhost:8088/v1/embeddings -d '{"input":"hello"}'
 | `POST /tokenize`, `POST /detokenize` | token ids for a `prompt` / `messages` (chat template applied) and back; vLLM's fields |
 | `GET /metrics` | Prometheus text (counters, live tokens/s, TTFT histogram, memory); needs a key when keys are set |
 | `GET /v1/models`, `GET /health` | capabilities / context / slots; queue, active slots, throughput counters |
+| `GET /chat` | built-in single-file test page (no external requests): streaming chat with reasoning display and per-reply stats (cached tokens, TTFT, tok/s, warnings), Stop, settings; a "Decide" tab posts to `/v1/systemone` with image/audio upload |
 
 `<think>..</think>` output is returned as `reasoning_content` (`--reasoning-format none` keeps it inline). Generation is continuously batched over `--lm-slots`
 device slots (each holds `--lm-ctx` tokens of KV cache, ~25 MB per 1k tokens); embedding requests are served between decode steps (a short text embedding
@@ -192,7 +232,21 @@ It is exact (causal state only, restore == prefill within the usual chunking noi
 Measured on a 1400-token system prompt + 8 different ~30-token digests (24 generated tokens each): per request 4.3 s -> 1.1 s on the 350M (3.9x warm, 2.8x over all 8 incl. the cold first) and 12.4 s -> 2.3 s on the 1.2B (5.5x, 3.5x over 8);
 the restored part costs a device-side copy (writing a 732-token snapshot measured 10-17 ms) instead of ~2.9 s of prefill. Costs: ~25 KB of device memory per cached token (a 1400-token prompt = 33 MB), and the first request of each new prefix pays ~4% for writing the snapshot (workloads that never
 repeat a prefix: turn it off or lower the budget). Per request `"cache_prompt": false` neither reads nor writes the cache (llama.cpp's field name). Boundaries are exact token prefixes, so the cached part must be byte-identical:
-same system text, same tools, same template variant. Chats with several messages or tools also leave a snapshot at the end of the prompt (`--no-prefix-tail` turns it off): the next turn of an agent loop extends exactly that prompt, so it restores it and prefills only the new reply + tool output, instead of restoring the previous turn's boundary and prefilling two turns of text.
+same system text, same tools, same template variant. Chats with several messages or tools also leave a
+snapshot at the end of the prompt — **only** once the conversation has actually continued (some
+`assistant` or `tool` message exists), so one-shot system+user calls pay nothing; `--no-prefix-tail`
+turns tails off entirely. Tails are their own LRU class: one entry per conversation lineage (a newer
+tail replaces the one it extends), capped at a quarter of the cache budget, *skipped* rather than
+evicting any non-tail entry — which is what keeps the shared system-prompt entry alive through an agent
+loop — and never written to disk. Measured: on a 5-turn conversation (347-token system prompt)
+`cached_tokens` equals the previous prompt's length from turn 3 on (370/393, 393/416, 416/439); on a
+6-turn synthetic agent conversation the old build restored the prompt *minus its tail* (a turn behind)
+while the new one restores it exactly, prefilling only the new reply + tool output — **1.6-1.7× lower
+TTFT per turn (316-358 ms → 177-217 ms)**. `test_serve_prefix --url` passes with tails on: 20/20 at a
+128 MB cache, and the `--small-cache` run against a real 8 MB instance (entries 1, 5.2 MB, 4 evictions,
+budget respected). One property to watch on a tight cache: when non-tail entries fill the budget a tail
+is skipped rather than evicting them, so a full cache can legitimately hold no tail — that is the cap
+doing its job; raise `--prefix-cache-mb`, it is not a bug.
 
 **Decisions over HTTP (`--d1`).** `POST /v1/systemone` takes exactly the request documented in "Using d1-omni" (single object or array) and returns the same JSON; text decisions of ~3 questions take ~0.25 s, and they stay at
 ~0.14 s while three chat streams decode (the worker interleaves them). **Regions:** a frame plus a detector box needs no client-side crop / JPEG re-encode. Any image entry (`files` / `images` item or `image_url` part) can be an object:
@@ -259,9 +313,10 @@ response (and on the last streamed chunk). `ignore_eos: true` generates past the
 
 **KV cache (`--kv-dtype f32|int8|f16`, default f32).** K/V rows as int8 with one fp32 scale per 32 values (llama.cpp's q8_0 KV scheme), quantized in the fused
 norm+rope+cache-write kernel and dequantized in the attention kernels; prefix snapshots carry the scales. 350M at 4 x 4096: KV 384 -> 108 MB (resident memory -276 MB
-measured). Accuracy vs the same-weights llama.cpp oracle: top-1 12/12 either way, mean TV 0.0172 (f32) -> 0.0276 (int8), the loss concentrated on short prompts.
-Speed: decode ~10-15% slower at a 2k context (350M 23.1 -> 19.6 tok/s, 1.2B 12.0 -> 10.9) because dequantizing adds work to the attention kernel; no change at short context.
-Worth it when memory is the limit, not otherwise.
+measured); f16 sits between (192 MB). Accuracy vs the same-weights llama.cpp oracle: top-1 12/12 either way, mean TV 0.0172 (f32) -> 0.0276 (int8), the loss concentrated on short prompts;
+f16 lands between as a 10-bit mantissa predicts. Speed: before split-K decode attention, int8 cost 10-15% at a 2k context (350M 23.1 -> 19.6 tok/s) - the dequant plus the latency-bound
+per-head kernel. After the 2026-10-22 fix the gap is ~4% (same-binary A/B at 1.9k tokens: f32 40.2 vs int8 38.8 vs f16 35.1 tok/s) and **f32 is both the fast and the accurate default**:
+switch to int8/f16 only when you need the memory, not for speed.
 
 **Memory planning and admission.** `ferro-embed plan <serve flags>` prints what a configuration needs from GGUF headers and file sizes alone (runtime ~700 MB + 1.3 x every
 GGUF + KV + prefix cache; calibrated: 350M + d1 + EG2 + mmproj estimated 3585 MB, measured 3373 MB) against the container limit, with concrete advice when it does not fit
@@ -280,7 +335,8 @@ files from anything else are never loaded (and never deleted), corrupt files are
 speculative drafted / accepted, memory gauges); `/health` adds `live` rates and the speculative counters. `POST /tokenize` and `/detokenize` (vLLM's fields: `prompt` or `messages`,
 `add_special_tokens`, `return_token_strs`; they use the exact tokenization generation uses, so a client can count and plan cached prefixes). Several labelled API keys: `--api-key 'label: key'`
 (repeatable), `--api-key-file F` (one `label: key` or bare key per line, `#` comments; **re-read on SIGHUP**), `Authorization: Bearer` or `x-api-key`; the log names the key used; `/metrics` needs a key unless
-`--metrics-open`, `/health` stays open. `scripts/test_serve_ops.py`.
+`--metrics-open`, `/health` stays open. `scripts/test_serve_ops.py`. **Idle cost:** pool workers futex-park after a 200 µs spin (`FERRO_POOL_SPIN_US`), so an
+idle server draws 0% of a core; before this a live server kept one core at 100% for its whole life (62% in-kernel), inside the shared CPU+iGPU power budget.
 
 ## How the iGPU path is fast
 1. **int8 DP4A GEMMs** (`cl_khr_integer_dot_product`): Q8_0 weights resident on the GPU in a
