@@ -85,10 +85,14 @@ bool op_gemv_pro(int slot, int T, Buf Y, int mode, Buf A, Buf B, Buf wn, Buf Xo,
 bool op_lm_conv_dec_q(Buf C, Buf st, Buf slot, Buf taps, int T, int d);
 bool op_lm_qkv_post_kv(Buf C, int rowc, int T, int nq, int nkv, int hd, Buf qw, Buf kw, Buf cosb, Buf sinb, Buf pos, int hlf, float eps, Buf KV, Buf dst, int kvw);
 bool op_lm_attn_pf(Buf C, int ldc, Buf KV, int ldkv, int voff, int kvbase, int nq, int nkv, int pos0, float scale, int T);
-bool op_lm_attn_dec(Buf C, int ldc, Buf KV, int ldkv, int voff, Buf bases, Buf lens, int nq, int nkv, float scale, int B);
+// decode attention, output -> shared int8 scratch. maxlen = longest lens[b] of the launch (> 0): split-K kernels (128-key slices at fixed positions +
+// an ordered merge; a row's result does not depend on the batch, row order or maxlen); 0 or FERRO_LM_ATTN_SPLIT=0: the per-head kernels
+bool op_lm_attn_dec(Buf C, int ldc, Buf KV, int ldkv, int voff, Buf bases, Buf lens, int nq, int nkv, float scale, int B, int maxlen = 0);
 // int8 KV cache variants: data bytes KVq[row][ldkv] + one fp32 scale per 32 values KVs[row][ldkv/32]
 bool op_lm_attn_pf_q(Buf C, int ldc, Buf KVq, Buf KVs, int ldkv, int voff, int kvbase, int nq, int nkv, int pos0, float scale, int T);
-bool op_lm_attn_dec_q(Buf C, int ldc, Buf KVq, Buf KVs, int ldkv, int voff, Buf bases, Buf lens, int nq, int nkv, float scale, int B);
+bool op_lm_attn_dec_q(Buf C, int ldc, Buf KVq, Buf KVs, int ldkv, int voff, Buf bases, Buf lens, int nq, int nkv, float scale, int B, int maxlen = 0);
+bool dec_split_available();                                                  // the split-K decode attention kernels built
+bool read_qscratch(void* xp, size_t xp_bytes, void* xs, size_t xs_bytes);    // tests: read the shared int8 activation scratch (blocking)
 bool op_lm_qkv_post_kvq(Buf C, int rowc, int T, int nq, int nkv, int hd, Buf qw, Buf kw, Buf cosb, Buf sinb, Buf pos, int hlf, float eps, Buf KVq, Buf KVs, Buf dst, int kvw);
 bool op_silu_mul_q(Buf G, int T, int FF);                    // silu(G[:, :FF]) * G[:, FF:] -> int8
 bool op_bias_act_q(Buf G, Buf b, bool relu, int T, int cols);// (G + b) [relu] -> int8

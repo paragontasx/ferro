@@ -246,6 +246,8 @@ static bool gpu_forward(LmEngine::Impl& in, const LmModel& m, const std::vector<
               && gpu::write(g.bsrc1, g.src1.data(), (size_t)T * 4) && gpu::write(g.bsrc2, g.src2.data(), (size_t)T * 4)
               && gpu::write(g.bslot, g.slot.data(), (size_t)ns * 4) && gpu::write(g.br1, g.r1.data(), (size_t)ns * 4) && gpu::write(g.br2, g.r2.data(), (size_t)ns * 4);
     if (!pf) ok = ok && gpu::write(g.bbase, g.base.data(), (size_t)ns * 4) && gpu::write(g.blen, g.len.data(), (size_t)ns * 4);
+    int dec_maxlen = 0;                                                    // longest key range of this decode step / window: sizes split-K attention
+    if (!pf) for (int v : g.len) if (v > dec_maxlen) dec_maxlen = v;
     int ci = 0, ai = 0;
     static const bool fuse = !(getenv("FERRO_LM_FUSE") && atoi(getenv("FERRO_LM_FUSE")) == 0);      // FERRO_LM_FUSE=0: unfused launches (A/B); unset/1: conv+state and qkv+kv fusions (default); 2: + prologue-fused GEMVs (opt-in, break-even on ADL-N)
     static const bool fuse_pro = fuse && getenv("FERRO_LM_FUSE") && atoi(getenv("FERRO_LM_FUSE")) >= 2;
@@ -300,9 +302,9 @@ static bool gpu_forward(LmEngine::Impl& in, const LmModel& m, const std::vector<
                               && P("kv_write", gpu::op_lm_kv_write(g.C, rowc, qsz, g.kv[ai], g.bdst, T, kvw));
             ok = ok
                  && P("attn", kvq ? (pf ? gpu::op_lm_attn_pf_q(g.C, rowc, g.kv[ai], g.kvs[ai], kvw, ksz, seqs[0]->gpu_slot * g.cap, nq, nkv, pos0, scale, T)
-                                        : gpu::op_lm_attn_dec_q(g.C, rowc, g.kv[ai], g.kvs[ai], kvw, ksz, g.bbase, g.blen, nq, nkv, scale, T))
+                                        : gpu::op_lm_attn_dec_q(g.C, rowc, g.kv[ai], g.kvs[ai], kvw, ksz, g.bbase, g.blen, nq, nkv, scale, T, dec_maxlen))
                                   : (pf ? gpu::op_lm_attn_pf(g.C, rowc, g.kv[ai], kvw, ksz, seqs[0]->gpu_slot * g.cap, nq, nkv, pos0, scale, T)
-                                        : gpu::op_lm_attn_dec(g.C, rowc, g.kv[ai], kvw, ksz, g.bbase, g.blen, nq, nkv, scale, T)))
+                                        : gpu::op_lm_attn_dec(g.C, rowc, g.kv[ai], kvw, ksz, g.bbase, g.blen, nq, nkv, scale, T, dec_maxlen)))
                  && P("gemm", gpu::op_gemm_q(l.wo.gpu_slot, T, g.D));
             ++ai;
         }

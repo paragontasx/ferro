@@ -27,6 +27,134 @@ static double rel(const std::vector<float>& a, const std::vector<float>& b) {
     return num / den;
 }
 
+// LFM2 decode attention (iGPU): split-K kernels vs the per-head kernels vs a double reference on the same K/V, exact invariance, device timing
+static void quant_rows_q8(const std::vector<float>& x, std::vector<int8_t>& q, std::vector<float>& s) {   // int8 + one scale per 32 (the KV cache format)
+    q.resize(x.size()); s.resize(x.size() / 32);
+    for (size_t k = 0; k < s.size(); ++k) {
+        float am = 0.f; for (int i = 0; i < 32; ++i) am = std::max(am, std::fabs(x[k * 32 + i]));
+        const float d = am / 127.f, id = d > 0.f ? 1.f / d : 0.f;
+        s[k] = d;
+        for (int i = 0; i < 32; ++i) q[k * 32 + i] = (int8_t)std::lrint(std::max(-127.f, std::min(127.f, x[k * 32 + i] * id)));
+    }
+}
+static int test_dec_attn() {
+    if (!gpu::dec_split_available()) { printf("gpu decode attention split-K: FAIL (kernels did not build)\n"); return 1; }
+    int fails = 0;
+    std::mt19937 rg(7); std::normal_distribution<float> nd(0.f, 1.f);
+    const float scale = 0.125f;
+    const int nkv = 8, kvw = 2 * nkv * 64;
+    // key counts around the 128-key slice boundaries; the last three rows are one sequence verified as a speculative window
+    const std::vector<int> lens = {1, 127, 128, 129, 300, 1921, 129, 130, 131};
+    const std::vector<int> base = {0, 1, 128, 256, 385, 685, 2606, 2606, 2606};
+    const int B = (int)lens.size(), rows = 2606 + 131, maxlen = 1921;
+    std::vector<float> kv((size_t)rows * kvw);
+    for (auto& v : kv) v = nd(rg);
+    std::vector<int8_t> kq; std::vector<float> ks, kvd(kv.size());
+    quant_rows_q8(kv, kq, ks);
+    for (size_t i = 0; i < kv.size(); ++i) kvd[i] = kq[i] * ks[i / 32];                    // what the int8 kernels see
+    gpu::Buf dKV = gpu::upload(kv.data(), kv.size() * 4), dKQ = gpu::upload(kq.data(), kq.size()), dKS = gpu::upload(ks.data(), ks.size() * 4);
+    gpu::Buf dB = gpu::upload(base.data(), B * 4), dL = gpu::upload(lens.data(), B * 4);
+    for (int G : {2, 4}) {
+        const int nq = nkv * G, cols = nq * 64, ldc = cols + kvw;
+        std::vector<float> Cq((size_t)B * ldc);
+        for (auto& v : Cq) v = nd(rg);
+        gpu::Buf dC = gpu::upload(Cq.data(), Cq.size() * 4);
+        gpu::ensure_qscratch(B, cols);
+        for (int q8 = 0; q8 < 2; ++q8) {
+            const std::vector<float>& K = q8 ? kvd : kv;
+            std::vector<int8_t> xo, xn, xt; std::vector<float> so, sn, st;
+            auto run = [&](gpu::Buf c, gpu::Buf bb, gpu::Buf ll, int nb, int ml, std::vector<int8_t>& xp, std::vector<float>& xs) {
+                const bool ok = q8 ? gpu::op_lm_attn_dec_q(c, ldc, dKQ, dKS, kvw, nkv * 64, bb, ll, nq, nkv, scale, nb, ml)
+                                   : gpu::op_lm_attn_dec(c, ldc, dKV, kvw, nkv * 64, bb, ll, nq, nkv, scale, nb, ml);
+                xp.assign((size_t)nb * cols, 0); xs.assign((size_t)nb * cols / 32, 0.f);
+                return ok && gpu::read_qscratch(xp.data(), xp.size(), xs.data(), xs.size() * 4);
+            };
+            bool ok = run(dC, dB, dL, B, 0, xo, so) && run(dC, dB, dL, B, maxlen, xn, sn);
+            // exact invariance of the split path: launch stride (slice count), each row alone, reversed batch order
+            bool inv = ok && run(dC, dB, dL, B, 4096, xt, st) && xt == xn && st == sn;
+            for (int b = 0; inv && b < B; ++b) {
+                gpu::Buf c1 = gpu::upload(Cq.data() + (size_t)b * ldc, (size_t)ldc * 4), b1 = gpu::upload(&base[b], 4), l1 = gpu::upload(&lens[b], 4);
+                inv = run(c1, b1, l1, 1, lens[b], xt, st) && std::equal(xt.begin(), xt.end(), xn.begin() + (size_t)b * cols)
+                      && std::equal(st.begin(), st.end(), sn.begin() + (size_t)b * cols / 32);
+                gpu::release(c1); gpu::release(b1); gpu::release(l1);
+            }
+            if (inv) {
+                std::vector<float> Cr((size_t)B * ldc); std::vector<int> br(B), lr(B);
+                for (int b = 0; b < B; ++b) {
+                    std::copy(Cq.begin() + (size_t)(B - 1 - b) * ldc, Cq.begin() + (size_t)(B - b) * ldc, Cr.begin() + (size_t)b * ldc);
+                    br[b] = base[B - 1 - b]; lr[b] = lens[B - 1 - b];
+                }
+                gpu::Buf cr = gpu::upload(Cr.data(), Cr.size() * 4), bR = gpu::upload(br.data(), B * 4), lR = gpu::upload(lr.data(), B * 4);
+                inv = run(cr, bR, lR, B, maxlen, xt, st);
+                for (int b = 0; inv && b < B; ++b)
+                    inv = std::equal(xt.begin() + (size_t)b * cols, xt.begin() + (size_t)(b + 1) * cols, xn.begin() + (size_t)(B - 1 - b) * cols)
+                          && std::equal(st.begin() + (size_t)b * cols / 32, st.begin() + (size_t)(b + 1) * cols / 32, sn.begin() + (size_t)(B - 1 - b) * cols / 32);
+                gpu::release(cr); gpu::release(bR); gpu::release(lR);
+            }
+            // accuracy: worst error in units of the reference block's int8 step (rounding alone gives 0.5)
+            double wn = 0, wo = 0;
+            for (int b = 0; ok && b < B; ++b) for (int h = 0; h < nq; ++h) {
+                const int kvh = h / G; const float* q = &Cq[(size_t)b * ldc + h * 64];
+                std::vector<double> p(lens[b]); double mx = -1e300, l = 0, ov[64];
+                for (int j = 0; j < lens[b]; ++j) {
+                    const float* k = &K[(size_t)(base[b] + j) * kvw + kvh * 64];
+                    double d = 0; for (int e = 0; e < 64; ++e) d += (double)q[e] * k[e];
+                    p[j] = d * scale; mx = std::max(mx, p[j]);
+                }
+                for (auto& v : p) { v = std::exp(v - mx); l += v; }
+                for (int e = 0; e < 64; ++e) {
+                    double o = 0; for (int j = 0; j < lens[b]; ++j) o += p[j] * K[(size_t)(base[b] + j) * kvw + nkv * 64 + kvh * 64 + e];
+                    ov[e] = o / l;
+                }
+                for (int e = 0; e < 64; ++e) {
+                    double am = 0; for (int i = e & ~31; i < (e & ~31) + 32; ++i) am = std::max(am, std::fabs(ov[i]));
+                    const double step = am / 127.0;
+                    const size_t xi = (size_t)b * cols + h * 64 + e, si = (size_t)b * cols / 32 + h * 2 + e / 32;
+                    wn = std::max(wn, std::fabs(xn[xi] * (double)sn[si] - ov[e]) / step);
+                    wo = std::max(wo, std::fabs(xo[xi] * (double)so[si] - ov[e]) / step);
+                }
+            }
+            const bool pass = ok && inv && wn < 0.75 && wo < 0.75;
+            printf("gpu decode attn G=%d %s KV, %d rows (1..1921 keys, a 3-row spec window): split-K %.3f / per-head %.3f int8 steps from the double reference; split-K invariant to stride, batch, order: %s %s\n",
+                   G, q8 ? "int8" : "f32", B, wn, wo, inv ? "yes" : "NO", pass ? "PASS" : "FAIL");
+            if (!pass) ++fails;
+        }
+        gpu::release(dC);
+    }
+    {   // device time per attention layer at the LFM2.5-350M decode shape (16 q / 8 kv heads): best of 3 interleaved rounds of 30 launches
+        const int G = 2, nq = nkv * G, cols = nq * 64, ldc = cols + kvw, R = 4, LM = 1921;
+        std::vector<float> Cq((size_t)R * ldc), kt((size_t)R * LM * kvw);
+        for (auto& v : Cq) v = nd(rg);
+        for (auto& v : kt) v = nd(rg);
+        std::vector<int8_t> tq; std::vector<float> ts; quant_rows_q8(kt, tq, ts);
+        std::vector<int> bs(R), la(R, LM), lb(R, 200);
+        for (int r = 0; r < R; ++r) bs[r] = r * LM;
+        gpu::Buf dC = gpu::upload(Cq.data(), Cq.size() * 4), dK = gpu::upload(kt.data(), kt.size() * 4), dQ = gpu::upload(tq.data(), tq.size()),
+                 dS = gpu::upload(ts.data(), ts.size() * 4), dBs = gpu::upload(bs.data(), R * 4), dLa = gpu::upload(la.data(), R * 4), dLb = gpu::upload(lb.data(), R * 4);
+        gpu::ensure_qscratch(R, cols);
+        struct Cfg { int q8, nb, L; const char* name; };
+        const Cfg cfg[] = {{0, 1, LM, "f32 1x1921"}, {1, 1, LM, "int8 1x1921"}, {0, 4, LM, "f32 4x1921"}, {1, 4, LM, "int8 4x1921"}, {0, 1, 200, "f32 1x200"}, {1, 1, 200, "int8 1x200"}};
+        double best[6][2];
+        for (auto& v : best) v[0] = v[1] = 1e9;
+        for (int round = 0; round < 3; ++round) for (int c = 0; c < 6; ++c) for (int sp = 0; sp < 2; ++sp) {
+            const Cfg& f = cfg[c]; const gpu::Buf dl = f.L == LM ? dLa : dLb; const int ml = sp ? f.L : 0;
+            auto op = [&] { return f.q8 ? gpu::op_lm_attn_dec_q(dC, ldc, dQ, dS, kvw, nkv * 64, dBs, dl, nq, nkv, scale, f.nb, ml)
+                                        : gpu::op_lm_attn_dec(dC, ldc, dK, kvw, nkv * 64, dBs, dl, nq, nkv, scale, f.nb, ml); };
+            for (int i = 0; i < 3; ++i) op();
+            gpu::finish();
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < 30; ++i) op();
+            gpu::finish();
+            best[c][sp] = std::min(best[c][sp], std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / 30);
+        }
+        printf("gpu decode attn, one layer at the 350M shape, ms (per-head -> split-K):");
+        for (int c = 0; c < 6; ++c) printf(" %s %.3f -> %.3f%s", cfg[c].name, best[c][0], best[c][1], c < 5 ? "," : "\n");
+        for (gpu::Buf x : {dC, dK, dQ, dS, dBs, dLa, dLb}) gpu::release(x);
+    }
+    gpu::release(dKV); gpu::release(dKQ); gpu::release(dKS); gpu::release(dB); gpu::release(dL);
+    return fails;
+}
+
 int main() {
     Pool::get().init(4);
     int fails = 0;
@@ -174,7 +302,7 @@ int main() {
         if (worst >= 2e-4) fails++;
     }
     {   // iGPU int8 DP4A GEMM vs CPU GEMM (skipped when no OpenCL GPU with integer dot product)
-        if (!gpu::init(false)) printf("gpu dp4a gemm: SKIP (no capable GPU)\n");
+        if (!gpu::init(true)) printf("gpu dp4a gemm: SKIP (no capable GPU)\n");
         else {
             const int rows = 512, cols = 1024, T = 37;
             std::mt19937 rng(11); std::normal_distribution<float> nd(0.f, 1.f);
@@ -191,6 +319,7 @@ int main() {
             double rel = std::sqrt(num / den);
             printf("gpu dp4a gemm (%s) vs cpu: rel_l2=%.2e %s\n", gpu::device_name(), rel, ok && rel < 1e-2 ? "PASS" : "FAIL");
             if (!ok || rel >= 1e-2) ++fails;
+            fails += test_dec_attn();
         }
     }
     Pool::get().shutdown();

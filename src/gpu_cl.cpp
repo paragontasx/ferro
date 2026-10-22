@@ -1882,6 +1882,9 @@ static cl_kernel k_quant = nullptr, k_gemm = nullptr, k_gemm_sw = nullptr, k_rms
                  k_rnq = nullptr, k_hinq = nullptr, k_convq = nullptr, k_siluq = nullptr, k_bactq = nullptr,
                  k_badd = nullptr, k_score = nullptr, k_attq4 = nullptr, k_attq5 = nullptr, k_quantq = nullptr, k_lngq = nullptr, k_dqk = nullptr, k_dsm = nullptr, k_dpv = nullptr, k_qkvg4 = nullptr, k_dqkh = nullptr, k_dpvh = nullptr, k_dsmw = nullptr, k_anq = nullptr, k_aact = nullptr, k_ares = nullptr, k_aconv = nullptr, k_aattn = nullptr, k_lmconv = nullptr, k_lmcst = nullptr, k_lmkv = nullptr, k_lmpf = nullptr, k_lmdec = nullptr, k_lmcdec = nullptr, k_lmqkv = nullptr;
 static cl_kernel k_lmpfq = nullptr, k_lmdecq = nullptr, k_lmqkvq = nullptr, k_lmcwin = nullptr;   // int8-KV variants
+static cl_program g_prog_ds = nullptr;                    // split-K decode attention (own program: a build failure keeps the per-head kernels)
+static cl_kernel k_lmds = nullptr, k_lmdsq = nullptr, k_lmdm = nullptr;
+static bool build_split_attn(bool verbose);
 static std::vector<Slot> g_slots;
 static size_t g_bytes = 0;
 static cl_mem g_Xp = nullptr, g_Xs = nullptr;           // quantized-activation scratch
@@ -1953,6 +1956,7 @@ bool init(bool verbose) {
         {&k_gmvq3, "gelu_mulvec_q3"}, {&k_rnq, "resid_norm_q3"}, {&k_hinq, "head_in_q3"}, {&k_convq, "conv_gate_q3"},
         {&k_siluq, "silu_mul_q8"}, {&k_bactq, "bias_act_q8"}, {&k_badd, "bias_add"}, {&k_score, "score_out"}, {&k_attq4, "attention_q4"}, {&k_attq5, "attention_q5"}, {&k_quantq, "quant_q3"}, {&k_lngq, "ln_gather_q3"}, {&k_dqk, "dattn_qk"}, {&k_dsm, "dattn_stats"}, {&k_dpv, "dattn_pv"}};
     for (auto& k : ks) { *k.k = cl.clCreateKernel(g_prog, k.n, &err); CK(err); }
+    build_split_attn(verbose);                            // optional: when it fails, decode attention stays on the per-head kernels
     g_ok = true;
     if (verbose) fprintf(stderr, "[gpu] %s ready (int8 DP4A GEMM TT=%d KB=%d, on-device layer loop)\n",
                          g_name.c_str(), FERRO_GPU_TT, FERRO_GPU_KB);
@@ -2474,7 +2478,209 @@ bool op_lm_attn_pf(Buf C, int ldc, Buf KV, int ldkv, int voff, int kvbase, int n
     size_t g[2] = {(size_t)nq * 32, (size_t)((T + 31) / 32)}, l[2] = {32, 1};
     return launch(k_lmpf, 2, g, l);
 }
-bool op_lm_attn_dec(Buf C, int ldc, Buf KV, int ldkv, int voff, Buf bases, Buf lens, int nq, int nkv, float scale, int B) {
+// ---------------------------------------------------------------- LFM2 decode attention, split-K
+// The per-head kernel (lm_attn_dec*) runs one work-group per (query head, row) that walks the whole context serially: 16 work-groups for one
+// stream of the 350M on a 24-EU GPU, latency-bound (+17-25 ms per token at a 1.9k context; the int8 cache was slower than f32 although it moves
+// 3.6x fewer bytes). Split-K: one work-group per (kv head, row, slice of 128 keys) covers every query head of the GQA group (K/V read once) and
+// leaves a partial (64 unnormalized dims, max, sum); a merge kernel combines the slices in order and quantizes exactly like the per-head kernel.
+// Slices sit at fixed positions from the sequence start, so a row's result depends only on its own keys - not on the batch, the row order or the
+// slice count of the launch (speculative windows still equal serial decode). FERRO_LM_ATTN_SPLIT=0 selects the per-head kernels.
+static const char* kSrcDs = R"CL(
+#define LMD_GMAX 4
+#define LMD_SKL 128
+__kernel void lm_attn_dsplit(__global const float* C, int ldc, __global const float* KV, int ldkv, int voff,
+                             __global const int* bases, __global const int* lens, int nq, int nkv, float scale,
+                             __global float* P, int nsl) {
+  __local float qs[LMD_GMAX * 64];
+  __local float sc[LMD_GMAX * LMD_SKL];
+  __local float rmx[LMD_GMAX * 16];
+  const int kvh = get_group_id(0), b = get_group_id(1), s = get_group_id(2), lid = get_local_id(0);
+  const int G = nq / nkv, len = lens[b], k0 = s * LMD_SKL;
+  if (k0 >= len) return;                                   // uniform: the whole work-group leaves
+  const int n = min(LMD_SKL, len - k0);
+  for (int i = lid; i < G * 64; i += 64) qs[i] = C[(size_t)b * ldc + kvh * G * 64 + i] * (scale * 1.4426950408889634f);
+  barrier(CLK_LOCAL_MEM_FENCE);
+  const __global float* K0 = KV + (size_t)(bases[b] + k0) * ldkv + kvh * 64;
+  float mx[LMD_GMAX];
+#pragma unroll
+  for (int g = 0; g < LMD_GMAX; ++g) mx[g] = -1e30f;
+  for (int j = lid; j < n; j += 64) {
+    const __global float* row = K0 + j * ldkv;
+    float4 a[LMD_GMAX];
+#pragma unroll
+    for (int g = 0; g < LMD_GMAX; ++g) a[g] = (float4)(0.f);
+    for (int i = 0; i < 16; ++i) {
+      const float4 k4 = vload4(i, row);
+#pragma unroll
+      for (int g = 0; g < LMD_GMAX; ++g) if (g < G) a[g] = mad(vload4(i, qs + g * 64), k4, a[g]);
+    }
+#pragma unroll
+    for (int g = 0; g < LMD_GMAX; ++g) if (g < G) { const float v = a[g].x + a[g].y + a[g].z + a[g].w; sc[g * LMD_SKL + j] = v; mx[g] = fmax(mx[g], v); }
+  }
+  const int sgid = get_sub_group_id(), nsg = get_num_sub_groups();
+#pragma unroll
+  for (int g = 0; g < LMD_GMAX; ++g) if (g < G) { const float r = sub_group_reduce_max(mx[g]); if (get_sub_group_local_id() == 0) rmx[g * 16 + sgid] = r; }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  float m[LMD_GMAX];
+#pragma unroll
+  for (int g = 0; g < LMD_GMAX; ++g) { m[g] = -1e30f; if (g < G) for (int i = 0; i < nsg; ++i) m[g] = fmax(m[g], rmx[g * 16 + i]); }
+  for (int j = lid; j < n; j += 64) {
+#pragma unroll
+    for (int g = 0; g < LMD_GMAX; ++g) if (g < G) sc[g * LMD_SKL + j] = native_exp2(sc[g * LMD_SKL + j] - m[g]);
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  const __global float* V0 = KV + (size_t)(bases[b] + k0) * ldkv + voff + kvh * 64 + lid;
+  float acc[LMD_GMAX], l[LMD_GMAX];
+#pragma unroll
+  for (int g = 0; g < LMD_GMAX; ++g) { acc[g] = 0.f; l[g] = 0.f; }
+  for (int j = 0; j < n; ++j) {
+    const float v = V0[j * ldkv];
+#pragma unroll
+    for (int g = 0; g < LMD_GMAX; ++g) if (g < G) { const float p = sc[g * LMD_SKL + j]; acc[g] = mad(p, v, acc[g]); l[g] += p; }
+  }
+  const int pi0 = (b * nq + kvh * G) * nsl + s;
+#pragma unroll
+  for (int g = 0; g < LMD_GMAX; ++g) if (g < G) {
+    __global float* pp = P + (size_t)(pi0 + g * nsl) * 66;
+    pp[lid] = acc[g];
+    if (lid == 0) { pp[64] = m[g]; pp[65] = l[g]; }
+  }
+}
+// int8 cache: data KVq[row][ldkv] + one fp32 scale per 32 values KVs[row][ldkv/32]; same scores as lm_attn_dec_q (same summation order)
+__kernel void lm_attn_dsplit_q(__global const float* C, int ldc, __global const char* KVq, __global const float* KVs, int ldkv, int voff,
+                               __global const int* bases, __global const int* lens, int nq, int nkv, float scale,
+                               __global float* P, int nsl) {
+  __local float qs[LMD_GMAX * 64];
+  __local float sc[LMD_GMAX * LMD_SKL];
+  __local float rmx[LMD_GMAX * 16];
+  const int kvh = get_group_id(0), b = get_group_id(1), s = get_group_id(2), lid = get_local_id(0);
+  const int G = nq / nkv, len = lens[b], k0 = s * LMD_SKL;
+  if (k0 >= len) return;
+  const int n = min(LMD_SKL, len - k0), r0 = bases[b] + k0, lds = ldkv / 32;
+  for (int i = lid; i < G * 64; i += 64) qs[i] = C[(size_t)b * ldc + kvh * G * 64 + i] * (scale * 1.4426950408889634f);
+  barrier(CLK_LOCAL_MEM_FENCE);
+  const __global char* K0 = KVq + (size_t)r0 * ldkv + kvh * 64;
+  const __global float* KS0 = KVs + (size_t)r0 * lds + kvh * 2;
+  float mx[LMD_GMAX];
+#pragma unroll
+  for (int g = 0; g < LMD_GMAX; ++g) mx[g] = -1e30f;
+  for (int j = lid; j < n; j += 64) {
+    const __global char* row = K0 + j * ldkv;
+    float4 a[LMD_GMAX]; float v0[LMD_GMAX];
+#pragma unroll
+    for (int g = 0; g < LMD_GMAX; ++g) a[g] = (float4)(0.f);
+    for (int i = 0; i < 8; ++i) {
+      const float4 k4 = convert_float4(vload4(i, row));
+#pragma unroll
+      for (int g = 0; g < LMD_GMAX; ++g) if (g < G) a[g] = mad(vload4(i, qs + g * 64), k4, a[g]);
+    }
+#pragma unroll
+    for (int g = 0; g < LMD_GMAX; ++g) { v0[g] = a[g].x + a[g].y + a[g].z + a[g].w; a[g] = (float4)(0.f); }
+    for (int i = 8; i < 16; ++i) {
+      const float4 k4 = convert_float4(vload4(i, row));
+#pragma unroll
+      for (int g = 0; g < LMD_GMAX; ++g) if (g < G) a[g] = mad(vload4(i, qs + g * 64), k4, a[g]);
+    }
+    const float s0 = KS0[j * lds], s1 = KS0[j * lds + 1];
+#pragma unroll
+    for (int g = 0; g < LMD_GMAX; ++g) if (g < G) { const float v = v0[g] * s0 + (a[g].x + a[g].y + a[g].z + a[g].w) * s1; sc[g * LMD_SKL + j] = v; mx[g] = fmax(mx[g], v); }
+  }
+  const int sgid = get_sub_group_id(), nsg = get_num_sub_groups();
+#pragma unroll
+  for (int g = 0; g < LMD_GMAX; ++g) if (g < G) { const float r = sub_group_reduce_max(mx[g]); if (get_sub_group_local_id() == 0) rmx[g * 16 + sgid] = r; }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  float m[LMD_GMAX];
+#pragma unroll
+  for (int g = 0; g < LMD_GMAX; ++g) { m[g] = -1e30f; if (g < G) for (int i = 0; i < nsg; ++i) m[g] = fmax(m[g], rmx[g * 16 + i]); }
+  for (int j = lid; j < n; j += 64) {
+#pragma unroll
+    for (int g = 0; g < LMD_GMAX; ++g) if (g < G) sc[g * LMD_SKL + j] = native_exp2(sc[g * LMD_SKL + j] - m[g]);
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  const __global char* V0 = KVq + (size_t)r0 * ldkv + voff + kvh * 64 + lid;
+  const __global float* VS0 = KVs + (size_t)r0 * lds + voff / 32 + kvh * 2 + (lid >> 5);
+  float acc[LMD_GMAX], l[LMD_GMAX];
+#pragma unroll
+  for (int g = 0; g < LMD_GMAX; ++g) { acc[g] = 0.f; l[g] = 0.f; }
+  for (int j = 0; j < n; ++j) {
+    const float v = (float)V0[j * ldkv] * VS0[j * lds];
+#pragma unroll
+    for (int g = 0; g < LMD_GMAX; ++g) if (g < G) { const float p = sc[g * LMD_SKL + j]; acc[g] = mad(p, v, acc[g]); l[g] += p; }
+  }
+  const int pi0 = (b * nq + kvh * G) * nsl + s;
+#pragma unroll
+  for (int g = 0; g < LMD_GMAX; ++g) if (g < G) {
+    __global float* pp = P + (size_t)(pi0 + g * nsl) * 66;
+    pp[lid] = acc[g];
+    if (lid == 0) { pp[64] = m[g]; pp[65] = l[g]; }
+  }
+}
+// merge the slices of one (head, row) in order, normalize, then the per-head kernel's int8 epilogue (one scale per 32 dims) into Xp / Xs
+__kernel void lm_attn_dmerge(__global const float* P, int nsl, __global const int* lens, int nq, __global uint* Xp, __global float* Xs) {
+  __local float rd[64];
+  __local uint q8u[16];
+  const int h = get_group_id(0), b = get_group_id(1), lid = get_local_id(0);
+  const int ns = min(nsl, (lens[b] + LMD_SKL - 1) / LMD_SKL);
+  const __global float* pp = P + (size_t)(b * nq + h) * nsl * 66;
+  float M = -1e30f;
+  for (int s = 0; s < ns; ++s) M = fmax(M, pp[s * 66 + 64]);
+  float acc = 0.f, l = 0.f;
+  for (int s = 0; s < ns; ++s) { const float w = native_exp2(pp[s * 66 + 64] - M); acc = mad(w, pp[s * 66 + lid], acc); l = mad(w, pp[s * 66 + 65], l); }
+  const float o = l > 0.f ? acc / l : 0.f;
+  rd[lid] = fabs(o);
+  barrier(CLK_LOCAL_MEM_FENCE);
+  const int b0 = lid & ~31;
+  float amax = 0.f;
+  for (int i = 0; i < 32; ++i) amax = fmax(amax, rd[b0 + i]);
+  const float dq = amax / 127.f, id = dq > 0.f ? 1.f / dq : 0.f;
+  ((__local char*)q8u)[lid] = convert_char_sat_rte(o * id);
+  barrier(CLK_LOCAL_MEM_FENCE);
+  const int cols = nq * 64;
+  if (lid < 16) Xp[(size_t)b * (cols / 4) + h * 16 + lid] = q8u[lid];
+  if ((lid & 31) == 0) Xs[(size_t)b * (cols / 32) + h * 2 + (lid >> 5)] = dq;
+}
+)CL";
+static bool build_split_attn(bool verbose) {
+    cl_int err = 0;
+    g_prog_ds = cl.clCreateProgramWithSource(g_ctx, 1, &kSrcDs, nullptr, &err);
+    if (err != CL_SUCCESS || !g_prog_ds) { g_prog_ds = nullptr; return false; }
+    if (cl.clBuildProgram(g_prog_ds, 1, &g_dev, "-cl-std=CL3.0 -cl-mad-enable", nullptr, nullptr) != CL_SUCCESS) {
+        size_t n = 0; cl.clGetProgramBuildInfo(g_prog_ds, g_dev, CL_PROGRAM_BUILD_LOG, 0, nullptr, &n);
+        std::string log(n, '\0'); if (n) cl.clGetProgramBuildInfo(g_prog_ds, g_dev, CL_PROGRAM_BUILD_LOG, n, &log[0], nullptr);
+        fprintf(stderr, "[gpu] split-K decode attention did not build; decode attention stays on the per-head kernels%s\n%s", verbose ? ":" : " (FERRO_VERBOSE=1 shows the log)", verbose ? log.c_str() : "");
+        cl.clReleaseProgram(g_prog_ds); g_prog_ds = nullptr;
+        return false;
+    }
+    k_lmds = cl.clCreateKernel(g_prog_ds, "lm_attn_dsplit", &err);    if (err != CL_SUCCESS) k_lmds = nullptr;
+    k_lmdsq = cl.clCreateKernel(g_prog_ds, "lm_attn_dsplit_q", &err); if (err != CL_SUCCESS) k_lmdsq = nullptr;
+    k_lmdm = cl.clCreateKernel(g_prog_ds, "lm_attn_dmerge", &err);    if (err != CL_SUCCESS) k_lmdm = nullptr;
+    return k_lmds && k_lmdsq && k_lmdm;
+}
+static cl_mem g_dsP = nullptr; static size_t g_dsPcap = 0;              // split-K partials [row][head][slice][66]
+static constexpr int kDsSkl = 128;                                         // keys per slice (= LMD_SKL in kSrcDs)
+static bool dec_split_ok(int nq, int nkv, int maxlen) {
+    static const bool on = !(getenv("FERRO_LM_ATTN_SPLIT") && atoi(getenv("FERRO_LM_ATTN_SPLIT")) == 0);
+    return on && maxlen > 0 && k_lmds && k_lmdsq && k_lmdm && nkv > 0 && nq % nkv == 0 && nq / nkv <= 4;
+}
+static bool dec_split_launch(cl_kernel ks, int nq, int nkv, Buf lens, int B, int nsl) {
+    size_t g[3] = {(size_t)nkv * 64, (size_t)B, (size_t)nsl}, l[3] = {64, 1, 1};
+    if (!launch(ks, 3, g, l)) return false;
+    set_args(k_lmdm, (Buf)g_dsP, (cl_int)nsl, lens, (cl_int)nq, (Buf)g_Xp, (Buf)g_Xs);
+    size_t gm[2] = {(size_t)nq * 64, (size_t)B}, lm[2] = {64, 1};
+    return launch(k_lmdm, 2, gm, lm);
+}
+bool dec_split_available() { return k_lmds && k_lmdsq && k_lmdm; }
+bool read_qscratch(void* xp, size_t xp_bytes, void* xs, size_t xs_bytes) {
+    return g_Xp && g_Xs && xp_bytes <= g_Xpcap && xs_bytes <= g_Xscap && gpu::read((Buf)g_Xp, xp, xp_bytes) && gpu::read((Buf)g_Xs, xs, xs_bytes);
+}
+bool op_lm_attn_dec(Buf C, int ldc, Buf KV, int ldkv, int voff, Buf bases, Buf lens, int nq, int nkv, float scale, int B, int maxlen) {
+    if (dec_split_ok(nq, nkv, maxlen)) {
+        const int nsl = (maxlen + kDsSkl - 1) / kDsSkl;
+        if (ensure(g_dsP, g_dsPcap, (size_t)B * nq * nsl * 66 * 4)) {
+            set_args(k_lmds, C, (cl_int)ldc, KV, (cl_int)ldkv, (cl_int)voff, bases, lens, (cl_int)nq, (cl_int)nkv, scale, (Buf)g_dsP, (cl_int)nsl);
+            return dec_split_launch(k_lmds, nq, nkv, lens, B, nsl);
+        }
+    }
     set_args(k_lmdec, C, (cl_int)ldc, KV, (cl_int)ldkv, (cl_int)voff, bases, lens, (cl_int)nq, (cl_int)nkv, scale, (Buf)g_Xp, (Buf)g_Xs);
     size_t g[2] = {(size_t)nq * 64, (size_t)B}, l[2] = {64, 1};
     return launch(k_lmdec, 2, g, l);
@@ -2506,7 +2712,14 @@ bool op_lm_attn_pf_q(Buf C, int ldc, Buf KVq, Buf KVs, int ldkv, int voff, int k
     size_t g[2] = {(size_t)nq * 32, (size_t)((T + 31) / 32)}, l[2] = {32, 1};
     return launch(k_lmpfq, 2, g, l);
 }
-bool op_lm_attn_dec_q(Buf C, int ldc, Buf KVq, Buf KVs, int ldkv, int voff, Buf bases, Buf lens, int nq, int nkv, float scale, int B) {
+bool op_lm_attn_dec_q(Buf C, int ldc, Buf KVq, Buf KVs, int ldkv, int voff, Buf bases, Buf lens, int nq, int nkv, float scale, int B, int maxlen) {
+    if (dec_split_ok(nq, nkv, maxlen)) {
+        const int nsl = (maxlen + kDsSkl - 1) / kDsSkl;
+        if (ensure(g_dsP, g_dsPcap, (size_t)B * nq * nsl * 66 * 4)) {
+            set_args(k_lmdsq, C, (cl_int)ldc, KVq, KVs, (cl_int)ldkv, (cl_int)voff, bases, lens, (cl_int)nq, (cl_int)nkv, scale, (Buf)g_dsP, (cl_int)nsl);
+            return dec_split_launch(k_lmdsq, nq, nkv, lens, B, nsl);
+        }
+    }
     set_args(k_lmdecq, C, (cl_int)ldc, KVq, KVs, (cl_int)ldkv, (cl_int)voff, bases, lens, (cl_int)nq, (cl_int)nkv, scale, (Buf)g_Xp, (Buf)g_Xs);
     size_t g[2] = {(size_t)nq * 64, (size_t)B}, l[2] = {64, 1};
     return launch(k_lmdecq, 2, g, l);
