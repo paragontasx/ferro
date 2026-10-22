@@ -525,3 +525,16 @@ longer written to the 2 GB disk store.
 Both commits build (`make -j1`, 13 s each). **Neither has been through `test_serve_prefix`**, so production still runs `--no-prefix-tail` and the
 `validated-2026-10-22` tag still marks the last fully validated tree (`7c9d977`), two commits behind HEAD. To re-enable: one window that runs
 `test_serve_prefix --url` with tails on at 128 MB and with `--small-cache`, then remove the flag from `scripts/serve_prod.sh` and re-tag.
+### Tail snapshots re-enabled (validated 2026-10-22, `validated-2026-10-22-2`)
+
+`test_serve_prefix --url` with tails **on**, 128 MB, f32, fresh store: **20 pass / 0 fail** - the regression window2 reported is gone.
+`test_serve_prefix --url --small-cache` against a real 8 MB instance: **5 pass / 0 fail** (`PASS cache stays within the 8 MB budget
+{'entries': 1, 'mb': 5.2, 'evictions': 4}`; the 4 failures in window3 were the harness pointing the suite at a 128 MB server, not code).
+
+Tails engage for a continuing conversation (5 turns, system 347 tokens): `cached/prompt` = 0/347, 327/370, 370/393, 393/416, 416/439 - from
+turn 3 exactly the previous prompt, which is the property the change was for. After the run: 13 entries, 124.7 MB of 128, 25 hits,
+4 evictions; the shared system-prompt entry kept hitting. At 128 MB a cache full of non-tail entries can legitimately leave no room for a
+tail (a tail is skipped rather than evicting one), so `entries` and tail presence are worth watching on the 256 MB production cache rather
+than assumed; the quarter-cache cap keeps tails from ever owning more than 64 MB there.
+
+`scripts/serve_prod.sh` no longer passes `--no-prefix-tail`; production restarts onto tails enabled at the next launch.
