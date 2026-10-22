@@ -445,3 +445,23 @@ context (latency-bound, as expected); 4 streams not measured. Memory 4x4096: 192
 After split-K the KV ranking inverted for single-stream decode: f32 is now both faster (1.20 vs 1.30 ms per layer) and better (mean TV 0.0172 vs
 0.0276). The live serve still runs `--kv-dtype int8`, so switching it to `--kv-dtype f32` is the free quality win today (+276 MB of the ~1 GB
 headroom, and every persisted snapshot goes cold because the dtype is part of the snapshot identity). f16 is the option for when that memory is needed.
+
+**End-to-end decode, old vs new binary** (`generate`, 64 tokens, temperature 0, `FERRO_KV` per row, `FERRO_LM_STEPTIME=1`, median device
+wait+read of the 64 steps, nothing else running; the old binary is `ferro-embed.bak-20261022-1732`):
+
+| prompt | old f32 | new f32 | old int8 | new int8 | new f16 |
+|---|---|---|---|---|---|
+| ~200 tokens | 45.7 tok/s (21.9 ms) | 47.8 (20.9) | 45.2 (22.1) | 46.3 (21.6) | 46.9 (21.3) |
+| ~1900 tokens | 31.7 tok/s (31.5 ms) | **40.2 (24.9)** | 26.8 (37.3) | **38.8 (25.8)** | 35.1 (28.5) |
+
+Split-K pays only with context, as the per-layer numbers predicted: +27% (f32) and +45% (int8) at 1.9k tokens, nothing at 200. The int8
+gain (11.5 ms per token) is the predicted size; f32 gains 6.6 ms. int8 is no longer faster than f32 anywhere measured (1.9k: 24.9 vs 25.8 ms)
+and f16 buys memory, not speed (28.5 ms - the earlier "about equal to f32" guess was optimistic).
+
+**Deployed** 2026-10-22: `scripts/serve_prod.sh` = `--kv-dtype f32 --prefix-cache-mb 256` (`plan` 2641 MB, runtime 3368 MB used / 728 MB
+headroom, no new OOM kills). Live after the restart: idle CPU **0% of a core** (was 100% of one), warm prefix 749-token prompt 3294 -> 475 ms
+with 727 tokens cached, 4 concurrent identical prompts bit-identical to the single run.
+
+**Still not run** (no oracle in this container - `which llama-server` is empty, so llama.cpp has to be built first): LM parity, d1 parity,
+EG2 cosine, `test_batch_invariance.py`, `test_serve_spec.py`, the speculative-window self-check under real batching, and the hydra A/B with
+and without `--penalty-scope generated`.
