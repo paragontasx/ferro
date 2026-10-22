@@ -939,9 +939,15 @@ static std::shared_ptr<GenJob> parse_gen_request(Server& S, const std::string& t
             } catch (const std::exception&) {}
         }
     }
-    if (chat && j->cache_prompt && S.o.prefix_cache_mb > 0) {      // a conversation that continues (several messages or tools): also snapshot the end of the prompt
-        const Json* tl = b.find("tools");
-        j->tail_cut = b.find("messages")->arr.size() >= 2 || (tl && tl->is_array() && !tl->arr.empty());
+    // a tail snapshot pays off only when the conversation has already continued: with just a system and a user message the next request
+    // starts a new prompt anyway, and taking a tail for every one-shot call filled the cache with ~28 MB entries (test_serve_prefix caught it)
+    if (chat && j->cache_prompt && S.o.prefix_cache_mb > 0) {
+        const Json* ms = b.find("messages");
+        for (size_t i = 0; i < ms->arr.size() && !j->tail_cut; ++i) {
+            const Json& m = ms->arr[i];
+            const Json* rl = m.is_object() ? m.find("role") : nullptr;
+            if (rl && rl->is_string() && (rl->s == "assistant" || rl->s == "tool")) j->tail_cut = true;
+        }
     }
     const int ctx = S.lm.max_ctx();
     if ((int)j->prompt.size() >= ctx) throw BadRequest("prompt is " + std::to_string(j->prompt.size()) + " tokens but the context is " + std::to_string(ctx) + " (start with --lm-ctx N)");
