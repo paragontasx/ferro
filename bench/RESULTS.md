@@ -513,3 +513,15 @@ token (~4%) behind a per-slot exactness flag across every GEMM variant, and #7's
 **Fix planned for the tail store:** give tail entries their own small budget (or evict tail entries first), never let one evict the shared
 system-prompt entry, and skip the tail when the device cache is within one tail of its budget. Re-run `test_serve_prefix` with tails on before
 re-enabling it in `serve_prod.sh`.
+### Tail store: fixed in code, not yet validated (commits d046d4a, 5f75fd5)
+
+Two changes. **Trigger:** a tail is taken only when the conversation has already continued (some message has role `assistant` or `tool`). The old
+test (`messages >= 2 || tools`) was true for every chat request, so one-shot system+user calls and every hydra request (it always sends tools)
+left a ~28 MB entry behind. **Class:** tails now have their own budget - storing one first drops older tails that the new prompt extends, so a
+lineage holds one entry instead of one per turn; tail bytes are capped at `max(--prefix-cache-mb / 4, px->bytes)`; and a tail is *skipped* rather
+than evicting any non-tail entry, which is the property that keeps the shared system-prompt entry alive through an agent loop. Tails are also no
+longer written to the 2 GB disk store.
+
+Both commits build (`make -j1`, 13 s each). **Neither has been through `test_serve_prefix`**, so production still runs `--no-prefix-tail` and the
+`validated-2026-10-22` tag still marks the last fully validated tree (`7c9d977`), two commits behind HEAD. To re-enable: one window that runs
+`test_serve_prefix --url` with tails on at 128 MB and with `--small-cache`, then remove the flag from `scripts/serve_prod.sh` and re-tag.
