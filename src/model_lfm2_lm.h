@@ -62,9 +62,11 @@ class LmEngine {
 public:
     struct Impl;
     // n_slots: number of concurrent sequences with device-resident state (KV cache for max_ctx tokens each + conv state)
-    // kv_int8: keep the KV cache as int8 with one fp32 scale per 32 values (about 3.6x smaller than fp32); FERRO_KV=f32|int8 overrides
-    bool init(const std::string& path, int n_threads, int max_ctx, std::string* err, int n_slots = 1, bool kv_int8 = false);
-    bool kv_int8() const { return kv_int8_; }
+    // kv_dtype: 0 = f32, 1 = int8 (one fp32 scale per 32 values, 3.6x smaller), 2 = f16 (half storage, fp32 arithmetic, 1.8x smaller);
+    // FERRO_KV=f32|int8|f16 overrides. f16 needs the fp16 KV kernels and split-K decode attention (GPU only).
+    bool init(const std::string& path, int n_threads, int max_ctx, std::string* err, int n_slots = 1, int kv_dtype = 0);
+    int kv_dtype() const { return kv_dtype_; }
+    size_t kvesz() const { return kv_dtype_ == 1 ? 1 : kv_dtype_ == 2 ? 2 : 4; }   // bytes per cached value
     // Persist / reload a prefix snapshot through host memory (layout: per attention layer [K/V data][scales if int8], per conv layer 2*d floats; exactly
     // prefix_bytes(n) bytes). state_id() hashes what the state depends on (model file, KV dtype, kernel build): only equal ids may exchange snapshots.
     bool export_prefix(const LmPrefix& p, std::vector<uint8_t>* out) const;
@@ -97,7 +99,7 @@ public:
 private:
     LmModel m_;
     int max_ctx_ = 0, n_slots_ = 1;
-    bool kv_int8_ = false;
+    int kv_dtype_ = 0;
     uint64_t state_id_ = 0;
     std::shared_ptr<Impl> impl_;
     bool forward_gpu(const std::vector<LmSeq*>& seqs, const std::vector<const int*>& toks, const std::vector<int>& n, float* logits, std::string* err,

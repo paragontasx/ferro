@@ -434,3 +434,14 @@ sampler unit test only.
 **Pending (needs the server stopped):** `lm_parity.py` (350M, int8 and f32 KV), `test_batch_invariance.py`, `test_serve_lm.py`, `test_serve_prefix.py`,
 `d1_parity.py` and the EG2 cosine check (the pool and `gpu_cl.cpp` are shared), `FERRO_LM_STEPTIME` at 0.2k / 2k context, and the hydra suite (TTFT, cached tokens
 per request, draft acceptance, pass rate) with and without `--penalty-scope generated`.
+
+**fp16 KV cache** (`--kv-dtype f16`, opt-in, GPU only - init refuses it without the fp16 kernels and split-K decode attention). Half storage, fp32
+arithmetic; every stored value is clamped into the fp16 range first (K is RMS-normalised, V is not: max |V| 6.1 on random data, 0 clamped).
+Kernel-level tests (`test_kernels`, no model): the f32 write kernel matches a double reference to 9.1e-7; the f16 store is the rounded fp32 value
+(worst 1.2 fp16 ulp, i.e. rounding alone); split-K decode on f16 rows is 0.50 int8 output steps from a double reference at 1921 keys, the same as the
+f32 and int8 paths. Device time per layer at the 350M shape, 1921 keys, 1 stream: f32 1.21-1.29 ms vs f16 1.18-1.34 ms across runs - no win at this
+context (latency-bound, as expected); 4 streams not measured. Memory 4x4096: 192 MB vs 108 int8 / 384 f32.
+
+After split-K the KV ranking inverted for single-stream decode: f32 is now both faster (1.20 vs 1.30 ms per layer) and better (mean TV 0.0172 vs
+0.0276). The live serve still runs `--kv-dtype int8`, so switching it to `--kv-dtype f32` is the free quality win today (+276 MB of the ~1 GB
+headroom, and every persisted snapshot goes cold because the dtype is part of the snapshot identity). f16 is the option for when that memory is needed.

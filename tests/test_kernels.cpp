@@ -155,6 +155,174 @@ static int test_dec_attn() {
     return fails;
 }
 
+// ---- fp16 KV cache (--kv-dtype f16): the write kernel stores rounded halves of norm+rope K and raw V; split-K decode reads them back
+static uint16_t f2h_bits(float x) {                    // round to nearest even, clamp to the fp16 range (what vstore_half4_rte does)
+    uint32_t u; memcpy(&u, &x, 4);
+    const uint16_t s = (uint16_t)((u >> 16) & 0x8000u);
+    const uint32_t eb = (u >> 23) & 0xffu;
+    uint32_t m = u & 0x7fffffu;
+    if (eb == 0xff) return (uint16_t)(s | 0x7c00u);
+    int e = (int)eb - 127 + 15;
+    if (e >= 31) return (uint16_t)(s | 0x7bffu);
+    if (e <= 0) {
+        if (e < -10) return s;
+        m |= 0x800000u;
+        const int sh = 14 - e;
+        uint32_t r = m >> sh, rem = m & ((1u << sh) - 1), half = 1u << (sh - 1);
+        if (rem > half || (rem == half && (r & 1))) ++r;
+        return (uint16_t)(s | r);
+    }
+    uint32_t r = m >> 13, rem = m & 0x1fffu;
+    if (rem > 0x1000u || (rem == 0x1000u && (r & 1))) { ++r; if (r == 0x400u) { r = 0; if (++e >= 31) return (uint16_t)(s | 0x7bffu); } }
+    return (uint16_t)(s | ((uint32_t)e << 10) | r);
+}
+static float h2f(uint16_t h) {
+    const uint32_t s = (uint32_t)(h & 0x8000u) << 16;
+    uint32_t e = (h >> 10) & 0x1fu, m = h & 0x3ffu, o;
+    if (e == 0) {
+        if (!m) o = s;
+        else { int sh = 0; while (!(m & 0x400u)) { m <<= 1; ++sh; } m &= 0x3ffu; o = s | ((uint32_t)(127 - 14 - sh) << 23) | (m << 13); }
+    } else if (e == 31) o = s | 0x7f800000u | (m << 13);
+    else o = s | ((e - 15 + 127) << 23) | (m << 13);
+    float f; memcpy(&f, &o, 4); return f;
+}
+static int test_kv_f16() {
+    if (!gpu::kv_f16_available()) { printf("gpu f16 KV: FAIL (kernels did not build)\n"); return 1; }
+    int fails = 0;
+    const int nkv = 8, nq = 16, hd = 64, hlf = 32, kvw = 2 * nkv * hd, rowc = nq * hd + kvw;
+    const int rows = 1921, pmax = 2048;
+    std::mt19937 rg(21); std::normal_distribution<float> nd(0.f, 1.f);
+    std::vector<float> C((size_t)rows * rowc), qw(hd), kw(hd), cosf((size_t)pmax * hlf), sinf((size_t)pmax * hlf);
+    for (auto& v : C) v = nd(rg);
+    for (int i = 0; i < hd; ++i) { qw[i] = 1.f + 0.1f * (i % 3); kw[i] = 1.f + 0.1f * (i % 5); }
+    for (int p = 0; p < pmax; ++p) for (int i = 0; i < hlf; ++i) {
+        const double th = p / std::pow(10000.0, 2.0 * i / hd);
+        cosf[(size_t)p * hlf + i] = (float)std::cos(th); sinf[(size_t)p * hlf + i] = (float)std::sin(th);
+    }
+    const std::vector<float> Craw = C;                                  // the kernel rewrites q/k in place
+    std::vector<int> pos(rows), dst(rows);
+    for (int t = 0; t < rows; ++t) { pos[t] = t; dst[t] = t; }
+    gpu::Buf dC = gpu::upload(C.data(), C.size() * 4), dqw = gpu::upload(qw.data(), hd * 4), dkw = gpu::upload(kw.data(), hd * 4);
+    gpu::Buf dcos = gpu::upload(cosf.data(), cosf.size() * 4), dsin = gpu::upload(sinf.data(), sinf.size() * 4);
+    gpu::Buf dpos = gpu::upload(pos.data(), rows * 4), ddst = gpu::upload(dst.data(), rows * 4);
+    gpu::Buf dKV = gpu::alloc((size_t)rows * kvw * 2);
+    bool wok = gpu::op_lm_qkv_post_kv_f(dC, rowc, rows, nq, nkv, hd, dqw, dkw, dcos, dsin, dpos, hlf, 1e-6f, dKV, ddst, kvw);
+    std::vector<uint16_t> kh((size_t)rows * kvw);
+    wok = wok && gpu::read(dKV, kh.data(), kh.size() * 2);
+    std::vector<float> deq(kh.size());
+    for (size_t i = 0; i < kh.size(); ++i) deq[i] = h2f(kh[i]);
+    double worst = 0, vmax = 0; int clampn = 0;
+    for (int t = 0; wok && t < rows; ++t) {
+        const float* r = &Craw[(size_t)t * rowc];
+        for (int s = nq; s < nq + 2 * nkv; ++s) {                        // cached slots: K heads, then V heads (q is not cached)
+            double ref[64];
+            if (s >= nq + nkv) { for (int i = 0; i < hd; ++i) ref[i] = r[(size_t)s * hd + i]; }
+            else {
+                double ss = 0; for (int i = 0; i < hd; ++i) ss += (double)r[(size_t)s * hd + i] * r[(size_t)s * hd + i];
+                const double inv = 1.0 / std::sqrt(ss / hd + 1e-6);
+                for (int i = 0; i < hlf; ++i) {
+                    const double a = r[(size_t)s * hd + i] * inv * kw[i], b = r[(size_t)s * hd + i + hlf] * inv * kw[i + hlf];
+                    const double c = cosf[(size_t)pos[t] * hlf + i], sn = sinf[(size_t)pos[t] * hlf + i];
+                    ref[i] = a * c - b * sn; ref[i + hlf] = b * c + a * sn;
+                }
+            }
+            const int off = s < nq + nkv ? (s - nq) * hd : nkv * hd + (s - nq - nkv) * hd;
+            for (int i = 0; i < hd; ++i) {
+                const double got = deq[(size_t)t * kvw + off + i];
+                vmax = std::max(vmax, std::fabs(ref[i]));
+                if (std::fabs(ref[i]) > 65504.0) ++clampn;
+                worst = std::max(worst, std::fabs(got - ref[i]) / (std::fabs(ref[i]) * (1.0 / 1024.0) + 1e-7));
+            }
+        }
+    }
+    // split-K decode on the stored rows, vs a double reference on the same (dequantized) values; q of row 0 as the kernel left it
+    std::vector<float> C0(C.begin(), C.begin() + rowc);
+    std::vector<int> base1{0}, len1{rows};
+    gpu::Buf dB = gpu::upload(base1.data(), 4), dL = gpu::upload(len1.data(), 4), dC0 = gpu::upload(C0.data(), rowc * 4);
+    gpu::ensure_qscratch(1, nq * hd);
+    std::vector<int8_t> xp((size_t)nq * hd); std::vector<float> xs((size_t)nq * hd / 32);
+    bool aok = wok && gpu::op_lm_attn_dec_f(dC0, rowc, dKV, kvw, nkv * hd, dB, dL, nq, nkv, 0.125f, 1, rows)
+               && gpu::read_qscratch(xp.data(), xp.size(), xs.data(), xs.size() * 4);
+    double worst_a = 0;
+    for (int h = 0; aok && h < nq; ++h) {
+        const int kvh = h / (nq / nkv);
+        std::vector<double> p(rows); double mx = -1e300, l = 0, ov[64];
+        for (int j = 0; j < rows; ++j) {
+            double d = 0; for (int e = 0; e < hd; ++e) d += (double)C0[(size_t)h * hd + e] * deq[(size_t)j * kvw + kvh * hd + e];
+            p[j] = d * 0.125; mx = std::max(mx, p[j]);
+        }
+        for (auto& v : p) { v = std::exp(v - mx); l += v; }
+        for (int e = 0; e < hd; ++e) { double o = 0; for (int j = 0; j < rows; ++j) o += p[j] * deq[(size_t)j * kvw + nkv * hd + kvh * hd + e]; ov[e] = o / l; }
+        for (int e = 0; e < hd; ++e) {
+            double am = 0; for (int i = e & ~31; i < (e & ~31) + 32; ++i) am = std::max(am, std::fabs(ov[i]));
+            const double got = xp[(size_t)h * hd + e] * (double)xs[h * 2 + (e >> 5)];
+            worst_a = std::max(worst_a, std::fabs(got - ov[e]) / (am / 127.0));
+        }
+    }
+    // speed: f32 vs f16 storage of the same values, split-K, 1921 keys, 1 stream (best of 2 x 20 launches)
+    std::vector<float> deqv(deq.begin(), deq.end());
+    gpu::Buf dKV32 = gpu::upload(deqv.data(), deqv.size() * 4);
+    double ms[2] = {1e9, 1e9};
+    for (int round = 0; aok && round < 2; ++round) for (int m = 0; m < 2; ++m) {
+        auto op = [&] { return m ? gpu::op_lm_attn_dec_f(dC0, rowc, dKV, kvw, nkv * hd, dB, dL, nq, nkv, 0.125f, 1, rows)
+                                : gpu::op_lm_attn_dec(dC0, rowc, dKV32, kvw, nkv * hd, dB, dL, nq, nkv, 0.125f, 1, rows); };
+        for (int i = 0; i < 3; ++i) op();
+        gpu::finish();
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < 20; ++i) op();
+        gpu::finish();
+        ms[m] = std::min(ms[m], std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / 20);
+    }
+    // the same host reference against the f32 write kernel: isolates a wrong reference from a wrong f16 store
+    double worst32 = 0;
+    std::vector<float> Kv32v((size_t)rows * kvw);
+    {
+        std::vector<float> C2 = Craw, &Kv32 = Kv32v;
+        gpu::Buf dC2 = gpu::upload(C2.data(), C2.size() * 4), dKV32w = gpu::alloc((size_t)rows * kvw * 4);
+        if (gpu::op_lm_qkv_post_kv(dC2, rowc, rows, nq, nkv, hd, dqw, dkw, dcos, dsin, dpos, hlf, 1e-6f, dKV32w, ddst, kvw)
+            && gpu::read(dKV32w, Kv32.data(), Kv32.size() * 4)) {
+            for (int t = 0; t < rows; ++t) {
+                const float* r = &Craw[(size_t)t * rowc];
+                for (int s = nq; s < nq + 2 * nkv; ++s) {
+                    double ref[64];
+                    if (s >= nq + nkv) { for (int i = 0; i < hd; ++i) ref[i] = r[(size_t)s * hd + i]; }
+                    else {
+                        double ss = 0; for (int i = 0; i < hd; ++i) ss += (double)r[(size_t)s * hd + i] * r[(size_t)s * hd + i];
+                        const double inv = 1.0 / std::sqrt(ss / hd + 1e-6);
+                        for (int i = 0; i < hlf; ++i) {
+                            const double a = r[(size_t)s * hd + i] * inv * kw[i], b = r[(size_t)s * hd + i + hlf] * inv * kw[i + hlf];
+                            const double c = cosf[(size_t)pos[t] * hlf + i], sn = sinf[(size_t)pos[t] * hlf + i];
+                            ref[i] = a * c - b * sn; ref[i + hlf] = b * c + a * sn;
+                        }
+                    }
+                    const int off = s < nq + nkv ? (s - nq) * hd : nkv * hd + (s - nq - nkv) * hd;
+                    for (int i = 0; i < hd; ++i) worst32 = std::max(worst32, std::fabs(Kv32[(size_t)t * kvw + off + i] - ref[i]));
+                }
+            }
+        }
+        gpu::release(dC2); gpu::release(dKV32w);
+    }
+    // direct comparison of the two storages (same inputs, same math): f16 must equal round(f32) wherever it differs, the kernel is wrong
+    double d1632 = 0, wr16 = 0, wr32 = 0; int wt = -1, ws = -1, wi = -1;
+    for (int t = 0; t < rows; ++t) for (int s = nq; s < nq + 2 * nkv; ++s) {
+        const int off = s < nq + nkv ? (s - nq) * hd : nkv * hd + (s - nq - nkv) * hd;
+        for (int i = 0; i < hd; ++i) {
+            const double a = h2f(kh[(size_t)t * kvw + off + i]), b = Kv32v[(size_t)t * kvw + off + i];
+            const double u = std::fabs(a - b) / (std::fabs(b) * (1.0 / 1024.0) + 1e-7);
+            if (u > d1632) { d1632 = u; wt = t; ws = s; wi = i; wr16 = a; wr32 = b; }
+        }
+    }
+    printf("gpu f16 KV: f16 vs f32 storage worst %.2f ulp at t=%d s=%d i=%d (f16 %.9g, f32 %.9g)\n", d1632, wt, ws, wi, wr16, wr32);
+    const bool pass = wok && aok && worst < 1.5 && worst_a < 0.75;   // 1 ulp of the fp16 subnormal grid is coarser than |x|/1024
+    printf("gpu f16 KV: f32 write kernel vs the same reference: maxabs %.3e; f16 store worst %.1f ulp; decode %.2f int8 steps; 1 layer 1921 keys f32 %.3f vs f16 %.3f ms; max|V| %.1f, %d clamped %s\n",
+           worst32, worst, worst_a, ms[0], ms[1], vmax, clampn, pass ? "PASS" : "FAIL");
+    printf("gpu f16 KV: K/V stored within %.2f fp16 ulp (max|V| %.1f, %d clamped); split-K decode %.2f int8 steps from the double reference; "
+           "1 layer 1921 keys f32 %.3f vs f16 %.3f ms %s\n", worst, vmax, clampn, worst_a, ms[0], ms[1], pass ? "PASS" : "FAIL");
+    if (!pass) ++fails;
+    for (gpu::Buf x : {dC, dqw, dkw, dcos, dsin, dpos, ddst, dKV, dKV32, dB, dL, dC0}) gpu::release(x);
+    return fails;
+}
+
 int main() {
     Pool::get().init(4);
     int fails = 0;
@@ -320,6 +488,7 @@ int main() {
             printf("gpu dp4a gemm (%s) vs cpu: rel_l2=%.2e %s\n", gpu::device_name(), rel, ok && rel < 1e-2 ? "PASS" : "FAIL");
             if (!ok || rel >= 1e-2) ++fails;
             fails += test_dec_attn();
+            fails += test_kv_f16();
         }
     }
     Pool::get().shutdown();

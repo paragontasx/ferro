@@ -164,7 +164,7 @@ Fusion / timing-experiment knobs: `FERRO_LM_FUSE=0` (unfused launches), `=2` (op
 One resident process, OpenAI-compatible, embeddings and/or language model and/or the d1 decision model on the same iGPU (one worker thread owns the device):
 ```sh
 ./ferro-embed serve --model models/embeddinggemma-2-Q8_0.gguf --mmproj models/mmproj-embeddinggemma-2-Q8_0.gguf \
-                    --lm models/LFM2.5-1.2B-Thinking-Q8_0.gguf --d1 models/d1-omni-600M-Q8_0.gguf --port 8088 [--lm-slots 4] [--lm-ctx 4096] [--kv-dtype f32|int8] [--spec-draft 6] [--snapshot-dir D] [--api-key 'label: key']... [--host 0.0.0.0]
+                    --lm models/LFM2.5-1.2B-Thinking-Q8_0.gguf --d1 models/d1-omni-600M-Q8_0.gguf --port 8088 [--lm-slots 4] [--lm-ctx 4096] [--kv-dtype f32|int8|f16] [--spec-draft 6] [--snapshot-dir D] [--api-key 'label: key']... [--host 0.0.0.0]
 ./ferro-embed plan <same flags>      # what this configuration needs vs the container limit, before anything is loaded
 curl localhost:8088/v1/chat/completions -d '{"messages":[{"role":"user","content":"What is 17*23?"}],"stream":true}'
 curl localhost:8088/v1/embeddings -d '{"input":"hello"}'
@@ -257,7 +257,7 @@ has not shown drafting works needs a 3-token match. Only with the default fused 
 budget 24: reasoning cut at 24). A reply that stops at `max_tokens` inside `<think>` has empty `content`, so it now says so: a log line, and a `warnings` array in the
 response (and on the last streamed chunk). `ignore_eos: true` generates past the end token (fixed-length benchmark runs).
 
-**int8 KV cache (`--kv-dtype int8`, default f32).** K/V rows as int8 with one fp32 scale per 32 values (llama.cpp's q8_0 KV scheme), quantized in the fused
+**KV cache (`--kv-dtype f32|int8|f16`, default f32).** K/V rows as int8 with one fp32 scale per 32 values (llama.cpp's q8_0 KV scheme), quantized in the fused
 norm+rope+cache-write kernel and dequantized in the attention kernels; prefix snapshots carry the scales. 350M at 4 x 4096: KV 384 -> 108 MB (resident memory -276 MB
 measured). Accuracy vs the same-weights llama.cpp oracle: top-1 12/12 either way, mean TV 0.0172 (f32) -> 0.0276 (int8), the loss concentrated on short prompts.
 Speed: decode ~10-15% slower at a 2k context (350M 23.1 -> 19.6 tok/s, 1.2B 12.0 -> 10.9) because dequantizing adds work to the attention kernel; no change at short context.

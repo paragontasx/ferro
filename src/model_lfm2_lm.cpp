@@ -117,7 +117,7 @@ struct LmEngine::Impl {
     // ---- iGPU state ----
     struct Gpu {
         bool ok = false;
-        int slots = 1, cap = 0, Tmax = 0;
+        int slots = 1, cap = 0, Tmax = 0, kv_dtype = 0;
         std::vector<gpu::Buf> an, fn, taps, qn, kn, kv, kvs, cst, cw;   // per layer (an/fn), per conv layer (taps, cst), per attention layer (qn, kn, kv)
         gpu::Buf out_norm = nullptr, cosb = nullptr, sinb = nullptr, zero = nullptr;
         gpu::Buf X = nullptr, X2 = nullptr, D = nullptr, C = nullptr, G = nullptr, Xl = nullptr, Dl = nullptr, logits = nullptr;
@@ -138,7 +138,8 @@ struct LmEngine::Impl {
 
 // ------------------------------------------------------------------ iGPU path
 static const int kWinMax = 16;      // rows of one speculative verification window
-static bool gpu_setup(LmEngine::Impl& in, LmModel& m, int max_ctx, int n_slots, bool kv_int8_) {
+static bool gpu_setup(LmEngine::Impl& in, LmModel& m, int max_ctx, int n_slots, int kv_dtype_) {
+    const size_t kvesz = kv_dtype_ == 1 ? 1 : kv_dtype_ == 2 ? 2 : 4;
     auto& g = in.g;
     const int d = m.n_embd, hd = m.head_dim, ff = m.n_ff, kvw = 2 * m.n_kv * hd, rowc = m.n_head * hd + kvw;
     if (hd != 64 || d % 32 || d / 4 > 512 || ff % 32 || ff / 8 > 1024 || m.n_head % m.n_kv) return false;
@@ -154,8 +155,9 @@ static bool gpu_setup(LmEngine::Impl& in, LmModel& m, int max_ctx, int n_slots, 
                            g.cw.push_back(gpu::alloc((size_t)kWinMax * 3 * d * 4)); ok = ok && g.cw.back(); }       // copy of the window's in_proj rows (speculative commit)
         else {
             g.qn.push_back(up(l.q_norm)); g.kn.push_back(up(l.k_norm));
-            g.kv.push_back(gpu::alloc((size_t)n_slots * max_ctx * kvw * (kv_int8_ ? 1 : 4))); ok = ok && g.kv.back();
-            if (kv_int8_) { g.kvs.push_back(gpu::alloc((size_t)n_slots * max_ctx * (kvw / 32) * 4)); ok = ok && g.kvs.back(); }
+            g.kv_dtype = kv_dtype_;
+            g.kv.push_back(gpu::alloc((size_t)n_slots * max_ctx * kvw * kvesz)); ok = ok && g.kv.back();
+            if (kv_dtype_ == 1) { g.kvs.push_back(gpu::alloc((size_t)n_slots * max_ctx * (kvw / 32) * 4)); ok = ok && g.kvs.back(); }
         }
     }
     g.out_norm = up(m.out_norm); g.cosb = up(m.rope.cosb); g.sinb = up(m.rope.sinb);
@@ -211,6 +213,7 @@ static bool gpu_forward(LmEngine::Impl& in, const LmModel& m, const std::vector<
     struct Policy { Policy(int p) { static const char* e = getenv("FERRO_ROW_POLICY"); gpu::set_row_policy(e && atoi(e) == 0 ? 0 : p); } ~Policy() { gpu::set_row_policy(0); } } policy_guard(pf ? 2 : 1);
     auto& g = in.g;
     const bool kvq = !g.kvs.empty();                                       // int8 KV cache
+    const bool kvf = g.kv_dtype == 2;                                      // f16 KV cache
     const int d = m.n_embd, hd = m.head_dim, nq = m.n_head, nkv = m.n_kv, ff = m.n_ff, T = (int)ids.size(), ns = (int)seqs.size();
     const int qsz = nq * hd, ksz = nkv * hd, kvw = 2 * ksz, rowc = qsz + kvw;
     const float scale = 1.0f / std::sqrt((float)hd);
@@ -297,14 +300,17 @@ static bool gpu_forward(LmEngine::Impl& in, const LmModel& m, const std::vector<
         } else {
             ok = P("gemm", first_gemm(l.wqkv.gpu_slot, il, g.C));
             if (ok && kvq) ok = P("qkv_post", gpu::op_lm_qkv_post_kvq(g.C, rowc, T, nq, nkv, hd, g.qn[ai], g.kn[ai], g.cosb, g.sinb, g.bpos, hd / 2, m.rms_eps, g.kv[ai], g.kvs[ai], g.bdst, kvw));
+            else if (ok && kvf) ok = P("qkv_post", gpu::op_lm_qkv_post_kv_f(g.C, rowc, T, nq, nkv, hd, g.qn[ai], g.kn[ai], g.cosb, g.sinb, g.bpos, hd / 2, m.rms_eps, g.kv[ai], g.bdst, kvw));
             else if (ok && fuse) ok = P("qkv_post", gpu::op_lm_qkv_post_kv(g.C, rowc, T, nq, nkv, hd, g.qn[ai], g.kn[ai], g.cosb, g.sinb, g.bpos, hd / 2, m.rms_eps, g.kv[ai], g.bdst, kvw));
             else if (ok) ok = P("qkv_post", gpu::op_qkv_post(g.C, rowc, T, nq, nkv, hd, g.qn[ai], g.kn[ai], g.cosb, g.sinb, g.bpos, hd / 2, m.rms_eps, false))
                               && P("kv_write", gpu::op_lm_kv_write(g.C, rowc, qsz, g.kv[ai], g.bdst, T, kvw));
             ok = ok
                  && P("attn", kvq ? (pf ? gpu::op_lm_attn_pf_q(g.C, rowc, g.kv[ai], g.kvs[ai], kvw, ksz, seqs[0]->gpu_slot * g.cap, nq, nkv, pos0, scale, T)
                                         : gpu::op_lm_attn_dec_q(g.C, rowc, g.kv[ai], g.kvs[ai], kvw, ksz, g.bbase, g.blen, nq, nkv, scale, T, dec_maxlen))
-                                  : (pf ? gpu::op_lm_attn_pf(g.C, rowc, g.kv[ai], kvw, ksz, seqs[0]->gpu_slot * g.cap, nq, nkv, pos0, scale, T)
-                                        : gpu::op_lm_attn_dec(g.C, rowc, g.kv[ai], kvw, ksz, g.bbase, g.blen, nq, nkv, scale, T, dec_maxlen)))
+                                  : kvf ? (pf ? gpu::op_lm_attn_pf_f(g.C, rowc, g.kv[ai], kvw, ksz, seqs[0]->gpu_slot * g.cap, nq, nkv, pos0, scale, T)
+                                             : gpu::op_lm_attn_dec_f(g.C, rowc, g.kv[ai], kvw, ksz, g.bbase, g.blen, nq, nkv, scale, T, dec_maxlen))
+                                        : (pf ? gpu::op_lm_attn_pf(g.C, rowc, g.kv[ai], kvw, ksz, seqs[0]->gpu_slot * g.cap, nq, nkv, pos0, scale, T)
+                                              : gpu::op_lm_attn_dec(g.C, rowc, g.kv[ai], kvw, ksz, g.bbase, g.blen, nq, nkv, scale, T, dec_maxlen)))
                  && P("gemm", gpu::op_gemm_q(l.wo.gpu_slot, T, g.D));
             ++ai;
         }
@@ -364,11 +370,11 @@ bool LmEngine::commit(const std::vector<LmSeq*>& seqs, const std::vector<int>& r
     return ok;
 }
 
-bool LmEngine::init(const std::string& path, int n_threads, int max_ctx, std::string* err, int n_slots, bool kv_int8) {
+bool LmEngine::init(const std::string& path, int n_threads, int max_ctx, std::string* err, int n_slots, int kv_dtype) {
     (void)n_threads;
     max_ctx_ = max_ctx; n_slots_ = std::max(1, n_slots);
-    if (const char* e = getenv("FERRO_KV")) kv_int8 = std::string(e) == "int8";
-    kv_int8_ = kv_int8;
+    if (const char* e = getenv("FERRO_KV")) { const std::string v(e); kv_dtype = v == "int8" ? 1 : v == "f16" ? 2 : 0; }
+    kv_dtype_ = kv_dtype;
     {   // identity of persisted device state: model file (size + head + tail), KV dtype, and the build of the kernels that produced it
         uint64_t h = 1469598103934665603ull;
         auto mix = [&](const void* d, size_t n) { const uint8_t* p = (const uint8_t*)d; for (size_t i = 0; i < n; ++i) { h ^= p[i]; h *= 1099511628211ull; } };
@@ -378,7 +384,7 @@ bool LmEngine::init(const std::string& path, int n_threads, int max_ctx, std::st
             for (long off : {0L, std::max(0L, sz - (1L << 20))}) { fseek(f, off, SEEK_SET); const size_t n = fread(buf.data(), 1, buf.size(), f); mix(buf.data(), n); }
             fclose(f);
         }
-        const int abi = 1; mix(&abi, sizeof abi); mix(&kv_int8_, sizeof kv_int8_);
+        const int abi = 1; mix(&abi, sizeof abi); mix(&kv_dtype_, sizeof kv_dtype_);
         mix(gpu::build_id(), strlen(gpu::build_id())); const char* me = __DATE__ " " __TIME__; mix(me, strlen(me));
         state_id_ = h;
     }
@@ -387,7 +393,12 @@ bool LmEngine::init(const std::string& path, int n_threads, int max_ctx, std::st
     const char* ge = getenv("FERRO_GPU"); const char* gl = getenv("FERRO_LM_GPU");
     if ((!ge || atoi(ge) != 0) && (!gl || atoi(gl) != 0)) {
         const bool verbose = getenv("FERRO_VERBOSE") != nullptr;
-        if (gpu::init(verbose) && gpu_setup(*impl_, m_, max_ctx_, n_slots_, kv_int8_)) impl_->g.ok = true;
+        const bool gok = gpu::init(verbose);
+        if (kv_dtype_ == 2 && !(gok && gpu::kv_f16_available() && gpu::dec_split_available())) {
+            if (err) *err = "f16 KV needs the iGPU with the fp16 KV kernels and split-K decode attention (not available here, or FERRO_LM_ATTN_SPLIT=0); use --kv-dtype f32 or int8";
+            return false;
+        }
+        if (gok && gpu_setup(*impl_, m_, max_ctx_, n_slots_, kv_dtype_)) impl_->g.ok = true;
         else if (verbose) fprintf(stderr, "[lm] iGPU path unavailable -> CPU\n");
     }
     return true;
@@ -411,7 +422,7 @@ void LmEngine::reset(LmSeq& s) const {
 LmPrefix::~LmPrefix() { for (void* b : kv) if (b) gpu::release(b); for (void* b : kvs) if (b) gpu::release(b); for (void* b : cst) if (b) gpu::release(b); }
 
 size_t LmEngine::prefix_bytes(int n_tokens) const {
-    const size_t kvw = (size_t)2 * m_.n_kv * m_.head_dim, per_row = kv_int8_ ? kvw + kvw / 32 * 4 : kvw * 4;
+    const size_t kvw = (size_t)2 * m_.n_kv * m_.head_dim, per_row = kvw * kvesz() + (kv_dtype_ == 1 ? kvw / 32 * 4 : 0);
     return (size_t)n_tokens * per_row * m_.n_attn_layers + (size_t)2 * m_.n_embd * 4 * m_.n_conv_layers;
 }
 
@@ -421,13 +432,13 @@ std::shared_ptr<LmPrefix> LmEngine::snapshot(const LmSeq& s) const {
     const size_t kvw = (size_t)2 * m_.n_kv * m_.head_dim, d = (size_t)m_.n_embd;
     auto p = std::make_shared<LmPrefix>();
     p->n = s.n_past;
-    const size_t esz = kv_int8_ ? 1 : 4, rows = (size_t)s.n_past * kvw * esz, srows = (size_t)s.n_past * (kvw / 32) * 4;
+    const size_t esz = kvesz(), rows = (size_t)s.n_past * kvw * esz, srows = (size_t)s.n_past * (kvw / 32) * 4;
     for (size_t l = 0; l < g.kv.size(); ++l) {
         gpu::Buf b = gpu::alloc(rows);
         if (!b) return nullptr;
         p->kv.push_back(b);
         if (!gpu::copy(b, 0, g.kv[l], (size_t)s.gpu_slot * g.cap * kvw * esz, rows)) return nullptr;
-        if (kv_int8_) {
+        if (kv_dtype_ == 1) {
             gpu::Buf sb = gpu::alloc(srows);
             if (!sb) return nullptr;
             p->kvs.push_back(sb);
@@ -446,11 +457,11 @@ std::shared_ptr<LmPrefix> LmEngine::snapshot(const LmSeq& s) const {
 
 bool LmEngine::export_prefix(const LmPrefix& p, std::vector<uint8_t>* out) const {
     if (!impl_ || !impl_->g.ok || p.kv.size() != impl_->g.kv.size()) return false;
-    const size_t kvw = (size_t)2 * m_.n_kv * m_.head_dim, d = (size_t)m_.n_embd, esz = kv_int8_ ? 1 : 4;
+    const size_t kvw = (size_t)2 * m_.n_kv * m_.head_dim, d = (size_t)m_.n_embd, esz = kvesz();
     out->resize(prefix_bytes(p.n)); size_t off = 0;
     auto rd = [&](void* b, size_t n) { const bool ok = gpu::read(b, out->data() + off, n); off += n; return ok; };
     bool ok = true;
-    for (size_t l = 0; ok && l < p.kv.size(); ++l) { ok = rd(p.kv[l], (size_t)p.n * kvw * esz); if (ok && kv_int8_) ok = rd(p.kvs[l], (size_t)p.n * (kvw / 32) * 4); }
+    for (size_t l = 0; ok && l < p.kv.size(); ++l) { ok = rd(p.kv[l], (size_t)p.n * kvw * esz); if (ok && kv_dtype_ == 1) ok = rd(p.kvs[l], (size_t)p.n * (kvw / 32) * 4); }
     for (size_t l = 0; ok && l < p.cst.size(); ++l) ok = rd(p.cst[l], 2 * d * 4);
     return ok && off == out->size();
 }
@@ -458,12 +469,12 @@ bool LmEngine::export_prefix(const LmPrefix& p, std::vector<uint8_t>* out) const
 std::shared_ptr<LmPrefix> LmEngine::import_prefix(int n_tokens, const uint8_t* data, size_t len) const {
     if (!impl_ || !impl_->g.ok || n_tokens <= 0 || n_tokens >= max_ctx_ || len != prefix_bytes(n_tokens)) return nullptr;
     auto& g = impl_->g;
-    const size_t kvw = (size_t)2 * m_.n_kv * m_.head_dim, d = (size_t)m_.n_embd, esz = kv_int8_ ? 1 : 4;
+    const size_t kvw = (size_t)2 * m_.n_kv * m_.head_dim, d = (size_t)m_.n_embd, esz = kvesz();
     auto p = std::make_shared<LmPrefix>(); p->n = n_tokens; size_t off = 0;
     auto up = [&](size_t n) -> void* { void* b = gpu::upload(data + off, n); off += n; return b; };
     for (size_t l = 0; l < g.kv.size(); ++l) {
         void* b = up((size_t)n_tokens * kvw * esz); if (!b) return nullptr; p->kv.push_back(b);
-        if (kv_int8_) { void* sb = up((size_t)n_tokens * (kvw / 32) * 4); if (!sb) return nullptr; p->kvs.push_back(sb); }
+        if (kv_dtype_ == 1) { void* sb = up((size_t)n_tokens * (kvw / 32) * 4); if (!sb) return nullptr; p->kvs.push_back(sb); }
     }
     for (size_t l = 0; l < g.cst.size(); ++l) { void* b = up(2 * d * 4); if (!b) return nullptr; p->cst.push_back(b); }
     p->bytes = prefix_bytes(n_tokens);
@@ -480,10 +491,10 @@ bool LmEngine::restore(LmSeq& s, const LmPrefix& p) const {
         s.gpu_slot = g.free_slots.back(); g.free_slots.pop_back();
     }
     bool ok = true;
-    const size_t esz = kv_int8_ ? 1 : 4;
+    const size_t esz = kvesz();
     for (size_t l = 0; l < g.kv.size(); ++l) {
         ok = ok && gpu::copy(g.kv[l], (size_t)s.gpu_slot * g.cap * kvw * esz, p.kv[l], 0, (size_t)p.n * kvw * esz);
-        if (kv_int8_) ok = ok && gpu::copy(g.kvs[l], (size_t)s.gpu_slot * g.cap * (kvw / 32) * 4, p.kvs[l], 0, (size_t)p.n * (kvw / 32) * 4);
+        if (kv_dtype_ == 1) ok = ok && gpu::copy(g.kvs[l], (size_t)s.gpu_slot * g.cap * (kvw / 32) * 4, p.kvs[l], 0, (size_t)p.n * (kvw / 32) * 4);
     }
     for (size_t l = 0; l < g.cst.size(); ++l) ok = ok && gpu::copy(g.cst[l], (size_t)s.gpu_slot * 2 * d * 4, p.cst[l], 0, 2 * d * 4);
     if (ok) s.n_past = p.n;

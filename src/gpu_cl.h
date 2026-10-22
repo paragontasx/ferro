@@ -93,6 +93,11 @@ bool op_lm_attn_pf_q(Buf C, int ldc, Buf KVq, Buf KVs, int ldkv, int voff, int k
 bool op_lm_attn_dec_q(Buf C, int ldc, Buf KVq, Buf KVs, int ldkv, int voff, Buf bases, Buf lens, int nq, int nkv, float scale, int B, int maxlen = 0);
 bool dec_split_available();                                                  // the split-K decode attention kernels built
 bool read_qscratch(void* xp, size_t xp_bytes, void* xs, size_t xs_bytes);    // tests: read the shared int8 activation scratch (blocking)
+// fp16 KV cache (--kv-dtype f16): half storage, fp32 arithmetic; works with the split-K decode path
+bool kv_f16_available();
+bool op_lm_qkv_post_kv_f(Buf C, int rowc, int T, int nq, int nkv, int hd, Buf qw, Buf kw, Buf cosb, Buf sinb, Buf pos, int hlf, float eps, Buf KV, Buf dst, int kvw);
+bool op_lm_attn_pf_f(Buf C, int ldc, Buf KV, int ldkv, int voff, int kvbase, int nq, int nkv, int pos0, float scale, int T);
+bool op_lm_attn_dec_f(Buf C, int ldc, Buf KV, int ldkv, int voff, Buf bases, Buf lens, int nq, int nkv, float scale, int B, int maxlen);
 bool op_lm_qkv_post_kvq(Buf C, int rowc, int T, int nq, int nkv, int hd, Buf qw, Buf kw, Buf cosb, Buf sinb, Buf pos, int hlf, float eps, Buf KVq, Buf KVs, Buf dst, int kvw);
 bool op_silu_mul_q(Buf G, int T, int FF);                    // silu(G[:, :FF]) * G[:, FF:] -> int8
 bool op_bias_act_q(Buf G, Buf b, bool relu, int T, int cols);// (G + b) [relu] -> int8

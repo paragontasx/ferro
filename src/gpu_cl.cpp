@@ -1884,6 +1884,7 @@ static cl_kernel k_quant = nullptr, k_gemm = nullptr, k_gemm_sw = nullptr, k_rms
 static cl_kernel k_lmpfq = nullptr, k_lmdecq = nullptr, k_lmqkvq = nullptr, k_lmcwin = nullptr;   // int8-KV variants
 static cl_program g_prog_ds = nullptr;                    // split-K decode attention (own program: a build failure keeps the per-head kernels)
 static cl_kernel k_lmds = nullptr, k_lmdsq = nullptr, k_lmdm = nullptr;
+static cl_kernel k_lmkvf = nullptr, k_lmpff = nullptr, k_lmdsf = nullptr;   // fp16 KV variants (same program)
 static bool build_split_attn(bool verbose);
 static std::vector<Slot> g_slots;
 static size_t g_bytes = 0;
@@ -2639,6 +2640,160 @@ __kernel void lm_attn_dmerge(__global const float* P, int nsl, __global const in
   if (lid < 16) Xp[(size_t)b * (cols / 4) + h * 16 + lid] = q8u[lid];
   if ((lid & 31) == 0) Xs[(size_t)b * (cols / 32) + h * 2 + (lid >> 5)] = dq;
 }
+// ---- fp16 KV cache (--kv-dtype f16): half storage, fp32 arithmetic. Values are clamped into the fp16 range before every store
+// (K is RMS-normalised, V is not); the split-K partials and the merge kernel are shared with the f32 path.
+static float4 hf_clamp(float4 x) { return fmin(fmax(x, (float4)(-65504.f)), (float4)(65504.f)); }
+static float hf_wgsum(float x, __local float* red) {          // deterministic work-group sum (8 lanes)
+  const int lid = get_local_id(0), n = get_local_size(0);
+  red[lid] = x;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  float t = 0.f;
+  for (int i = 0; i < n; ++i) t += red[i];
+  return t;
+}
+__kernel void lm_kv_post_f(__global float* C, int rowc, int nq, int nkv, int hd, __global const float* qw, __global const float* kw,
+                           __global const float* cosb, __global const float* sinb, __global const int* pos, int hlf, float eps,
+                           __global ushort* KV, __global const int* dst, int kvw) {
+  __local float red[32];
+  const int slot = get_group_id(0), t = get_group_id(1), lid = get_local_id(0);
+  __global float* v = C + (size_t)t * rowc + slot * hd;
+  float4 a = vload4(lid, v), b = vload4(lid, v + hlf);
+  if (slot >= nq + nkv) {                                     // V head: raw copy into the cache
+    __global ushort* o = KV + (size_t)dst[t] * kvw + (size_t)nkv * hd + (size_t)(slot - nq - nkv) * hd;
+    vstore_half4_rte(hf_clamp(a), lid, o); vstore_half4_rte(hf_clamp(b), lid, o + hlf);
+    return;
+  }
+  const float ss = a.x * a.x + a.y * a.y + a.z * a.z + a.w * a.w + b.x * b.x + b.y * b.y + b.z * b.z + b.w * b.w;
+  const float inv = 1.0f / sqrt(hf_wgsum(ss, red) / (float)hd + eps);
+  __global const float* w = slot < nq ? qw : kw;
+  a = a * inv * vload4(lid, w);
+  b = b * inv * vload4(lid, w + hlf);
+  const int p = pos[t];
+  const float4 c = vload4(lid, cosb + (size_t)p * hlf), sn = vload4(lid, sinb + (size_t)p * hlf);
+  const float4 na = a * c - b * sn, nb = b * c + a * sn;
+  vstore4(na, lid, v); vstore4(nb, lid, v + hlf);
+  if (slot >= nq) {
+    __global ushort* o = KV + (size_t)dst[t] * kvw + (size_t)(slot - nq) * hd;
+    vstore_half4_rte(hf_clamp(na), lid, o); vstore_half4_rte(hf_clamp(nb), lid, o + hlf);
+  }
+}
+#define QT5 32
+#define KT5 64
+__kernel void lm_attn_pf_f(__global const float* C, int ldc, __global const ushort* KV, int ldkv, int voff, int kvbase,
+                           int nq, int nkv, int pos0, float scale, __global uint* Xp, __global float* Xs, int T) {
+  __local float Qs[QT5 * 68];
+  __local float Ks[KT5 * 64];
+  __local float Vs[KT5 * 64];
+  const int h = get_group_id(0), lid = get_local_id(0);
+  const int t0 = get_group_id(1) * QT5;
+  const int tq = t0 + lid, t = min(tq, T - 1);
+  const int kvh = h / (nq / nkv);
+  const __global float* qr = C + (size_t)t * ldc + h * 64;
+  for (int i = 0; i < 16; ++i) vstore4(vload4(i, qr) * (scale * 1.4426950408889634f), i, Qs + lid * 68);
+  float4 acc[16];
+  for (int i = 0; i < 16; ++i) acc[i] = (float4)(0.f);
+  float m = -1e30f, l = 0.f;
+  const int thi = pos0 + min(t0 + QT5 - 1, T - 1);
+  const int myhi = pos0 + t;
+  for (int k0 = 0; k0 <= thi; k0 += KT5) {
+    const int kn = min(KT5, thi - k0 + 1);
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int i = lid; i < kn * 16; i += QT5) {
+      const int r = i >> 4, c4 = i & 15;
+      const __global ushort* row = KV + (size_t)(kvbase + k0 + r) * ldkv + kvh * 64;
+      vstore4(vload_half4(c4, row), c4, Ks + r * 64);
+      vstore4(vload_half4(c4, row + voff), c4, Vs + r * 64);
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    float sc[KT5];
+    for (int j = 0; j < kn; ++j) {
+      float4 s4 = (float4)(0.f);
+      for (int i = 0; i < 16; ++i) s4 = mad(vload4(i, Qs + lid * 68), vload4(i, Ks + j * 64), s4);
+      sc[j] = (k0 + j <= myhi) ? (s4.x + s4.y + s4.z + s4.w) : -1e30f;
+    }
+    for (int j = 0; j < kn; ++j) {
+      const float sj = sc[j];
+      if (sj < -1e29f) continue;
+      if (sj > m) {
+        const float a = native_exp2(m - sj);
+        for (int i = 0; i < 16; ++i) acc[i] *= a;
+        l *= a; m = sj;
+      }
+      const float p = native_exp2(sj - m);
+      l += p;
+      for (int i = 0; i < 16; ++i) acc[i] = mad((float4)(p), vload4(i, Vs + j * 64), acc[i]);
+    }
+  }
+  if (tq >= T) return;
+  const float inv = l > 0.f ? 1.0f / l : 0.f;
+  const int cols = nq * 64;
+  for (int b = 0; b < 2; ++b) {
+    float amax = 0.f;
+    for (int i = 0; i < 8; ++i) { const float4 a = fabs(acc[b * 8 + i] * inv); amax = fmax(amax, fmax(fmax(a.x, a.y), fmax(a.z, a.w))); }
+    const float dq = amax / 127.f, id = dq > 0.f ? 1.f / dq : 0.f;
+    for (int i = 0; i < 8; ++i)
+      Xp[(size_t)tq * (cols / 4) + h * 16 + b * 8 + i] = as_uint(convert_char4_sat_rte(acc[b * 8 + i] * inv * id));
+    Xs[(size_t)tq * (cols / 32) + h * 2 + b] = dq;
+  }
+}
+__kernel void lm_attn_dsplit_f(__global const float* C, int ldc, __global const ushort* KV, int ldkv, int voff,
+                               __global const int* bases, __global const int* lens, int nq, int nkv, float scale,
+                               __global float* P, int nsl) {
+  __local float qs[LMD_GMAX * 64];
+  __local float sc[LMD_GMAX * LMD_SKL];
+  __local float rmx[LMD_GMAX * 16];
+  const int kvh = get_group_id(0), b = get_group_id(1), s = get_group_id(2), lid = get_local_id(0);
+  const int G = nq / nkv, len = lens[b], k0 = s * LMD_SKL;
+  if (k0 >= len) return;
+  const int n = min(LMD_SKL, len - k0);
+  for (int i = lid; i < G * 64; i += 64) qs[i] = C[(size_t)b * ldc + kvh * G * 64 + i] * (scale * 1.4426950408889634f);
+  barrier(CLK_LOCAL_MEM_FENCE);
+  const __global ushort* K0 = KV + (size_t)(bases[b] + k0) * ldkv + kvh * 64;
+  float mx[LMD_GMAX];
+#pragma unroll
+  for (int g = 0; g < LMD_GMAX; ++g) mx[g] = -1e30f;
+  for (int j = lid; j < n; j += 64) {
+    const __global ushort* row = K0 + j * ldkv;
+    float4 a[LMD_GMAX];
+#pragma unroll
+    for (int g = 0; g < LMD_GMAX; ++g) a[g] = (float4)(0.f);
+    for (int i = 0; i < 16; ++i) {
+      const float4 k4 = vload_half4(i, row);
+#pragma unroll
+      for (int g = 0; g < LMD_GMAX; ++g) if (g < G) a[g] = mad(vload4(i, qs + g * 64), k4, a[g]);
+    }
+#pragma unroll
+    for (int g = 0; g < LMD_GMAX; ++g) if (g < G) { const float v = a[g].x + a[g].y + a[g].z + a[g].w; sc[g * LMD_SKL + j] = v; mx[g] = fmax(mx[g], v); }
+  }
+  const int sgid = get_sub_group_id(), nsg = get_num_sub_groups();
+#pragma unroll
+  for (int g = 0; g < LMD_GMAX; ++g) if (g < G) { const float r = sub_group_reduce_max(mx[g]); if (get_sub_group_local_id() == 0) rmx[g * 16 + sgid] = r; }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  float m[LMD_GMAX];
+#pragma unroll
+  for (int g = 0; g < LMD_GMAX; ++g) { m[g] = -1e30f; if (g < G) for (int i = 0; i < nsg; ++i) m[g] = fmax(m[g], rmx[g * 16 + i]); }
+  for (int j = lid; j < n; j += 64) {
+#pragma unroll
+    for (int g = 0; g < LMD_GMAX; ++g) if (g < G) sc[g * LMD_SKL + j] = native_exp2(sc[g * LMD_SKL + j] - m[g]);
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  const __global ushort* V0 = KV + (size_t)(bases[b] + k0) * ldkv + voff + kvh * 64 + lid;
+  float acc[LMD_GMAX], l[LMD_GMAX];
+#pragma unroll
+  for (int g = 0; g < LMD_GMAX; ++g) { acc[g] = 0.f; l[g] = 0.f; }
+  for (int j = 0; j < n; ++j) {
+    const float v = vload_half(j * ldkv, V0);
+#pragma unroll
+    for (int g = 0; g < LMD_GMAX; ++g) if (g < G) { const float p = sc[g * LMD_SKL + j]; acc[g] = mad(p, v, acc[g]); l[g] += p; }
+  }
+  const int pi0 = (b * nq + kvh * G) * nsl + s;
+#pragma unroll
+  for (int g = 0; g < LMD_GMAX; ++g) if (g < G) {
+    __global float* pp = P + (size_t)(pi0 + g * nsl) * 66;
+    pp[lid] = acc[g];
+    if (lid == 0) { pp[64] = m[g]; pp[65] = l[g]; }
+  }
+}
 )CL";
 static bool build_split_attn(bool verbose) {
     cl_int err = 0;
@@ -2654,7 +2809,10 @@ static bool build_split_attn(bool verbose) {
     k_lmds = cl.clCreateKernel(g_prog_ds, "lm_attn_dsplit", &err);    if (err != CL_SUCCESS) k_lmds = nullptr;
     k_lmdsq = cl.clCreateKernel(g_prog_ds, "lm_attn_dsplit_q", &err); if (err != CL_SUCCESS) k_lmdsq = nullptr;
     k_lmdm = cl.clCreateKernel(g_prog_ds, "lm_attn_dmerge", &err);    if (err != CL_SUCCESS) k_lmdm = nullptr;
-    return k_lmds && k_lmdsq && k_lmdm;
+    k_lmkvf = cl.clCreateKernel(g_prog_ds, "lm_kv_post_f", &err);     if (err != CL_SUCCESS) k_lmkvf = nullptr;
+    k_lmpff = cl.clCreateKernel(g_prog_ds, "lm_attn_pf_f", &err);     if (err != CL_SUCCESS) k_lmpff = nullptr;
+    k_lmdsf = cl.clCreateKernel(g_prog_ds, "lm_attn_dsplit_f", &err); if (err != CL_SUCCESS) k_lmdsf = nullptr;
+    return k_lmds && k_lmdsq && k_lmdm && k_lmkvf && k_lmpff && k_lmdsf;
 }
 static cl_mem g_dsP = nullptr; static size_t g_dsPcap = 0;              // split-K partials [row][head][slice][66]
 static constexpr int kDsSkl = 128;                                         // keys per slice (= LMD_SKL in kSrcDs)
@@ -2672,6 +2830,28 @@ static bool dec_split_launch(cl_kernel ks, int nq, int nkv, Buf lens, int B, int
 bool dec_split_available() { return k_lmds && k_lmdsq && k_lmdm; }
 bool read_qscratch(void* xp, size_t xp_bytes, void* xs, size_t xs_bytes) {
     return g_Xp && g_Xs && xp_bytes <= g_Xpcap && xs_bytes <= g_Xscap && gpu::read((Buf)g_Xp, xp, xp_bytes) && gpu::read((Buf)g_Xs, xs, xs_bytes);
+}
+// ---- fp16 KV cache (--kv-dtype f16): same ops as the f32 path with half storage in KV; decode runs split-K only (no per-head f16 variant)
+bool kv_f16_available() { return k_lmkvf && k_lmpff && k_lmdsf; }
+bool op_lm_qkv_post_kv_f(Buf C, int rowc, int T, int nq, int nkv, int hd, Buf qw, Buf kw, Buf cosb, Buf sinb, Buf pos, int hlf, float eps, Buf KV, Buf dst, int kvw) {
+    if (hd != 64 || 2 * hlf != hd) return false;
+    const size_t LS = (size_t)hd / 8;
+    set_args(k_lmkvf, C, (cl_int)rowc, (cl_int)nq, (cl_int)nkv, (cl_int)hd, qw, kw, cosb, sinb, pos, (cl_int)hlf, eps, KV, dst, (cl_int)kvw);
+    size_t g[2] = {(size_t)(nq + 2 * nkv) * LS, (size_t)T}, l[2] = {LS, 1};
+    return launch(k_lmkvf, 2, g, l);
+}
+bool op_lm_attn_pf_f(Buf C, int ldc, Buf KV, int ldkv, int voff, int kvbase, int nq, int nkv, int pos0, float scale, int T) {
+    set_args(k_lmpff, C, (cl_int)ldc, KV, (cl_int)ldkv, (cl_int)voff, (cl_int)kvbase, (cl_int)nq, (cl_int)nkv, (cl_int)pos0, scale,
+             (Buf)g_Xp, (Buf)g_Xs, (cl_int)T);
+    size_t g[2] = {(size_t)nq * 32, (size_t)((T + 31) / 32)}, l[2] = {32, 1};
+    return launch(k_lmpff, 2, g, l);
+}
+bool op_lm_attn_dec_f(Buf C, int ldc, Buf KV, int ldkv, int voff, Buf bases, Buf lens, int nq, int nkv, float scale, int B, int maxlen) {
+    if (!dec_split_ok(nq, nkv, maxlen)) return false;
+    const int nsl = (maxlen + kDsSkl - 1) / kDsSkl;
+    if (!ensure(g_dsP, g_dsPcap, (size_t)B * nq * nsl * 66 * 4)) return false;
+    set_args(k_lmdsf, C, (cl_int)ldc, KV, (cl_int)ldkv, (cl_int)voff, bases, lens, (cl_int)nq, (cl_int)nkv, scale, (Buf)g_dsP, (cl_int)nsl);
+    return dec_split_launch(k_lmdsf, nq, nkv, lens, B, nsl);
 }
 bool op_lm_attn_dec(Buf C, int ldc, Buf KV, int ldkv, int voff, Buf bases, Buf lens, int nq, int nkv, float scale, int B, int maxlen) {
     if (dec_split_ok(nq, nkv, maxlen)) {

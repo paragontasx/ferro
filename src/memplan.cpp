@@ -75,10 +75,10 @@ MemPlan plan_memory(const ServerOptions& o) {
             const long n_head = g.get_int(P + "attention.head_count"), n_embd = g.get_int(P + "embedding_length");
             long n_attn = 0, n_kv = 0; for (auto v : kvs) if (v > 0) { ++n_attn; n_kv = std::max<long>(n_kv, v); }
             if (n_head > 0 && n_attn > 0) {
-                const double per_val = o.kv_int8 ? 1.125 : 4.0;
+                const double per_val = o.kv_dtype == 1 ? 1.125 : o.kv_dtype == 2 ? 2.0 : 4.0;
                 kv_slot_mb = (double)n_attn * o.lm_ctx * 2.0 * n_kv * (n_embd / n_head) * per_val / 1048576.0;
                 kv_mb = kv_slot_mb * o.lm_slots;
-                char nb[96]; snprintf(nb, sizeof nb, "%d slot(s) x %d ctx, %s", o.lm_slots, o.lm_ctx, o.kv_int8 ? "int8" : "fp32");
+                char nb[96]; snprintf(nb, sizeof nb, "%d slot(s) x %d ctx, %s", o.lm_slots, o.lm_ctx, o.kv_dtype == 1 ? "int8" : o.kv_dtype == 2 ? "f16" : "fp32");
                 add("KV cache", kv_mb, nb);
             }
         }
@@ -91,7 +91,7 @@ MemPlan plan_memory(const ServerOptions& o) {
             const int fit = (int)std::floor((p.limit_mb - (p.need_mb - kv_mb)) / kv_slot_mb);
             if (fit >= 1) { snprintf(b, sizeof b, "--lm-slots %d fits (each slot costs %.0f MB)", fit, kv_slot_mb); p.advice.push_back(b); }
         }
-        if (kv_mb > 0 && !o.kv_int8 && kv_mb * (1 - 1.125 / 4.0) >= over) { snprintf(b, sizeof b, "--kv-dtype int8 saves %.0f MB (small accuracy cost)", kv_mb * (1 - 1.125 / 4.0)); p.advice.push_back(b); }
+        if (kv_mb > 0 && o.kv_dtype == 0 && kv_mb * (1 - 1.125 / 4.0) >= over) { snprintf(b, sizeof b, "--kv-dtype int8 saves %.0f MB (small accuracy cost)", kv_mb * (1 - 1.125 / 4.0)); p.advice.push_back(b); }
         if (o.prefix_cache_mb >= over) { snprintf(b, sizeof b, "--prefix-cache-mb %d fits", (int)(o.prefix_cache_mb - over)); p.advice.push_back(b); }
         if (big > 0 && 1.3 * big >= over) { snprintf(b, sizeof b, "dropping the %s (%.0f MB) fits", big_name.c_str(), 1.3 * big); p.advice.push_back(b); }
         if (p.advice.empty()) p.advice.push_back("this combination does not fit: drop a model or raise the container memory limit");
