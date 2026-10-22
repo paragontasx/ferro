@@ -198,7 +198,7 @@ struct DecJob {
 };
 
 // A cached prompt prefix: the device state of the LM after `toks` (K/V rows + conv state). Worker-thread only.
-struct PrefixEntry { std::vector<int> toks; std::shared_ptr<LmPrefix> px; uint64_t used = 0; };
+struct PrefixEntry { std::vector<int> toks; std::shared_ptr<LmPrefix> px; uint64_t used = 0; bool tail = false; };
 
 // ---------------------------------------------------------------- server state
 // API keys: any number, each with a label (for the log); matched in constant time; the file form is re-read on SIGHUP.
@@ -363,17 +363,29 @@ static bool pc_has(Server& S, const std::vector<int>& prompt, int c) {
     for (auto& e : S.pcache) if ((int)e.toks.size() == c && pc_starts(prompt, e.toks)) return true;
     return false;
 }
-static void pc_store(Server& S, const std::vector<int>& prompt, std::shared_ptr<LmPrefix> px, bool persist = true) {
+static void pc_store(Server& S, const std::vector<int>& prompt, std::shared_ptr<LmPrefix> px, bool persist = true, bool tail = false) {
     const size_t budget = (size_t)S.o.prefix_cache_mb << 20;
     if (!px || px->bytes > budget) return;
+    if (tail) {
+        // a tail supersedes every older tail of the same conversation (the new prompt extends them), so at most one tail per lineage
+        for (size_t i = 0; i < S.pcache.size();) {
+            if (S.pcache[i].tail && pc_starts(prompt, S.pcache[i].toks)) {
+                S.pc_bytes -= S.pcache[i].px->bytes; S.pcache.erase(S.pcache.begin() + (long)i); S.pc_evict++;
+            } else ++i;
+        }
+        size_t tail_bytes = 0;
+        for (const auto& e : S.pcache) if (e.tail) tail_bytes += e.px->bytes;
+        const size_t tail_budget = std::max(budget / 4, px->bytes);          // tails never own more than a quarter of the cache
+        if (tail_bytes + px->bytes > tail_budget || S.pc_bytes + px->bytes > budget) return;   // skip rather than evict a non-tail entry
+    }
     while (!S.pcache.empty() && S.pc_bytes + px->bytes > budget) {                 // evict least recently used
         size_t k = 0; for (size_t i = 1; i < S.pcache.size(); ++i) if (S.pcache[i].used < S.pcache[k].used) k = i;
         S.pc_bytes -= S.pcache[k].px->bytes; S.pcache.erase(S.pcache.begin() + (long)k); S.pc_evict++;
     }
-    PrefixEntry e; e.toks.assign(prompt.begin(), prompt.begin() + px->n); e.used = ++S.pc_tick; S.pc_bytes += px->bytes; e.px = std::move(px);
+    PrefixEntry e; e.toks.assign(prompt.begin(), prompt.begin() + px->n); e.used = ++S.pc_tick; S.pc_bytes += px->bytes; e.px = std::move(px); e.tail = tail;
     S.pcache.push_back(std::move(e));
     S.pc_entries = S.pcache.size(); S.pc_used = S.pc_bytes;
-    if (persist && S.pstore && !S.pstore->has(S.pcache.back().toks)) {             // a new snapshot also goes to disk (written in the background)
+    if (persist && !tail && S.pstore && !S.pstore->has(S.pcache.back().toks)) {    // a new snapshot also goes to disk (tails are short-lived: never)
         std::vector<uint8_t> blob;
         if (S.lm.export_prefix(*S.pcache.back().px, &blob)) S.pstore->save_async(S.pcache.back().toks, std::move(blob));
     }
@@ -464,7 +476,7 @@ static void gen_prefill_chunk(Server& S) {
     j.prompt_ms = j.pf_ms;
     if (std::find(j.pf_cuts.begin(), j.pf_cuts.end(), n) != j.pf_cuts.end()) {      // end-of-prompt snapshot (several messages or tools), before the first token
         const auto ts = clk::now();
-        pc_store(S, j.prompt, S.lm.snapshot(j.seq));
+        pc_store(S, j.prompt, S.lm.snapshot(j.seq), false, true);
         if (getenv("FERRO_PC_DEBUG")) { gpu_sync_for_debug(); fprintf(stderr, "[prefix] end-of-prompt snapshot of %d tokens took %.1f ms (alloc+copy, synced)\n", n, ms_since(ts)); }
     }
     if (j.pc_on) { S.recent.push_back(j.prompt); if (S.recent.size() > 8) S.recent.pop_front(); }
