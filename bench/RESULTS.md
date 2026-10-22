@@ -403,3 +403,34 @@ EG2 image 1280x720 +261, 1920x1080 +375 (69.5 s). Plan estimate vs measured: 350
 
 **Measurement note.** Parity here is judged against llama.cpp running the *same Q8_0 weights* (`lm_parity.py --llama` pointed at a server on the Q8_0 file); an F16 oracle measures weight-quantization noise on top
 (350M: mean TV 0.0426 against F16 vs 0.0172 against Q8_0, identical code) and flips the argmax on a near-tie prompt - not a regression.
+
+## 2026-10-22: branch `perf-fixes` - pool parking, split-K decode attention, end-of-prompt snapshots, penalty window (kernel-level results)
+
+Built and tested in a worktree while the production server kept serving; the tests load no model, so end-to-end numbers are still pending (list at the end).
+
+**CPU pool parking.** Idle pool workers spun on `_mm_pause` and then `sched_yield()` forever: the live `serve` (2 threads) kept its one worker at 100% of a core
+for its whole life (3.9 h of CPU in 3.8 h of uptime, 62% of it in the kernel), inside the shared CPU+iGPU power budget. Workers now park on a futex after a 200 us
+spin (`FERRO_POOL_SPIN_US`). `test_kernels`: 3 idle workers use 0.6 ms of CPU in 300 ms (spinning pool: ~900 ms); 300 dispatches (100 of them after the workers had parked), results exact.
+**Every iGPU figure above this section was measured with that worker spinning** - re-measure the baselines before comparing against them.
+
+**Split-K decode attention** (default; `FERRO_LM_ATTN_SPLIT=0` = the per-head kernels). One attention layer at the 350M decode shape (16 q / 8 kv heads, hd 64),
+device time per launch, best of 3 interleaved rounds of 30 launches:
+
+| keys x streams | f32 KV: per-head -> split-K | int8 KV: per-head -> split-K |
+|---|---|---|
+| 1921 x 1 | 2.82 -> 1.20 ms | 3.76 -> 1.30 ms |
+| 1921 x 4 | 8.01 -> 4.43 ms | 11.46 -> 4.44 ms |
+| 200 x 1 | 0.35 -> 0.29 ms | 0.46 -> 0.34 ms |
+
+The per-head times x 6 attention layers (17 ms f32, 23 ms int8 at 1921 keys) account for the context-dependent decode cost measured end to end earlier
+(+17 / +25 ms per token at a 1.9k context): the old kernel was latency-bound, which is also why the int8 cache was slower than f32. Expected at a 1.9k context,
+one stream: ~10 ms (f32) / ~15 ms (int8) less per token (int8 19.6 -> ~28 tok/s); per layer int8 is now 8% slower than f32 instead of 33% (equal at 4 streams) - a projection until measured end to end.
+Accuracy: both kernels within 0.50 int8 output steps of a double reference (GQA 2 and 4, f32 and int8 KV, 1..1921 keys); a row's split-K output is bit-identical
+alone, in reversed batch order and with a different slice stride. Headroom left: 1.2 ms vs a ~0.3 ms KV-streaming floor per layer (the per-slice V loop is serial per lane).
+
+**End-of-prompt snapshots** (`--no-prefix-tail`) and **penalty window / scope** (`repeat_last_n`, `penalize_prompt`, `--penalty-scope generated`): code plus the
+sampler unit test only.
+
+**Pending (needs the server stopped):** `lm_parity.py` (350M, int8 and f32 KV), `test_batch_invariance.py`, `test_serve_lm.py`, `test_serve_prefix.py`,
+`d1_parity.py` and the EG2 cosine check (the pool and `gpu_cl.cpp` are shared), `FERRO_LM_STEPTIME` at 0.2k / 2k context, and the hydra suite (TTFT, cached tokens
+per request, draft acceptance, pass rate) with and without `--penalty-scope generated`.
