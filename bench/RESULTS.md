@@ -498,3 +498,18 @@ its new reply plus tool output: 1.6-1.7x lower TTFT per turn after the first, ~3
 Still open: `test_serve_spec.py`, `test_serve_lm.py`, `test_serve_prefix.py` (they take `--url`; a positional URL makes them exit), d1/EG2 parity,
 f16 at 4 streams, one hydra round, and the copy-heavy penalty A/B. #6 and #7 are unimplemented: the measured decode floor leaves #6 about 1 ms per
 token (~4%) behind a per-slot exactness flag across every GEMM variant, and #7's shared-token fraction has not been dumped yet.
+
+### window2 (18:08-18:11) - the serving suites, both KV dtypes, penalty A/B
+
+- `test_serve_spec.py --url`: **ALL PASS** on f32 **and** int8 (max_tokens and a stop string cutting inside a verification window land on the same token).
+- `test_serve_lm.py --url`: **ALL PASS** (6 concurrent requests over 4 slots, server idle and healthy afterwards).
+- `test_serve_prefix.py --url`: **FAILED** two checks. With the cache at 121.8 MB of 128 (7 entries, 19 evictions) the end-of-prompt snapshots
+  (~28 MB each at ~1.1k tokens) dominate the LRU, so the suite's entry-set assertions and its `--small-cache` "most recent prefix is still cached"
+  case (`cached_tokens: 0`) both break. Answers stay exact - this is cache bookkeeping and hit-rate, not correctness - but the documented
+  prefix-cache contract regressed, so **production now runs with `--no-prefix-tail`** until the store policy is fixed.
+- Penalty A/B (8 quoted identifiers, temperature 0): **8/8 identical copies both ways** - no signal at this length, so the default stays
+  `repeated_penalty 1.05 over the whole context`. Repeat with longer prompts (300+ tokens of surrounding text) before drawing a conclusion.
+
+**Fix planned for the tail store:** give tail entries their own small budget (or evict tail entries first), never let one evict the shared
+system-prompt entry, and skip the tail when the device cache is within one tail of its budget. Re-run `test_serve_prefix` with tails on before
+re-enabling it in `serve_prod.sh`.
