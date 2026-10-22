@@ -2,9 +2,14 @@
 #include "kernels.h"
 #include "threadpool.h"
 #include "gpu_cl.h"
+#include <algorithm>
+#include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <cmath>
+#include <ctime>
 #include <random>
+#include <unistd.h>
 #include <vector>
 using namespace ferro;
 
@@ -24,6 +29,25 @@ static double rel(const std::vector<float>& a, const std::vector<float>& b) {
 int main() {
     Pool::get().init(4);
     int fails = 0;
+    {   // pool: exact results, no CPU burn while idle (workers park after a short spin), no lost wake-ups across park/wake cycles
+        std::vector<int> v(10007);
+        auto run = [&](int n) {
+            std::fill(v.begin(), v.end(), -1);
+            Pool::get().parallel_for(n, [&](int lo, int hi) { for (int i = lo; i < hi; ++i) v[i] = i; });
+            for (int i = 0; i < n; ++i) if (v[i] != i) return false;
+            return true;
+        };
+        bool ok = run((int)v.size());
+        timespec c0, c1;
+        clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &c0);
+        usleep(300000);                                                    // 3 workers, 300 ms with nothing to do
+        clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &c1);
+        const double idle_ms = (c1.tv_sec - c0.tv_sec) * 1e3 + (c1.tv_nsec - c0.tv_nsec) / 1e6;
+        for (int r = 0; ok && r < 300; ++r) { ok = run(997 + r); if (r % 3 == 0) usleep(1000); }   // a lost wake-up hangs here
+        const bool pass = ok && idle_ms < 30.0;
+        printf("pool: results %s, CPU used by 3 idle workers over 300 ms = %.1f ms (spinning pool: ~900) %s\n", ok ? "exact" : "WRONG", idle_ms, pass ? "PASS" : "FAIL");
+        if (!pass) ++fails;
+    }
     // --- Q8 GEMM: fma path vs scalar reference (same WMat) ---
     {
         int rows = 128, cols = 512, T = 20;
