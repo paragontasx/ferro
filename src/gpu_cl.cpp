@@ -2534,7 +2534,21 @@ __kernel void lm_attn_dsplit(__global const float* C, int ldc, __global const fl
   float acc[LMD_GMAX], l[LMD_GMAX];
 #pragma unroll
   for (int g = 0; g < LMD_GMAX; ++g) { acc[g] = 0.f; l[g] = 0.f; }
-  for (int j = 0; j < n; ++j) {
+  // 4-deep unroll: four independent V loads per iteration so the hardware pipelines them.
+  // The FMA chain stays strictly in j order (no reassociation) -> bit-identical to the serial loop.
+  int j = 0;
+  for (; j + 4 <= n; j += 4) {
+    const float v0 = V0[(j + 0) * ldkv], v1 = V0[(j + 1) * ldkv], v2 = V0[(j + 2) * ldkv], v3 = V0[(j + 3) * ldkv];
+    const __local float* sp = sc + j;
+#pragma unroll
+    for (int g = 0; g < LMD_GMAX; ++g) if (g < G) {
+      const __local float* s = sp + g * LMD_SKL;
+      acc[g] = mad(s[0], v0, acc[g]); acc[g] = mad(s[1], v1, acc[g]);
+      acc[g] = mad(s[2], v2, acc[g]); acc[g] = mad(s[3], v3, acc[g]);
+      l[g] += s[0]; l[g] += s[1]; l[g] += s[2]; l[g] += s[3];
+    }
+  }
+  for (; j < n; ++j) {
     const float v = V0[j * ldkv];
 #pragma unroll
     for (int g = 0; g < LMD_GMAX; ++g) if (g < G) { const float p = sc[g * LMD_SKL + j]; acc[g] = mad(p, v, acc[g]); l[g] += p; }
