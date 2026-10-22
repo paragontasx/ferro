@@ -7,17 +7,56 @@
 
 # Ferro
 
-Lightweight inference engine for Intel low-power SoCs (N100-class) that runs two models from one
-binary, **on the integrated GPU by default** (OpenCL, int8 DP4A) with automatic CPU fallback:
+**A tiny inference engine for Intel low-power SoCs (N100-class).** One C++ binary, no Python, no
+framework — it loads GGUFs directly and runs them **on the integrated GPU by default** (OpenCL, int8
+DP4A), with automatic CPU fallback. Three model kinds from the same binary, detected from GGUF metadata:
 
 | Model | Arch (GGUF) | Command | What it returns |
 |---|---|---|---|
-| **EmbeddingGemma-2** | `gemma-embedding2` | `embed` / `bench` | sentence embeddings |
+| **EmbeddingGemma-2** | `gemma-embedding2` | `embed` / `bench` | sentence embeddings (+ image / audio / video via `--mmproj`) |
 | **LiquidAI d1-omni-600M** | `lfm2` + `lfm2.decision.*` | `decide` / `bench` | typed answers (yes/no, choice, score) over a state, one forward pass, no generated tokens |
-| **LiquidAI LFM2 / LFM2.5** (LFM2.5-1.2B-Thinking, LFM2.5-350M, ...) | `lfm2` (causal) | `generate` / `serve --lm` | text generation: chat + completions, streaming, OpenAI-compatible |
+| **LiquidAI LFM2 / LFM2.5** (1.2B-Thinking, 350M, ...) | `lfm2` (causal) | `generate` / `serve --lm` | text generation: chat + completions, streaming, OpenAI-compatible |
 
-The model kind is detected from the GGUF metadata. libOpenCL is `dlopen`'d, so the binary also runs on
-GPU-less hosts. Native GGUF loading and native tokenizers (Gemma SPM-BPE; LFM2 byte-level BPE).
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![language: C++](https://img.shields.io/github/languages/top/paragontasx/ferro)
+![iGPU by default](https://img.shields.io/badge/iGPU%20by%20default-OpenCL%20%C2%B7%20int8%20DP4A-green)
+![OpenAI--compatible](https://img.shields.io/badge/OpenAI--compatible-server-informational)
+![no dependencies](https://img.shields.io/badge/runtime%20deps-none%20(libOpenCL%20dlopen'd)-lightgrey)
+
+**Why:** on a ~6 W N100 box, ferro beats llama.cpp's own iGPU backend by ~2x (measured 2.1-2.3x on
+embeddings and decisions), and 1.6-1.7x on agent-loop TTFT through its prefix cache — while keeping an
+exactness contract llama.cpp does not offer: a stream decodes identically alone or among any number of
+streams, speculative decoding is provably a no-op, and every number on this page is reproducible from
+[`bench/RESULTS.md`](bench/RESULTS.md) with the scripts in `scripts/`.
+
+### Quick start (2 minutes)
+
+```sh
+make -j4                          # needs OpenCL headers (CL_INC=...); Mesa rusticl is enough
+make test                         # kernel + decision + serving tests
+./ferro-embed serve --lm models/LFM2.5-350M-Q8_0.gguf --d1 models/d1-omni-600M-Q8_0.gguf \
+                    --lm-slots 4 --lm-ctx 4096 --kv-dtype f32 --prefix-cache-mb 256 --port 8090
+curl localhost:8090/v1/chat/completions -d '{"messages":[{"role":"user","content":"What is 17*23?"}],"stream":true}'
+# then open http://localhost:8090/chat for the built-in test page
+```
+
+Models are plain GGUFs (`--model kind` is auto-detected); get e.g. d1 from
+`https://huggingface.co/LiquidAI/d1-omni-600M-GGUF`.
+
+### Contents
+
+[What's new](#whats-new-2026-10-22-tag-validated-2026-10-22-2) ·
+[Results](#results-intel-n100-same-model-files--inputs-as-llamacpp-interleaved-runs) ·
+[d1 decision model](#using-d1-omni-decision-model) ·
+[EmbeddingGemma-2 multimodal](#using-embeddinggemma-2-multimodal-text--image--audio--video---one-768-d-embedding) ·
+[LFM2.5 chat](#using-lfm25-language-models-chat--completions) ·
+[HTTP server](#serving-over-http-ferro-embed-serve) ·
+[Exactness & ops](#exactness-scheduling-and-operations-lm-serving) ·
+[How it's fast](#how-the-igpu-path-is-fast) ·
+[Build & run](#build--run) ·
+[CPU path](#cpu-path) ·
+[Code layout](#layout) ·
+[Env knobs](#env-knobs)
 
 ## What's new (2026-10-22, tag `validated-2026-10-22-2`)
 
