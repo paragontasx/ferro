@@ -2,6 +2,7 @@
 #include "kernels.h"
 #include "threadpool.h"
 #include "gpu_cl.h"
+#include "sampler.h"
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -46,6 +47,18 @@ int main() {
         for (int r = 0; ok && r < 300; ++r) { ok = run(997 + r); if (r % 3 == 0) usleep(1000); }   // a lost wake-up hangs here
         const bool pass = ok && idle_ms < 30.0;
         printf("pool: results %s, CPU used by 3 idle workers over 300 ms = %.1f ms (spinning pool: ~900) %s\n", ok ? "exact" : "WRONG", idle_ms, pass ? "PASS" : "FAIL");
+        if (!pass) ++fails;
+    }
+    {   // sampler: repetition-penalty window (-1 whole context, N last tokens, 0 off) and scope (penalty_from = prompt length)
+        auto pick = [](int last_n, int from) {
+            SamplerParams p; p.temperature = 0.f; p.repetition_penalty = 2.f; p.repeat_last_n = last_n; p.penalty_from = from;
+            Sampler s(p);
+            std::vector<float> lg = {0.f, 9.f, 10.f, 9.5f, 6.f, 0.f};
+            return s.sample(lg.data(), (int)lg.size(), std::vector<int>{1, 2, 3});   // prompt {1, 2}, generated {3}
+        };
+        const int a = pick(-1, 0), g = pick(-1, 2), w = pick(2, 0), o = pick(0, 0), gw = pick(2, 2);
+        const bool pass = a == 4 && g == 2 && w == 1 && o == 2 && gw == 2;
+        printf("sampler penalty window/scope: whole=%d generated=%d last2=%d off=%d generated+last2=%d (want 4 2 1 2 2) %s\n", a, g, w, o, gw, pass ? "PASS" : "FAIL");
         if (!pass) ++fails;
     }
     // --- Q8 GEMM: fma path vs scalar reference (same WMat) ---

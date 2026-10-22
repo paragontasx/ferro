@@ -29,6 +29,9 @@ struct ServerOptions {
     int prefix_min_tokens = 32;                // do not cache prefixes shorter than this (the saving would not pay for the copy)
     int lm_slots = 4;                          // concurrent generations (decode of all active slots runs as one batched pass)
     std::string reasoning_format = "deepseek"; // "deepseek": <think>..</think> -> reasoning_content; "none": keep it inline in content
+    float repeat_penalty = 0.f;                // --repeat-penalty: server default for repetition_penalty (<= 0: the sampler's 1.05, LiquidAI's recommendation)
+    int repeat_last_n = -1;                    // --repeat-last-n: default penalty window (-1 whole context, 0 off, N = last N tokens); request field repeat_last_n / penalty_last_n
+    bool penalize_prompt = true;               // --penalty-scope generated sets false: prompt tokens are never penalized (agents copy ids / paths / JSON keys); request field penalize_prompt
     std::string host = "127.0.0.1";            // bind address (use 0.0.0.0 to expose it)
     int port = 8080;
     std::vector<std::string> api_keys;         // repeatable --api-key; each key may be "label: key"

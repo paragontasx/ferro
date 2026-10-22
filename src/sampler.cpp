@@ -8,9 +8,10 @@
 namespace ferro {
 
 int Sampler::sample(float* logits, int n, const std::vector<int>& history) {
-    if (p_.repetition_penalty != 1.0f && !history.empty()) {
+    if (p_.repetition_penalty != 1.0f && p_.repeat_last_n != 0 && !history.empty()) {
         std::unordered_set<int> seen;
-        const size_t b = (p_.repeat_last_n > 0 && (size_t)p_.repeat_last_n < history.size()) ? history.size() - (size_t)p_.repeat_last_n : 0;
+        size_t b = (p_.repeat_last_n > 0 && (size_t)p_.repeat_last_n < history.size()) ? history.size() - (size_t)p_.repeat_last_n : 0;
+        if (p_.penalty_from > 0) b = std::max(b, (size_t)p_.penalty_from);   // scope "generated": prompt tokens are never penalized
         for (size_t i = b; i < history.size(); ++i) seen.insert(history[i]);
         for (int id : seen)
             if (id >= 0 && id < n) logits[id] = logits[id] > 0 ? logits[id] / p_.repetition_penalty : logits[id] * p_.repetition_penalty;

@@ -15,7 +15,8 @@ struct SamplerParams {
     float top_p = 1.0f;              // 1 = off
     float min_p = 0.0f;              // 0 = off
     float repetition_penalty = 1.05f;
-    int repeat_last_n = -1;          // history window for the penalty; -1 = the whole context (prompt + generated), as Hugging Face
+    int repeat_last_n = -1;          // penalty window = the last N tokens of the history; -1 = the whole context (prompt + generated, as Hugging Face), 0 = no penalty (llama.cpp's convention)
+    int penalty_from = 0;            // history positions before this are never penalized (the server sets the prompt length for penalty scope "generated")
     uint64_t seed = 0;               // 0 = random
 };
 

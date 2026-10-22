@@ -38,7 +38,7 @@ static void usage() {
         "                   (multimodal EmbeddingGemma 2: items are interleaved in order into one 768-d embedding; vision/audio encoders on the iGPU)\n"
         "       ferro-embed generate --lm LFM2.5.gguf (--prompt TEXT | --messages f.json) [--n-predict N] [--temp T] [--top-k K] [--rep-penalty P] [--seed S]\n"
         "                   (text generation with an LFM2 / LFM2.5 model, e.g. LFM2.5-1.2B-Thinking; chat template + sampler built in)\n"
-        "       ferro-embed serve [--model EG2.gguf [--mmproj P.gguf]] [--lm LFM2.5.gguf [--lm-ctx N] [--lm-slots N] [--prefix-cache-mb N] [--snapshot-dir D [--snapshot-mb N]] [--api-key K]... [--api-key-file F] [--metrics-open] [--no-memory-check] [--kv-dtype f32|int8] [--spec-draft N] [--thinking-budget N] [--prefill-slice-ms N] [--decode-share N] [--reasoning-format deepseek|none]] [--d1 d1-omni.gguf [--d1-mmproj P.gguf]] [--host H] [--port P] [--api-key K]\n"
+        "       ferro-embed serve [--model EG2.gguf [--mmproj P.gguf]] [--lm LFM2.5.gguf [--lm-ctx N] [--lm-slots N] [--prefix-cache-mb N] [--snapshot-dir D [--snapshot-mb N]] [--api-key K]... [--api-key-file F] [--metrics-open] [--no-memory-check] [--kv-dtype f32|int8] [--spec-draft N] [--thinking-budget N] [--prefill-slice-ms N] [--decode-share N] [--reasoning-format deepseek|none] [--repeat-penalty P] [--repeat-last-n N] [--penalty-scope all|generated]] [--d1 d1-omni.gguf [--d1-mmproj P.gguf]] [--host H] [--port P] [--api-key K]\n"
         "       (old form follows)  ferro-embed serve --model EG2.gguf [--mmproj P.gguf] [--host H] [--port N] [--api-key K] [--max-batch-tokens N] [--batch-wait-ms N]\n"
         "                   (resident OpenAI-compatible server: POST /v1/embeddings with text / image_url / input_audio / video_url parts, GET /v1/models, GET /health)\n"
         "       ferro-embed mm-embed --mmproj P.gguf --media image|audio --out f.bin     (per-chunk encoder output, mm_ref format)\n"
@@ -241,6 +241,9 @@ int main(int argc, char** argv) {
         else if (a == "--prefix-min-tokens") so.prefix_min_tokens = atoi(next("--prefix-min-tokens"));
         else if (a == "--lm-name") so.lm_name = next("--lm-name");
         else if (a == "--reasoning-format") so.reasoning_format = next("--reasoning-format");
+        else if (a == "--repeat-penalty") so.repeat_penalty = (float)atof(next("--repeat-penalty"));
+        else if (a == "--repeat-last-n") { so.repeat_last_n = atoi(next("--repeat-last-n")); ga.sp.repeat_last_n = so.repeat_last_n; }
+        else if (a == "--penalty-scope") { const std::string v = next("--penalty-scope"); if (v != "all" && v != "generated") { fprintf(stderr, "--penalty-scope must be all or generated\n"); return 2; } so.penalize_prompt = v == "all"; }
         else if (a == "--prompt") ga.prompt = next("--prompt");
         else if (a == "--system") ga.system = next("--system");
         else if (a == "--messages") ga.messages_file = next("--messages");

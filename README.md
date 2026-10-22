@@ -172,7 +172,7 @@ curl localhost:8088/v1/embeddings -d '{"input":"hello"}'
 | Endpoint | |
 |---|---|
 | `POST /v1/embeddings` | text / `image_url` / `input_audio` / `video_url` parts (data URLs), `dimensions`, `encoding_format: base64`; concurrent text requests share packed forward passes |
-| `POST /v1/chat/completions`, `POST /v1/completions` | `messages` (+`tools` are rendered into the prompt), `max_tokens`, `temperature`, `top_p`, `top_k`, `min_p`, `repetition_penalty`, `seed`, `stop`, `stream` (SSE) + `stream_options.include_usage`; `usage` and llama.cpp-style `timings` in every response |
+| `POST /v1/chat/completions`, `POST /v1/completions` | `messages` (+`tools` are rendered into the prompt), `max_tokens`, `temperature`, `top_p`, `top_k`, `min_p`, `repetition_penalty` (+ `repeat_last_n`, `penalize_prompt`: below), `seed`, `stop`, `stream` (SSE) + `stream_options.include_usage`; `usage` and llama.cpp-style `timings` in every response |
 | `POST /v1/systemone` | d1-omni typed decisions (choice / score / noul) over a text, image or audio state - llama.cpp's contract, answers identical to `ferro-embed decide`; queued requests share one forward pass; `crop` / `crops` regions (below) |
 | `POST /apply-template` | rendered chat prompt (same contract as llama.cpp) |
 | `POST /tokenize`, `POST /detokenize` | token ids for a `prompt` / `messages` (chat template applied) and back; vLLM's fields |
@@ -183,6 +183,8 @@ curl localhost:8088/v1/embeddings -d '{"input":"hello"}'
 device slots (each holds `--lm-ctx` tokens of KV cache, ~25 MB per 1k tokens); embedding requests are served between decode steps (a short text embedding
 measured 0.12-1.8 s while 4 streams were generating - it waits for the decode step or prefill in progress); a closed client connection frees its slot within a step; 503 when the queue is full; Bearer `--api-key`
 (or `FERRO_API_KEY`). Not implemented: tool-call *parsing* of model output (tools are only rendered into the prompt), `n > 1`, logprobs, image input to the LM.
+
+**Repetition penalty window.** The default is LiquidAI's chat recommendation, `repetition_penalty` 1.05 over the whole context (prompt included, as Hugging Face). An agent that must copy ids, paths or JSON keys out of its prompt can keep the penalty off the prompt with `--penalty-scope generated` (server default) or `"penalize_prompt": false` (per request); `--repeat-last-n N` / `repeat_last_n` (alias `penalty_last_n`) limits the window to the last N tokens (-1 = whole context, 0 = off, llama.cpp's convention) and `--repeat-penalty P` sets the server default. Speculative windows sample every row with the same window, so drafting stays exact.
 
 **Prompt-prefix cache (`--prefix-cache-mb`, default 128, 0 = off).** Digest-style workloads send the same long system prompt every time. The server snapshots the LM state (K/V rows + conv state) at the end of a leading system
 message (and at any prefix a request shares with a recent one - plain `/v1/completions` prompts too), keeps the snapshots on the device in an LRU cache, and later requests restore the longest matching snapshot into their slot and prefill only the rest.

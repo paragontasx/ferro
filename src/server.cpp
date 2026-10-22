@@ -936,9 +936,13 @@ static std::shared_ptr<GenJob> parse_gen_request(Server& S, const std::string& t
     sp.top_p = (float)jnum(b.find("top_p"), sp.top_p);
     sp.top_k = (int)jnum(b.find("top_k"), sp.top_k);
     sp.min_p = (float)jnum(b.find("min_p"), sp.min_p);
-    sp.repetition_penalty = (float)jnum(b.find("repetition_penalty"), jnum(b.find("repeat_penalty"), sp.repetition_penalty));
+    sp.repetition_penalty = (float)jnum(b.find("repetition_penalty"), jnum(b.find("repeat_penalty"), S.o.repeat_penalty > 0 ? S.o.repeat_penalty : sp.repetition_penalty));
+    sp.repeat_last_n = (int)jnum(b.find("repeat_last_n"), jnum(b.find("penalty_last_n"), S.o.repeat_last_n));   // -1 whole context, 0 off, N last tokens
+    bool pen_prompt = S.o.penalize_prompt;
+    if (const Json* pp = b.find("penalize_prompt")) if (pp->t == Json::Bool) pen_prompt = pp->b;
+    if (!pen_prompt) sp.penalty_from = (int)j->prompt.size();       // penalty scope "generated": the window never reaches into the prompt
     sp.seed = (uint64_t)jnum(b.find("seed"), 0);
-    if (sp.temperature < 0 || sp.top_p <= 0 || sp.top_p > 1 || sp.top_k < 0 || sp.repetition_penalty <= 0) throw BadRequest("sampling parameter out of range");
+    if (sp.temperature < 0 || sp.top_p <= 0 || sp.top_p > 1 || sp.top_k < 0 || sp.repetition_penalty <= 0 || sp.repeat_last_n < -1) throw BadRequest("sampling parameter out of range");
     j->sp = sp;
     double mt = jnum(b.find("max_completion_tokens"), jnum(b.find("max_tokens"), jnum(b.find("n_predict"), -1)));
     const int room = ctx - (int)j->prompt.size() - 1;
