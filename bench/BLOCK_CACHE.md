@@ -151,6 +151,125 @@ turn — not by fixing the tip.
 - Tested at 128-token blocks on the 350M (fp32 and int8) and the 1.2B (fp32); the 1.2B at 16k was not run (prefill is
   4x slower per token, ~4 minutes per pass).
 
+## Prior art: what is and is not novel (checked 2026-10)
+
+The mechanism set now ships in production engines. Mapping, so a reviewer can check every row:
+
+| here | equivalent elsewhere |
+|---|---|
+| blocks keyed by tokens + parent hash (chained) | **vLLM APC** ("we hash each kv-cache block by the tokens in the block and the tokens in the prefix"); **TensorRT-LLM** blocks in a radix search tree; **d-inference** `<blockHashHex>.darkbloom-kv` files |
+| prefix sharing + LRU over those blocks | **SGLang RadixAttention**; TensorRT-LLM's radix tree |
+| disk/remote tier behind the same prefix identity | **LMCache** (GPU/CPU/disk/remote); **SGLang HiCache** L1 GPU, L2 host, L3 `file`/`mooncake`/`hf3fs`/`nixl`/`aibrix`/`eic`/SeaweedFS |
+| **conv/recurrent state at a boundary -> exact resume** | **SGLang Unified Radix Cache**: MAMBA/SSM checkpoints as components, copy-on-write, "the deepest boundary accepted by all components", int8 checkpoints, default since v0.5.16 |
+| **tip (prompt+output, exact stop point)** | SGLang stores the full token path, "input *and* output", per completed request |
+| whole-prefix exact reuse, no dedupe or tiering | **llama.cpp** slot `cache_prompt` + `--prompt-cache`; **Ollama** RAM-only |
+| the approximate alternative | **DeepSeek** SWA state slot + bounded replay (their own word: approximate) |
+
+**So the design is not novel, and this doc should not claim it is.** It is the same mechanism class as
+SGLang's Unified Radix Cache + HiCache, reimplemented for hardware and a model family those engines do
+not serve:
+
+- **target**: a 6 W N100 iGPU with int8 KV in unified memory - no datacenter accelerator, no RDMA, one disk;
+- **evidence**: a published bit-identical contract (restore == cold prefill, tokens compared) rather than
+  correctness by construction, including at 15k context;
+- **two different choices, not new mechanisms**: the tip is one mutable per-conversation block (1.9 MB,
+  overwritten each turn) instead of a shared reference-counted tree node, and capture is zero-slice
+  (point `lm_conv_state` at the two boundary rows) instead of a separate checkpoint pass.
+
+Where nothing equivalent exists: **hybrid conv/SSM models on iGPU/CPU-only consumer boxes**. The engines
+those boxes actually run top out at RAM-only reuse (Ollama) or one whole-prefix file per slot
+(llama.cpp), and llama.cpp's exact restore for hybrid/recurrent and SWA models is an open bug (`/slots`
+restore yields no reuse, #28194) - the exact failure mode this design exists to avoid. At this prefill
+rate the technique is also worth more than on a 4090, where the same 15k prefill costs a few hundred
+milliseconds: here it is 84.6 s -> 721 ms.
+
+## Replicating the DeepSeek cache layer: one box, or inference + cache box
+
+DeepSeek's efficiency is four legs and the cache cluster is one of them: prefill/decode disaggregation
+(EP32 prefill, EP144 decode, dual-microbatch overlap), the EP comms stack (DeepEP/EPLB), **3FS as the KV
+store** ("a cost-effective alternative to DRAM-based caching"), and sparse attention (DSA). The
+cache-specific parts that transfer:
+
+- KV pages at **64-token granularity** (FlashMLA), the same unit the API cache uses;
+- entries are **prefix units** persisted at three triggers - request boundaries **including the end of
+  model output**, detected common prefixes, and fixed token intervals - and a request hits only on a
+  **full unit match**;
+- the store is a **disaggregated NVMe fleet**: 3FS, 6.6 TiB/s aggregate, **40+ GiB/s per client**, CRAQ
+  chain replication, metadata in FoundationDB;
+- for SWA/sparse generations they keep one state slot per sequence with **bounded replay** and accept
+  approximate KV.
+
+Sizing is where this box differs by orders of magnitude. Feed rate needed = prefill rate x KV bytes/token:
+
+| | this N100 (350M, 15k ctx) | DeepSeek per node |
+|---|---|---|
+| prefill | ~177 tok/s | ~73.7k tok/s |
+| KV per token | 24.6 KB fp32 / ~12.3 KB int8 | MLA latent, 64-token pages |
+| **feed rate needed** | **~4.4 / ~2.2 MB/s per stream** | **40+ GiB/s per client** |
+
+Gigabit therefore carries ~28 concurrent int8 restores here, so the fabric is not the design problem -
+latency and prefetch are.
+
+### A. One box
+
+Present already: chained content-addressed blocks on NVMe, exact conv-state checkpoints, the tip, the
+async writer, the LRU budget, `/health` + `/metrics`. To match the idea:
+
+1. **Async prefetch** - match the chain before the slot is free and overlap the read with the queue wait,
+   so disk latency leaves TTFT. ~1 day.
+2. **Direct-to-device restore** - apply blocks at their slot offsets instead of assembling a host blob
+   (drops an `O(prefix)` copy: 345 MB at 15k). Needs `restore_range` on the engine. ~2 days.
+3. **Prefix-unit detection** - when several requests share a prefix, materialise it as a durable unit so
+   the second and later conversations are cheap too, not just the same one. ~1 day.
+4. **Leaf-preferring eviction + TTL by traffic class** - evicting a mid-chain block truncates every
+   descendant. ~0.5 day.
+5. **Tier metrics** - hit rate per tier, bytes served, prefetch wait: the analogue of
+   `prompt_cache_hit_tokens`. ~0.5 day.
+
+Footprint: a 15k-token chain is 345 MB fp32 / 172 MB int8, so 1 TB of NVMe holds ~2,900 such chains.
+Capacity is not the constraint on one box.
+
+### B. Inference box + cache box
+
+The block format is already self-describing (magic, version, state_id, chain, parent, n_tokens,
+geometry, crc32), so the split is an interface extraction, not a redesign:
+
+```
+BlockBackend
+  bool has(uint64_t chain);
+  bool get(const std::vector<uint64_t>& chain, Sink* out);   // ranged, streamed, CRC per block
+  void put(uint64_t chain, const uint8_t* kv, size_t, const uint8_t* cst, size_t);
+  void touch(uint64_t chain);
+    LocalDir      (today: a directory of files)
+    RemoteBlocks  (new: one batched multi-GET per chain)
+```
+
+Rules that make it safe:
+
+- **index local, data remote** - the chain index (112 entries at 15k) stays on the inference box, so
+  matching never pays a round trip; only a miss path talks to the cache box.
+- **one request per chain, not per block** - 112 blocks x RTT would dominate; send the hash list, receive
+  a concatenated CRC-checked stream.
+- **never on the correctness path** - miss, CRC failure or timeout means recompute from zero. Same
+  best-effort contract the hosted API advertises.
+- **write-back after the response** - a slow cache box must never delay a token.
+- **identity in the key** - `state_id` (model + kernels + KV dtype) prevents cross-build poisoning; it is
+  the `modelHash` check d-inference performs on every load.
+- **decide honestly** - for one box, local NVMe (1-2 GB/s) beats gigabit: a 345 MB chain is ~0.3 s local
+  against ~2.8 s at 125 MB/s, still 30x better than the 84.6 s cold prefill but a downgrade. Split only
+  when one cache must serve several inference boxes, the inference box has no NVMe headroom, or the cache
+  must outlive a reinstall.
+
+Acceptance gate for the split already exists: `scripts/test_blocks.py` (exactness, sharing, storage) must
+pass unchanged against `RemoteBlocks`.
+
+### Not copying
+
+3FS itself - CRAQ chain replication, a FoundationDB metadata service, USRBIO, RDMA. The consistency
+requirement here is "immutable block + atomic rename", which POSIX provides; the metadata is an index
+rebuilt from the directory. Their scale is why they need a storage *system*; this needs a directory and,
+at most, a small object server.
+
 ## Where this could go next
 
 1. **Async prefetch**: the chain is matched before the slot is free, so the read could overlap the queue.
