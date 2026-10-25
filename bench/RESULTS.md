@@ -663,14 +663,19 @@ default stack (NEO 26.35 + IGC 2.41), same GGUF files, same prompt lengths, sing
 
 | metric | ferro | llama.cpp Vulkan | speedup |
 |---|---|---|---|
-| 350M prefill 784 | 747.6 | 367.7 | **2.03x** |
+| 350M prefill 784 | 747.6 | 368.2 | **2.03x** |
 | 350M prefill 3626 | 487.6 | 282.5 | **1.73x** |
-| 350M decode | 56.8 | 24.7 | **2.30x** |
+| 350M decode | 56.8 | 25.2 | **2.25x** |
 | 350M decode @3.6k | 36.5 | 25.3 | **1.44x** |
-| 1.2B prefill 784 | 221.8 | 124.2 | **1.79x** |
-| 1.2B prefill 3626 | 143.0 | 104.6 | **1.37x** |
-| 1.2B decode | 21.1 | 10.6 | **2.00x** |
-| 1.2B decode @3.6k | 15.5 | 10.4 | **1.48x** |
+| 1.2B prefill 784 | 221.8 | 123.7 | **1.79x** |
+| 1.2B prefill 3626 | 143.0 | 102.1 | **1.40x** |
+| 1.2B decode | 21.1 | 8.6-10.6 | **2.0x** |
+| 1.2B decode @3.6k | 15.5 | 10.3 | **1.50x** |
+
+Re-run single-tenant (ferro serve stopped) to confirm the llama.cpp numbers while the serve had been up:
+pp matched within 0.3% (350M 367.7 -> 368.2, 1.2B 124.2 -> 123.7); the 1.2B Vulkan decode is clock-state
+sensitive, 8.62 +- 0.89 over 3 reps at short context vs 10.3-10.6 after a long warm prefill - the README
+quotes the range and uses the favourable-for-llama.cpp end for the ratio.
 
 Against llama.cpp CPU (2 threads, 2026-10-20, kept unchanged): 350M 11.2x prefill / 1.8x decode,
 1.2B 19.8x prefill / 3.4x decode. Ferro's edge shrinks with context length (2.03x -> 1.73x prefill,

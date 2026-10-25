@@ -203,9 +203,9 @@ one-variable fallback); llama.cpp = its Vulkan backend, this repo's pinned basel
 | LFM2.5-1.2B-Thinking Q8_0 | ferro iGPU | llama.cpp Vulkan (same iGPU) | speedup |
 |---|---|---|---|
 | prefill, 784 tokens | **222 tok/s** | 124 tok/s | **1.79×** |
-| prefill, 3,626 tokens | **143 tok/s** | 105 tok/s | **1.37×** |
-| decode, 1 stream, short ctx | **21 tok/s** | 10.6 tok/s | **2.00×** |
-| decode, 1 stream, @ 3.6k ctx | **15.5 tok/s** | 10.4 tok/s | **1.48×** |
+| prefill, 3,626 tokens | **143 tok/s** | 102 tok/s | **1.40×** |
+| decode, 1 stream, short ctx | **21 tok/s** | 8.6-10.6 tok/s | **2.0×** |
+| decode, 1 stream, @ 3.6k ctx | **15.5 tok/s** | 10.3 tok/s | **1.50×** |
 | decode, aggregate over 2 / 4 streams (server) | 22 / 35 tok/s (2026-10-20) | | |
 
 **LFM2.5-350M** (`LiquidAI/LFM2.5-350M-GGUF`, Q8_0, same code path, no model-specific changes) measured the same way:
@@ -214,7 +214,7 @@ one-variable fallback); llama.cpp = its Vulkan backend, this repo's pinned basel
 |---|---|---|---|
 | prefill, 784 tokens | **748 tok/s** | 368 tok/s | **2.03×** |
 | prefill, 3,626 tokens | **488 tok/s** | 283 tok/s | **1.73×** |
-| decode, 1 stream, short ctx | **57 tok/s** | 24.7 tok/s | **2.30×** |
+| decode, 1 stream, short ctx | **57 tok/s** | 25.2 tok/s | **2.25×** |
 | decode, 1 stream, @ 3.6k ctx | **36.5 tok/s** | 25.3 tok/s | **1.44×** |
 | decode, aggregate over 2 / 4 / 8 streams (server) | 58 / 98 / 132 tok/s (2026-10-20) | | |
 
