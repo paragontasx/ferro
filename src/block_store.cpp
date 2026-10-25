@@ -252,13 +252,25 @@ void BlockStore::save_tip_async(const std::vector<int>& prompt, int start, int e
     const int base = start;
     j.toks.assign(prompt.begin() + base, prompt.begin() + end);
     j.start = base; j.end = end; j.tip = true; j.kv = std::move(kv); j.cst = std::move(cst);
-    j.parent = chain_at(prompt, base);                          // the last whole block this tip hangs off
+    // walk to the parent, remembering every block on the way: the tips hanging off them are this conversation's
+    // older ends, superseded by the one we are about to write
+    std::vector<uint64_t> ancestors;
+    uint64_t h = root_;
+    ancestors.push_back(h);
+    for (int i = 0; i < base / blk_; ++i) { h = chain_next(h, prompt.data() + (size_t)i * blk_, blk_); ancestors.push_back(h); }
+    j.parent = h;                                               // the last whole block this tip hangs off
     j.chain = chain_next(j.parent, prompt.data() + base, L);
     {
         std::lock_guard<std::mutex> g(m_);
         if (stop_) return;
         auto it = tips_.find(j.parent);
         if (it != tips_.end() && it->second.hash == j.chain) return;   // identical tip already there
+        for (size_t a = 0; a + 1 < ancestors.size(); ++a) {           // one tip per conversation, not one per boundary
+            auto old = tips_.find(ancestors[a]);
+            if (old == tips_.end()) continue;
+            remove(old->second.path.c_str());
+            tips_.erase(old);
+        }
         jobs_.push_back(std::move(j));
     }
     cv_.notify_one();

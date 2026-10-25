@@ -351,12 +351,9 @@ static void gen_finish(Server& S, const std::shared_ptr<GenJob>& jp, const char*
     // One tip per conversation: the exact end of prompt+reply, so the next turn of this conversation restores there instead of
     // re-prefilling the stretch between the last whole block and where the conversation actually stopped. Captured before the
     // slot is released, because that is the only moment the conv state for these tokens exists.
-    if (getenv("FERRO_TIP_DEBUG"))
-        fprintf(stderr, "[tip] n_past=%d hist=%zu cache_prompt=%d err=%d\n", j.seq.n_past, j.hist.size(), (int)j.cache_prompt, err != nullptr);
     if (S.bstore && j.cache_prompt && !err && j.seq.n_past > 0 &&
         (int)j.hist.size() >= j.seq.n_past && (int)j.hist.size() - j.seq.n_past <= 1) {   // stopping at max_tokens leaves the last token un-consumed
         const int n = j.seq.n_past, base = S.bstore->block_depth(j.hist);
-        if (getenv("FERRO_TIP_DEBUG")) fprintf(stderr, "[tip] base=%d n=%d L=%d\n", base, n, n - base);
         if (n > base) {
             std::vector<uint8_t> kvb, cstb;
             if (S.lm.export_block(j.seq, base, n, &kvb, &cstb)) S.bstore->save_tip_async(j.hist, base, n, std::move(kvb), std::move(cstb));
@@ -499,7 +496,7 @@ static void gen_prefill_chunk(Server& S) {
     if (end - j.pf_pos >= 48 && ms > 0) { const double r = (end - j.pf_pos) * 1000.0 / ms; S.pf_rate = S.pf_rate > 0 ? 0.6 * S.pf_rate + 0.4 * r : r; }
     S.rw_prefill.add(end - j.pf_pos, ms);
     j.pf_ms += ms; j.pf_pos = end;
-    if (S.bstore && j.cache_prompt && end % S.bstore->block() == 0) {               // capture [end-B, end): O(B), not O(prefix)
+    if (S.bstore && j.cache_prompt && end % S.bstore->block() == 0) {
         const int B = S.bstore->block();
         std::vector<uint8_t> kvb, cstb;
         if (S.lm.export_block(j.seq, end - B, end, &kvb, &cstb)) S.bstore->save_async(j.prompt, end, std::move(kvb), std::move(cstb));

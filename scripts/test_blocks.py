@@ -109,7 +109,7 @@ def main():
             p = start(port, tmp)
             b, ntok2, cached2 = chat(port, convo(0, TURNS[0]))
             check("a restarted server restores a chain from disk", bc(port).get("disk_hits", 0) >= 1, bc(port))
-            check("the restored prefix is actually reused", cached2 > BLK, "cached=%d" % cached2)
+            check("the restored prefix is actually reused", cached2 >= BLK, "cached=%d" % cached2)
             check("restore is exact (same tokens, cold vs restored)", a == b, repr(a[:70]) + " vs " + repr(b[:70]))
 
             # ---------------- 2. sharing ----------------
@@ -133,8 +133,8 @@ def main():
         finally:
             stop(p)
 
-        # ---------------- 3. storage for a growing conversation ----------------
-        p = start(port, tmp)
+        # ---------------- 3. storage for a growing conversation (own directory: only this conversation) ----------------
+        p = start(port, os.path.join(tmp, "store"))
         try:
             sum_tokens = 0
             for i in range(len(TURNS)):
@@ -147,7 +147,7 @@ def main():
             per_tok = per_block / BLK
             unique = max(h.get("saved", 0), 1)
             naive = sum_tokens * per_tok
-            actual = blocks * per_block
+            actual = mb * 2**20                                  # blocks + tips: what the store really occupies
             print()
             print("  %d turns, %d prompt tokens summed, final prefix ~%d tokens" % (len(TURNS), sum_tokens, ntok))
             print("  blocks on disk: %d (%.2f MB, %.3f MB each = %.1f KB/token)" % (blocks, mb, per_block / 2**20, per_tok / 1024))

@@ -72,7 +72,7 @@ therefore `O(prefix)`, not `O(prefix^2)`.
 | **restore is exact** | identical tokens, cold vs restored |
 | sibling conversation reuses shared blocks | 607 of 626 tokens cached, **0 new blocks written** |
 | sibling served from blocks == cold prefill | identical tokens |
-| storage, 6 growing turns | **15.4 MB vs 98.8 MB** whole-prefix = **6.41x** |
+| storage, 6 growing turns | **17.8 MB vs 98.4 MB** whole-prefix = **5.53x** (blocks + tip) |
 | restart then continue the same conversation | 17 tokens re-prefilled instead of 94 (442 -> 147 ms) |
 | tip-served continuation == cold prefill | identical tokens |
 
@@ -80,19 +80,33 @@ Per-block cost: 3.08 MB at N=128 (24.6 KB/token), i.e. blocks of one chain share
 
 ### Cost: prefill slicing
 
-A 1,400-token cold prefill, min of 2 runs (GPU shared with another server, so min is the honest estimator):
+A 1,400-token cold prefill, interleaved A/B, min of 4 runs:
 
 | block size | slices | prefill | vs unsliced |
 |---|---|---|---|
-| off | 1 | 5,387 ms | — |
-| 2048 | 1 | 5,559 ms | +3.2% |
-| 512 | 3 | 5,967 ms | +10.8% |
-| 128 | 11 | 6,347 ms | +17.8% |
+| off | 1 | 5,144 ms | — |
+| 512 | 3 | 5,304 ms | +3.1% |
+| 128 | 11 | 5,694 ms | +10.7% |
 
-The cost is **per slice**, ~79 ms each, not per block: this backend syncs once per layer (i915 watchdog), so every
-extra slice pays ~40 extra syncs. It shrinks on a backend with fewer syncs and on hardware with more compute.
-It also applies only to a *cold* request (`cache_prompt: false` skips both the alignment and the capture), and only
-once per conversation — every later turn restores instead of prefilling.
+About **50 ms per extra `step()` call**, independent of context length — so the cost is the number of slices, not the
+number of blocks. Two candidate causes were measured and **ruled out**:
+
+- *per-layer sync* (the i915 watchdog `gpu::finish()`): batching it (every 4 layers) or removing it entirely changed
+  nothing (5,058 / 5,201 ms vs 5,228 ms).
+- *block capture*: skipping `export_block` changed nothing (5,700 ms with capture vs 5,704 ms without).
+
+That leaves the fixed cost of starting a step — argument marshalling and ~400 kernel launches per slice on this driver.
+The fixes are therefore fewer slices, in order of effort:
+
+1. **Larger blocks.** `--block-cache 512` costs +3.1% instead of +10.7%. With the tip in place the tail stays exact,
+   so the only thing a larger block trades away is how finely two conversations can share a diverging prefix.
+2. **Capture boundary states inside one slice.** `op_lm_conv_state` already writes `b*x` of chosen rows into a state
+   slot; a variant that also writes the two rows before every block boundary into a side buffer would let prefill run
+   unsliced and blocks be exported in a post-pass, removing the cost entirely. This is the real fix; it touches a kernel.
+3. Fewer launches per layer (fusion) — helps all prefill, not just the cache.
+
+It also applies only to a *cold* request (`cache_prompt: false` skips alignment and capture) and only to the first turn
+of a conversation. On the 1.2B the relative penalty is about half, because prefill is 5-7x slower per token there.
 
 Warm-path check: after a restart, a 1,938-token prompt with a 768-token chain restored prefilled 1,170 tokens in
 3,475 ms (337 tok/s), where a cold prefill of the full prompt is ~5,750 ms.
