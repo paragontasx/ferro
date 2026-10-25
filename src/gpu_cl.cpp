@@ -1433,7 +1433,7 @@ __kernel void lm_attn_pf(__global const float* C, int ldc, __global const float*
     #pragma unroll
     for (int j = 0; j < KT5; ++j) { if (j >= kn) continue;
       float4 s4 = (float4)(0.f);
-      #pragma unroll
+      #pragma unroll 8   // partial unroll only: full unroll hoists Q into 64 GRF and IGC spills (53.7->12.1 ms/launch on NEO)
       for (int i = 0; i < 16; ++i) s4 = mad(vload4(i, Qs + lid * 68), vload4(i, Ks + j * 64), s4);
       sc[j] = (k0 + j <= myhi) ? (s4.x + s4.y + s4.z + s4.w) : -1e30f;
     }
