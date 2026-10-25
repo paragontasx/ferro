@@ -2014,6 +2014,11 @@ bool read_at(Buf b, size_t off, void* dst, size_t bytes) {
     if (!bytes) return true;
     return cl.clEnqueueReadBuffer(g_q, (cl_mem)b, CL_TRUE, off, bytes, dst, 0, nullptr, nullptr) == CL_SUCCESS;
 }
+bool read_nb(Buf b, void* dst, size_t bytes) { return read_nb_at(b, 0, dst, bytes); }
+bool read_nb_at(Buf b, size_t off, void* dst, size_t bytes) {
+    if (!bytes) return true;
+    return cl.clEnqueueReadBuffer(g_q, (cl_mem)b, CL_FALSE, off, bytes, dst, 0, nullptr, nullptr) == CL_SUCCESS;
+}
 bool finish() { return cl.clFinish(g_q) == CL_SUCCESS; }
 bool copy(Buf dst, size_t dst_off, Buf src, size_t src_off, size_t bytes) {
     if (!bytes) return true;

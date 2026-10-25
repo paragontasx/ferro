@@ -7,6 +7,7 @@
 // Per-sequence state: the last two `b*x` rows of every conv block + K/V of every attention block.
 #pragma once
 #include "block_store.h"
+#include <utility>
 #include "gguf.h"
 #include "kernels.h"
 #include <memory>
@@ -96,11 +97,19 @@ public:
     std::shared_ptr<LmPrefix> snapshot(const LmSeq& s) const;
     bool restore(LmSeq& s, const LmPrefix& p) const;
     size_t prefix_bytes(int n_tokens) const;
+    // Block-boundary capture: while prefilling one sequence, remember b*x of the two rows before every multiple of
+    // `blk` into gpu_slot's capture set, so a KV block can be resumed there without ending a prefill slice on the
+    // boundary. b*x is exactly what lm_conv_state writes, so no kernel change is needed.
+    bool capture_blocks(int blk);
+    // boundary positions captured for gpu_slot since the last clear, each with its conv state as a prefix-blob cst payload
+    bool take_captures(int gpu_slot, std::vector<std::pair<int, std::vector<uint8_t>>>* out);
+    void clear_captures(int gpu_slot);
     BlockGeom block_geom() const;                     // payload shape of one cache block (see block_store.h)
     // Capture one block of a live sequence: K/V rows [from,to) of every attention layer, then the conv state as it
     // stands at s.n_past (callers pass to == s.n_past: the conv state is only valid where it was computed). Layout is
     // a prefix blob restricted to those rows, so blocks of one chain concatenate per layer into a prefix blob.
-    bool export_block(const LmSeq& s, int from, int to, std::vector<uint8_t>* kv, std::vector<uint8_t>* cst) const;          // device bytes a snapshot of n_tokens takes
+    bool export_block(const LmSeq& s, int from, int to, std::vector<uint8_t>* kv, std::vector<uint8_t>* cst,
+                      bool wait = true) const;   // cst null = K/V only; wait false = enqueued reads, caller finishes          // device bytes a snapshot of n_tokens takes
 
 private:
     LmModel m_;

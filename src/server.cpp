@@ -359,6 +359,7 @@ static void gen_finish(Server& S, const std::shared_ptr<GenJob>& jp, const char*
             if (S.lm.export_block(j.seq, base, n, &kvb, &cstb)) S.bstore->save_tip_async(j.hist, base, n, std::move(kvb), std::move(cstb));
         }
     }
+    if (j.seq.gpu_slot >= 0) S.lm.clear_captures(j.seq.gpu_slot);
     S.lm.release(j.seq);
     if (!err && j.finish == "length" && j.in_think) fprintf(stderr, "[serve] warning: reply reached max_tokens inside the reasoning block (content is empty); raise max_tokens or set thinking_budget\n");
     j.gen_ms = ms_since(j.t_gen0);
@@ -481,13 +482,7 @@ static void gen_prefill_chunk(Server& S) {
         const double rate = S.pf_rate > 0 ? S.pf_rate : 300.0;
         end = std::min(n, j.pf_pos + std::max(64, std::min(1024, (int)(rate * S.o.prefill_slice_ms / 1000.0))));
     }
-    bool cut_applied = false;
-    for (int c : j.pf_cuts) if (c > j.pf_pos && c < end) { end = c; cut_applied = true; }
-    if (S.bstore && j.cache_prompt) {                                                // only a prompt that will be cached pays this
-        const int B = S.bstore->block(), nb = ((j.pf_pos / B) + 1) * B;
-        if (end >= nb) end = std::min(end, nb);                                      // never cross a boundary: the conv state is only valid there
-        else if (!cut_applied && end < n) end = std::min(n, nb);                     // a short time slice: extend up to the boundary
-    }                    // never step over a snapshot boundary
+    for (int c : j.pf_cuts) if (c > j.pf_pos && c < end) end = c;                    // never step over a snapshot boundary                    // never step over a snapshot boundary
     std::string err; bool ok = true;
     const auto t0 = clk::now();
     try { ok = S.lm.step({&j.seq}, {j.prompt.data() + j.pf_pos}, {end - j.pf_pos}, S.lg.data(), &err, true); } catch (const std::exception& e) { err = e.what(); ok = false; }
@@ -496,11 +491,6 @@ static void gen_prefill_chunk(Server& S) {
     if (end - j.pf_pos >= 48 && ms > 0) { const double r = (end - j.pf_pos) * 1000.0 / ms; S.pf_rate = S.pf_rate > 0 ? 0.6 * S.pf_rate + 0.4 * r : r; }
     S.rw_prefill.add(end - j.pf_pos, ms);
     j.pf_ms += ms; j.pf_pos = end;
-    if (S.bstore && j.cache_prompt && end % S.bstore->block() == 0) {
-        const int B = S.bstore->block();
-        std::vector<uint8_t> kvb, cstb;
-        if (S.lm.export_block(j.seq, end - B, end, &kvb, &cstb)) S.bstore->save_async(j.prompt, end, std::move(kvb), std::move(cstb));
-    }
     if (end < n) {
         if (std::find(j.pf_cuts.begin(), j.pf_cuts.end(), end) != j.pf_cuts.end()) {   // reached a boundary: leave a snapshot behind
             const auto ts = clk::now();
@@ -511,6 +501,18 @@ static void gen_prefill_chunk(Server& S) {
     }
     upd();
     j.prompt_ms = j.pf_ms;
+    if (S.bstore && j.cache_prompt) {                                                // one pass over every boundary this prefill captured
+        std::vector<std::pair<int, std::vector<uint8_t>>> states;
+        const int B = S.bstore->block();
+        if (S.lm.take_captures(j.seq.gpu_slot, &states))
+            for (auto& st : states) {
+                const int p = st.first;
+                std::vector<uint8_t> kvb;
+                if (S.lm.export_block(j.seq, p - B, p, &kvb, nullptr, false) && gpu::finish())
+                    S.bstore->save_async(j.prompt, p, std::move(kvb), std::move(st.second));
+            }
+        S.lm.clear_captures(j.seq.gpu_slot);
+    }
     if (std::find(j.pf_cuts.begin(), j.pf_cuts.end(), n) != j.pf_cuts.end()) {      // end-of-prompt snapshot (several messages or tools), before the first token
         const auto ts = clk::now();
         pc_store(S, j.prompt, S.lm.snapshot(j.seq), false, true);
@@ -703,6 +705,7 @@ static void worker_loop(Server& S, std::promise<std::string>& ready) {
             S.lg.assign((size_t)S.lm.n_slots() * (size_t)S.lm.n_vocab(), 0.0f);
             if (!S.o.snapshot_dir.empty() && S.o.block_cache > 0 && S.lm.on_gpu()) {
                 S.bstore.reset(new BlockStore); std::string e;
+                S.lm.capture_blocks(S.o.block_cache);                      // boundary conv states, captured during prefill
                 if (!S.bstore->open(S.o.snapshot_dir + "/blocks", S.lm.state_id(), S.o.block_cache,
                                     (uint64_t)S.o.snapshot_mb << 20, S.lm.block_geom(), &e)) {
                     fprintf(stderr, "[serve] block cache disabled: %s\n", e.c_str()); S.bstore.reset();
