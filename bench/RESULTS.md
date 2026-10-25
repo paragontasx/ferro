@@ -538,3 +538,46 @@ tail (a tail is skipped rather than evicting one), so `entries` and tail presenc
 than assumed; the quarter-cache cap keeps tails from ever owning more than 64 MB there.
 
 `scripts/serve_prod.sh` no longer passes `--no-prefix-tail`; production restarts onto tails enabled at the next launch.
+## 2026-10-24 — Intel NEO (compute-runtime) driver support + prefill attention tile retune (`75d0da7`)
+
+**Driver stack.** Mesa rusticl was the only ICD installed; Intel's NEO (compute-runtime 26.35 +
+IGC 2.41, installed rootlessly into a prefix and selected via `OCL_ICD_VENDORS`) runs the same
+binary and kernels. `clinfo`: NEO reports the true 24 CUs / 750 MHz / cl_khr_fp16 / full subgroup
+set, where rusticl reports 2 CUs / 400 MHz / no fp16. The "iGPU ceilings" recorded earlier
+(25.9 GB/s streaming, 435 GMAC/s DP4A) were measured through rusticl and are SOFTWARE ceilings.
+
+**Port fixes needed for NEO** (all in this commit):
+- NEO caps work-group size at 512 (rusticl allowed 1024): per-row quantize kernels silently fell
+  back to CPU — the LM prefill was fine, but `decide` batch and prefill-adjacent paths failed as
+  `iGPU forward failed`/`decision forward failed` → CPU. Fixed by querying
+  CL_DEVICE_MAX_WORK_GROUP_SIZE and column-chunking (`quant_lane8` now takes an explicit lane).
+- Kernel build with IGC needs the front-end compiler: `libigdfcl.so.2` comes from
+  intel/intel-graphics-compiler releases (intel-igc-core-2, intel-igc-opencl-2); without it every
+  build fails with an EMPTY build log.
+
+**Measured, same binary, single-tenant, alternating arms (end-to-end tok/s):**
+
+| workload | rusticl | NEO |
+|---|---|---|
+| 350M decode | 45.0 | 58.0 (+29%) |
+| 350M prefill | 153.7 | 274.7 (+79%) |
+| 1.2B decode, short ctx | ~15.5 | ~20.8 (+34%) |
+| 1.2B prefill 408 tok | 158.7 | 170.9 (+8%) |
+| 1.2B prefill 3626 tok | 111.5 | 83.5 (−25%) |
+| d1 16-ticket batch | 482 | 482 (parity) |
+
+**Prefill attention tile: `KT5` 16 → 8** (key-chunk staged in SLM; `QT5`=32 unchanged). Per-layer
+`lm_attn_pf` at 408 tok: Mesa 31.7 → 17.2 ms (−46%), NEO 136.3 → 53.7 ms (−61%); at 3626 tok:
+Mesa 2172 → 1142 ms, NEO 9530 → 3729 ms. Model-level 1.2B prefill at 3626 tok: NEO 47.9 → 83.5
+tok/s (+74%), Mesa 105 → 111.5. The tile sweep (QT5 ∈ {16,32,64} × KT5 ∈ {8,16,32,64}) used a
+standalone harness (`ferro-lab/cl_bench.cpp`) that launches the single kernel: identical results
+in seconds instead of full 40-s model loads. IGC's remaining deficit on this kernel is
+loads-with-a-`j`-varying-uniform-address (K from SLM: 37 vs 10 ms on its own) — global-K and
+register-hoisted-Q variants were both tried and rejected.
+
+**Gates.** lm_parity 12/12 top-1, mean TV 0.0100 NEO / 0.0168 rusticl (unchanged by the tile);
+d1_parity 15/15 token counts, 23/23 top answers, batched==alone 0.0e+00 (NEO).
+
+**Stability.** Two host hangs during GPU experiments (Oct-23 SKV=16 variant on rusticl; Oct-24 a
+16-run NEO matrix) — unvalidated GPU paths get single supervised runs only; a hung driver takes
+the whole box (no SSH).
