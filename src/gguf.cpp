@@ -162,6 +162,10 @@ std::vector<int64_t> GgufFile::get_iarr(const std::string& k) const {
         for (size_t i = 0; i < n; ++i) { int16_t v; memcpy(&v, raw.data()+i*2, 2); out[i]=v; } }
     else if (et == 0 || et == 1) { size_t n = raw.size(); out.resize(n);
         for (size_t i = 0; i < n; ++i) out[i] = (int8_t)raw[i]; }
+    else if (et == 7) { size_t n = raw.size(); out.resize(n);          // GGUF bool arrays: 1 byte each
+        for (size_t i = 0; i < n; ++i) out[i] = raw[i] ? 1 : 0; }
+    else if (et == 6) { size_t n = raw.size()/4; out.resize(n);
+        for (size_t i = 0; i < n; ++i) { float v; memcpy(&v, raw.data()+i*4, 4); out[i]=(int64_t)v; } }
     return out;
 }
 

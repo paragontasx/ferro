@@ -37,6 +37,7 @@ private:
     std::vector<int> specials_;                         // CONTROL / USER_DEFINED, longest first
     std::vector<std::string> regex_;
     bool ignore_merges_ = true;
+    bool spm_ = false;                                  // gemma4: spaces escape to U+2581, raw UTF-8 (no byte encoding), U+2581 -> space on decode
     int mask_id_ = -1, bos_id_ = -1;
 };
 

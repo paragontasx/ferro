@@ -3,6 +3,8 @@
 #include "../third_party/llama_unicode/unicode.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <queue>
 #include <string_view>
 
@@ -12,7 +14,9 @@ namespace ferro {
 enum { TT_NORMAL = 1, TT_UNKNOWN = 2, TT_CONTROL = 3, TT_USER_DEFINED = 4, TT_UNUSED = 5, TT_BYTE = 6 };
 
 bool BpeTokenizer::load(const GgufFile& g, std::string* err) {
-    if (g.get_str("tokenizer.ggml.model") != "gpt2") { *err = "tokenizer is not byte-level BPE (gpt2)"; return false; }
+    const std::string model = g.get_str("tokenizer.ggml.model");
+    if (model != "gpt2" && model != "gemma4") { *err = "tokenizer is not BPE (gpt2/gemma4)"; return false; }
+    spm_ = (model == "gemma4");
     tokens_ = g.get_strarr("tokenizer.ggml.tokens");
     auto ty = g.get_iarr("tokenizer.ggml.token_type");
     types_.assign(ty.begin(), ty.end());
@@ -31,7 +35,12 @@ bool BpeTokenizer::load(const GgufFile& g, std::string* err) {
     }
 
     const std::string pre = g.get_str("tokenizer.ggml.pre");
-    if (pre == "lfm2" || pre == "llama3" || pre == "llama-bpe" || pre == "llama-v3") {
+    if (spm_) {
+        // gemma4: SPM-style BPE — spaces are replaced by U+2581 and BPE runs over the whole text;
+        // only newline runs are split out (BPE merge lookup asserts no newlines inside a token).
+        regex_ = {"[^\\n]+|[\\n]+"};
+        ignore_merges_ = false;
+    } else if (pre == "lfm2" || pre == "llama3" || pre == "llama-bpe" || pre == "llama-v3") {
         regex_ = {"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"};
         ignore_merges_ = true;
     } else {
@@ -61,6 +70,8 @@ int BpeTokenizer::rank(const std::string& a, const std::string& b) const {
 
 // llm_tokenizer_bpe_session::tokenize for one pre-tokenized (byte-encoded) word
 void BpeTokenizer::bpe_word(const std::string& word, std::vector<int>& out) const {
+    static const bool dbg = getenv("G4_TOKDBG") != nullptr;
+    if (dbg) { fprintf(stderr, "[tok] word(%zu bytes) =", word.size()); for (unsigned char c : word) fprintf(stderr, " %02x", c); fprintf(stderr, "\n"); }
     if (ignore_merges_) {
         auto it = tok2id_.find(word);
         if (it != tok2id_.end()) { out.push_back(it->second); return; }
@@ -96,6 +107,7 @@ void BpeTokenizer::bpe_word(const std::string& word, std::vector<int>& out) cons
         add(L.prev, bg.left);
         add(bg.left, L.next);
     }
+    if (dbg) { fprintf(stderr, "[tok] after merges: %zu syms:", sym.size()); for (auto& z : sym) if (z.n) fprintf(stderr, " [%.*s]", (int)z.n, word.data()+z.off); fprintf(stderr, "\n"); }
     for (auto& s : sym) {
         if (!s.n) continue;
         std::string str = word.substr(s.off, s.n);
@@ -136,7 +148,28 @@ std::vector<int> BpeTokenizer::tokenize(const std::string& text, bool parse_spec
     std::vector<int> out;
     for (const Frag& f : frags) {
         if (f.id >= 0) { out.push_back(f.id); continue; }
-        auto words = unicode_regex_split(text.substr(f.off, f.len), regex_, true);
+        std::string seg = text.substr(f.off, f.len);
+        if (spm_) {                                  // escape_whitespaces: ' ' -> U+2581 before splitting
+            std::string esc;
+            esc.reserve(seg.size() + 8);
+            for (char c : seg) {
+                if (c == ' ') esc += "\xE2\x96\x81"; else esc += c;
+            }
+            seg.swap(esc);
+            // gemma4 pre-tokenizer is exactly "[^\n]+|[\n]+"; split by hand because the vendored
+            // unicode_regex_split re-encodes non-ASCII UTF-8 (it was only ever exercised on the
+            // byte-level LFM2 vocabulary). Byte-preserving here.
+            size_t i = 0;
+            while (i < seg.size()) {
+                const bool nl = seg[i] == '\n';
+                size_t j = i;
+                while (j < seg.size() && (seg[j] == '\n') == nl) ++j;
+                bpe_word(seg.substr(i, j - i), out);
+                i = j;
+            }
+            continue;
+        }
+        auto words = unicode_regex_split(seg, regex_, true);
         for (const auto& w : words) bpe_word(w, out);
     }
     return out;
@@ -155,6 +188,16 @@ std::string BpeTokenizer::decode_piece(int id) const {
     }
     if (id < 0 || id >= (int)tokens_.size()) return std::string();
     const std::string& p = tokens_[id];
+    if (spm_) {                                   // gemma4: U+2581 -> space, raw UTF-8 (no byte-level mapping)
+        std::string o;
+        o.reserve(p.size());
+        for (size_t i = 0; i < p.size();) {
+            if (i + 2 < p.size() && (unsigned char)p[i] == 0xE2 && (unsigned char)p[i + 1] == 0x96 &&
+                (unsigned char)p[i + 2] == 0x81) { o += ' '; i += 3; }
+            else { o += p[i]; ++i; }
+        }
+        return o;
+    }
     std::string out;
     for (size_t i = 0; i < p.size();) {
         const unsigned char c = (unsigned char)p[i];

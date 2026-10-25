@@ -2,6 +2,7 @@
 #include "lm_cli.h"
 #include "chat_template.h"
 #include "json.h"
+#include "model_gemma4.h"
 #include "model_lfm2_lm.h"
 #include "threadpool.h"
 #include "tokenizer_bpe.h"
@@ -15,7 +16,75 @@
 
 namespace ferro {
 
+// Gemma 4 one-shot generation (CPU reference path). The chat format is the model's own
+// <start_of_turn>/<end_of_turn> convention; --raw sends the prompt verbatim after <bos>.
+static int run_generate_gemma4(const GenArgs& a) {
+    using clk = std::chrono::steady_clock;
+    auto secs = [](clk::time_point t) { return std::chrono::duration<double>(clk::now() - t).count(); };
+    auto t0 = clk::now();
+    Gemma4Model m; std::string err;
+    if (!m.load(a.lm, a.ctx, &err)) { fprintf(stderr, "load failed: %s\n", err.c_str()); return 1; }
+    BpeTokenizer tok;
+    if (!tok.load(m.gguf, &err)) { fprintf(stderr, "tokenizer: %s\n", err.c_str()); return 1; }
+    fprintf(stderr, "[gemma4] %d layers, d=%d, heads %d/%d, vocab %d, ple %d, loaded in %.2fs\n",
+            m.n_layer, m.n_embd, m.n_head, m.n_kv, m.n_vocab, m.n_embd_pl, secs(t0));
+
+    std::string text;
+    if (!a.logits_batch.empty()) {                              // score many raw prompts (parity tooling)
+        std::ifstream f(a.logits_batch); std::stringstream ss; ss << f.rdbuf();
+        Json arr = json_parse(ss.str());
+        std::vector<float> lg((size_t)m.n_vocab);
+        Gemma4Model::State sq;
+        for (size_t i = 0; i < arr.arr.size(); ++i) {
+            std::vector<int> pi = tok.tokenize("<bos>" + arr.arr[i].s, true);
+            m.reset(sq);
+            auto t1 = clk::now();
+            if (!m.forward(sq, pi.data(), (int)pi.size(), lg.data(), &err)) { fprintf(stderr, "prompt %zu failed: %s\n", i, err.c_str()); return 1; }
+            fprintf(stderr, "[gemma4] prompt %zu: %zu tokens, prefill %.3fs (%.0f tok/s)\n", i, pi.size(), secs(t1), pi.size() / secs(t1));
+            FILE* o = fopen((a.dump_logits + "." + std::to_string(i) + ".bin").c_str(), "wb");
+            if (o) { fwrite(lg.data(), 4, lg.size(), o); fclose(o); }
+        }
+        return 0;
+    }
+    if (a.raw) text = a.prompt;
+    else {
+        text = "<bos><start_of_turn>user\n" + a.prompt + "<end_of_turn>\n<start_of_turn>model\n";
+    }
+    std::vector<int> ids = tok.tokenize(text, true);
+    if (a.print_ids) { fprintf(stderr, "prompt ids (%zu):", ids.size()); for (int i : ids) fprintf(stderr, " %d", i); fprintf(stderr, "\n"); }
+    if ((int)ids.size() + a.n_predict > a.ctx) { fprintf(stderr, "prompt %zu + n_predict exceeds ctx %d\n", ids.size(), a.ctx); return 2; }
+
+    Gemma4Model::State st;
+    m.reset(st);
+    std::vector<float> logits((size_t)m.n_vocab);
+    auto t1 = clk::now();
+    if (!m.forward(st, ids.data(), (int)ids.size(), logits.data(), &err)) { fprintf(stderr, "forward failed: %s\n", err.c_str()); return 1; }
+    const double pf_s = secs(t1);
+    fprintf(stderr, "[gemma4] prefill %zu tokens in %.3fs (%.1f tok/s)\n", ids.size(), pf_s, ids.size() / pf_s);
+
+    Sampler smp(a.sp);
+    std::vector<int> hist = ids;
+    auto td = clk::now();
+    int n_gen = 0;
+    for (int i = 0; i < a.n_predict; ++i) {
+        const int id = smp.sample(logits.data(), m.n_vocab, hist);
+        hist.push_back(id);
+        if (id == m.eos_id) break;
+        ++n_gen;
+        if (!a.quiet) { fputs(tok.decode_piece(id).c_str(), stdout); fflush(stdout); }
+        if (i + 1 >= a.n_predict) break;
+        if (!m.forward(st, &id, 1, logits.data(), &err)) { fprintf(stderr, "\nforward failed: %s\n", err.c_str()); return 1; }
+    }
+    const double d_s = secs(td);
+    fprintf(stderr, "\n[gemma4] decode %d tokens in %.3fs (%.2f tok/s)\n", n_gen, d_s, n_gen > 0 ? n_gen / d_s : 0.0);
+    return 0;
+}
+
 int run_generate(const GenArgs& a) {
+    {   // arch dispatch: gemma4 has its own loader/forward
+        GgufFile probe; std::string perr;
+        if (probe.open_file(a.lm.c_str(), &perr) && is_gemma4(probe)) return run_generate_gemma4(a);
+    }
     struct PoolGuard { ~PoolGuard() { Pool::get().shutdown(); } } pool_guard;
     using clk = std::chrono::steady_clock;
     auto secs = [](clk::time_point t) { return std::chrono::duration<double>(clk::now() - t).count(); };
