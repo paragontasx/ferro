@@ -698,7 +698,10 @@ Next-token parity over 6 raw prompts (top-1 / TV / mean |dlogprob|):
 | iGPU hybrid (`FERRO_LM_GPU=1`, NEO) | — | — | — | 0.85 tok/s | 18.9 tok/s |
 | iGPU hybrid (rusticl) | — | — | — | 1.81 tok/s | 11.4 tok/s |
 
-Numbers are single-tenant, 39-token chat prompt, `--temp 0`, 16-20 generated tokens.
+Numbers are single-tenant, `--temp 0`. Short row: 39-token chat prompt, 16-20 generated tokens.
+Long prompt (365 tokens, git-log-style filler, summarisation task): CPU int8 per-row 4.2 tok/s prefill /
+3.49 tok/s decode, correct one-sentence summary. CPU load is ~37 s (Q4_0 -> int8 repack of 1.5 G
+weights) once per process.
 
 Notes
 - iGPU weights go resident (`gpu::upload_q8`, int8 DP4A). Per-token decode currently pays ~280
