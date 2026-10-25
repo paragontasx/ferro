@@ -746,3 +746,28 @@ What the measurement says about the remaining headroom
   resident; (2) a decode-shaped attention kernel - the tiled QK/PV kernels process 64 query rows
   per tile regardless, so at 365 tokens one query row still costs a whole tile, which is why decode
   drops from 8.07 to 4.86 tok/s with context.
+
+### Negative result: 4-bit (nibble) weight planes for the GEMM — do not retry
+
+Measured at 086a432 + the int4 patch (interleaved inside one process, best-of-20, so DVFS/thermal drift
+hits both arms equally; harness `ferro-lab/gemm_bench.cpp` takes the shape and token count):
+
+| shape | T | int8 planes | int4 nibbles | delta |
+| :-- | :-- | :-- | :-- | :-- |
+| 24576x1536 | 1 | 1.73 ms, 21.8 GB/s | 2.21 ms, 8.5 GB/s | -22% |
+| 24576x1536 | 128 | 20.15 ms, 239.7 GMAC/s | 29.56 ms, 163.5 GMAC/s | -32% |
+| 262144x1536 | 1 | 19.90 ms, 20.2 GB/s | 26.11 ms, 7.7 GB/s | -24% |
+| 1536x12288 | 1 | 1.88 ms, 10.1 GB/s | 2.55 ms, 3.7 GB/s | -26% |
+
+Why: unpacking a nibble into an int8 DP4A operand costs ~2 extra ALU ops per 4-value group
+(`(n & 15) - 8` via modular uchar arithmetic, plus a shift for the high half), i.e. roughly doubling
+the instruction count per DP4A. It only pays if the GEMM is bandwidth-bound, and these kernels are
+not, even at T=1: int8 already streams at 21.8 GB/s of a ~25 GB/s ceiling while running at 1/11 of
+the DP4A throughput it reaches at T=128 (239.7 GMAC/s). Halving the bytes bought nothing because the
+cost is latency/instruction issue, not DRAM.
+
+Consequence for the decode roofline: the earlier "decode is bandwidth-bound at 13 GB/s, so 1.8x fewer
+bytes gives 1.8x" reading was wrong. A single token at T=1 runs the small-T kernels at ~1/11 of the
+DP4A rate the same kernels reach when 128 rows share the launch - so the decode lever is *more work
+per launch* (fusion, larger T), not fewer bytes. Numerics were verified exact before the perf run
+(top-1/2/3 logits identical to int8 on both probe prompts), so this is purely a speed verdict.

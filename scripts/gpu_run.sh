@@ -31,8 +31,21 @@ if ! gpu_acquire "$ME" "$WHAT" 15; then
 fi
 trap 'gpu_release "$ME"' EXIT INT TERM
 
-orph=$(pgrep -x ferro-embed 2>/dev/null | head -5 | tr '\n' ' ')
-[ -n "$orph" ] && echo "[gpu_run] note: ferro-embed already up: $orph (the long-lived serve is expected)" >&2
+# hard guard: a stray compute process (not the long-lived serve) means contention - refuse, do not run.
+# An orphan surviving a killed wrapper is exactly what silently halved two of my earlier measurements.
+stray=""
+for pid in $(pgrep -x ferro-embed 2>/dev/null); do
+    case "$(tr '\0' ' ' < /proc/$pid/cmdline 2>/dev/null)" in
+        *" serve "*) : ;;                       # the serve is expected and idle
+        *) stray="$stray $pid" ;;
+    esac
+done
+if [ -n "$stray" ]; then
+    echo "[gpu_run] REFUSING: another ferro-embed compute process is running:$stray" >&2
+    echo "[gpu_run] fix: kill it (kill -9$stray) and re-run; never measure with two engines live" >&2
+    gpu_release "$ME"
+    exit 76
+fi
 
 start=$(date +%s)
 timeout "$TMO" "$@"
