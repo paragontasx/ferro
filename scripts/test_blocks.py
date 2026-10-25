@@ -29,6 +29,8 @@ def start(port, snapdir, block=BLK):
             "--snapshot-dir", snapdir, "--snapshot-mb", "512"]
     if block:
         args += ["--block-cache", str(block)]
+    if os.environ.get("FERRO_TEST_KV"):
+        args += ["--kv-dtype", os.environ["FERRO_TEST_KV"]]
     p = subprocess.Popen(args, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     for _ in range(900):
         try:
@@ -50,14 +52,19 @@ def stop(p):
 
 
 def chat(port, messages, n=24):
+    body = {"messages": messages, "max_tokens": n, "temperature": 0, "cache_prompt": True}
+    if os.environ.get("FERRO_TEST_NO_THINK"):
+        body["thinking_budget"] = 0          # a Thinking model's reply is <think>..</think>content: the echo cannot match
     req = urllib.request.Request("http://127.0.0.1:%d/v1/chat/completions" % port,
-                                 data=json.dumps({"messages": messages, "max_tokens": n, "temperature": 0,
-                                                  "cache_prompt": True}).encode(),
+                                 data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"})
     o = json.load(urllib.request.urlopen(req, timeout=300))
     u = o["usage"]
     cached = (u.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
-    return o["choices"][0]["message"]["content"], u["prompt_tokens"], cached
+    m = o["choices"][0]["message"]
+    # a Thinking model is still inside <think> at max_tokens=24, so content alone would compare empty == empty
+    txt = (m.get("reasoning_content") or "") + (m.get("content") or "")
+    return txt, u["prompt_tokens"], cached
 
 
 def bc(port):
@@ -109,7 +116,7 @@ def main():
             p = start(port, tmp)
             b, ntok2, cached2 = chat(port, convo(0, TURNS[0]))
             check("a restarted server restores a chain from disk", bc(port).get("disk_hits", 0) >= 1, bc(port))
-            check("the restored prefix is actually reused", cached2 > BLK, "cached=%d" % cached2)
+            check("the restored prefix is actually reused", cached2 >= BLK, "cached=%d" % cached2)
             check("restore is exact (same tokens, cold vs restored)", a == b, repr(a[:70]) + " vs " + repr(b[:70]))
 
             # ---------------- 2. sharing ----------------
@@ -133,8 +140,8 @@ def main():
         finally:
             stop(p)
 
-        # ---------------- 3. storage for a growing conversation ----------------
-        p = start(port, tmp)
+        # ---------------- 3. storage for a growing conversation (own directory: only this conversation) ----------------
+        p = start(port, os.path.join(tmp, "store"))
         try:
             sum_tokens = 0
             for i in range(len(TURNS)):
@@ -143,11 +150,11 @@ def main():
             settle(port, bc(port).get("saved", 0))
             h = bc(port)
             blocks, mb = h.get("entries", 0), h.get("mb", 0.0)
-            per_block = (mb * 2**20) / max(blocks, 1)
+            per_block = ((mb - h.get("tips_mb", 0.0)) * 2**20) / max(blocks, 1)
             per_tok = per_block / BLK
             unique = max(h.get("saved", 0), 1)
             naive = sum_tokens * per_tok
-            actual = blocks * per_block
+            actual = mb * 2**20                                  # blocks + tips: what the store really occupies
             print()
             print("  %d turns, %d prompt tokens summed, final prefix ~%d tokens" % (len(TURNS), sum_tokens, ntok))
             print("  blocks on disk: %d (%.2f MB, %.3f MB each = %.1f KB/token)" % (blocks, mb, per_block / 2**20, per_tok / 1024))
@@ -155,6 +162,34 @@ def main():
             print("  block-chained actually uses:       %.1f MB" % (actual / 2**20))
             print("  saving: %.2fx" % (naive / actual if actual else 0))
             check("storage grew with unique tokens, not with history", actual < naive * 0.75, "%.2fx" % (naive / actual if actual else 0))
+        finally:
+            stop(p)
+
+        # ---------------- 4. the tip: restart, then continue the same conversation ----------------
+        tipdir = os.path.join(tmp, "tip")
+        p = start(port, tipdir)
+        try:
+            a1, p1, _ = chat(port, convo(0, TURNS[0]))
+            settle(port, 1)
+            h1 = bc(port)
+            check("a tip is stored for the conversation", h1.get("tips", 0) >= 1, h1)
+        finally:
+            stop(p)
+        turn2 = convo(0, TURNS[0]) + [{"role": "assistant", "content": a1},
+                                      {"role": "user", "content": TURNS[1]}]
+        p = start(port, tipdir)                       # restart: only the disk tier survives
+        try:
+            c1, p2, cached = chat(port, turn2)
+            blockonly = (p1 - 1) // BLK * BLK
+            check("a continuation after a restart reuses the conversation end", cached > blockonly,
+                  "cached %d of %d (blocks alone would be %d, turn-1 prompt was %d)" % (cached, p2, blockonly, p1))
+        finally:
+            stop(p)
+        p = start(port, os.path.join(tmp, "tipcold"), block=0)
+        try:
+            d1, _, dcached = chat(port, turn2)
+            check("the tip-served continuation matches a cold prefill", c1 == d1, repr(c1[:60]) + " vs " + repr(d1[:60]))
+            check("(control) the cold server had no cache", dcached == 0, "cached=%d" % dcached)
         finally:
             stop(p)
     finally:

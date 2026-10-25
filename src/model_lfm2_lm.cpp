@@ -125,6 +125,11 @@ struct LmEngine::Impl {
         std::vector<int> free_slots;
         std::vector<float> hostX;
         std::vector<int> pos, dst, src1, src2, slot, r1, r2, base, len;      // staging (must outlive the enqueued writes)
+        // Block-boundary capture (see capture_blocks): per gpu slot, one small buffer per conv layer holding b*x of the two
+        // rows before every captured boundary. Slots inside one buffer are chosen by `slot`, so each layer needs its own.
+        struct Cap { std::vector<gpu::Buf> st; gpu::Buf slot = nullptr, r1 = nullptr, r2 = nullptr;
+                     std::vector<int> sloth, r1h, r2h, pos; };
+        std::vector<Cap> caps; int cap_blk = 0, cap_maxb = 0;
         int max_ns = 0;
     } g;
     std::vector<float> X, X2, Hn, C, BX, O, G, F, last, lastn;
@@ -206,6 +211,21 @@ static bool lm_dup(const char* name) {            // FERRO_LM_DUP=a,b: launch th
 }
 
 // One forward over `T` rows. Prefill (pf): rows are consecutive tokens of one sequence (positions pos0..), decode: one row per sequence.
+// Allocate slot sl's capture set on first use: one state buffer per conv layer plus the slot/row index buffers.
+static bool cap_ensure(LmEngine::Impl& in, const LmModel& m, int sl) {
+    auto& g = in.g;
+    if (g.cap_maxb <= 0 || sl < 0) return false;
+    if ((int)g.caps.size() <= sl) g.caps.resize((size_t)sl + 1);
+    auto& cs = g.caps[(size_t)sl];
+    if (!cs.st.empty()) return true;
+    const size_t per = (size_t)g.cap_maxb * 2 * (size_t)m.n_embd * 4;
+    for (size_t ci = 0; ci < g.cst.size(); ++ci) { gpu::Buf b = gpu::alloc(per); if (!b) return false; cs.st.push_back(b); }
+    cs.slot = gpu::alloc((size_t)g.cap_maxb * 4);
+    cs.r1 = gpu::alloc((size_t)g.cap_maxb * 4);
+    cs.r2 = gpu::alloc((size_t)g.cap_maxb * 4);
+    return cs.slot && cs.r1 && cs.r2;
+}
+
 static bool gpu_forward(LmEngine::Impl& in, const LmModel& m, const std::vector<int>& ids, const std::vector<LmSeq*>& seqs, bool pf, int pos0, float* logits,
                         std::string* err, const std::vector<int>* win_j = nullptr) {
     // Decode rows always use the split-K GEMV and prefill rows always use the tile GEMM, so a row's arithmetic does not
@@ -219,6 +239,31 @@ static bool gpu_forward(LmEngine::Impl& in, const LmModel& m, const std::vector<
     const float scale = 1.0f / std::sqrt((float)hd);
     g.pos.resize(T); g.dst.resize(T); g.src1.resize(T); g.src2.resize(T);
     g.slot.resize(ns); g.r1.resize(ns); g.r2.resize(ns); g.base.resize(ns); g.len.resize(ns);
+    int cap_sl = -1, cap_n = 0;                                            // boundaries captured by THIS call
+    if (g.cap_blk > 0 && pf && ns == 1) {
+        const int sl = seqs[0]->gpu_slot, B = g.cap_blk;
+        if (sl >= 0 && cap_ensure(in, m, sl)) {
+            auto& cs = g.caps[(size_t)sl];
+            const int first = ((pos0 / B) + 1) * B, base = (int)cs.pos.size();
+            int k = 0;
+            for (int p = first; p <= pos0 + T; p += B) ++k;
+            if (k > 0 && base + k <= g.cap_maxb) {
+                cs.sloth.resize((size_t)k); cs.r1h.resize((size_t)k); cs.r2h.resize((size_t)k);
+                int i = 0;
+                for (int p = first; p <= pos0 + T; p += B, ++i) {
+                    const int rel = p - pos0;                              // row offsets of the two rows the state needs
+                    cs.sloth[(size_t)i] = base + i;
+                    cs.r1h[(size_t)i] = rel >= 1 ? rel - 1 : -1 - (sl * 2 + 1);   // b*x(t-1), from the state if before this slice
+                    cs.r2h[(size_t)i] = rel >= 2 ? rel - 2 : -1 - (sl * 2 + 0);   // b*x(t-2)
+                    cs.pos.push_back(p);
+                }
+                gpu::write(cs.slot, cs.sloth.data(), (size_t)k * 4);
+                gpu::write(cs.r1, cs.r1h.data(), (size_t)k * 4);
+                gpu::write(cs.r2, cs.r2h.data(), (size_t)k * 4);
+                cap_sl = sl; cap_n = k;
+            }
+        }
+    }
     if (pf) {
         const int sl = seqs[0]->gpu_slot;
         for (int t = 0; t < T; ++t) {
@@ -296,6 +341,9 @@ static bool gpu_forward(LmEngine::Impl& in, const LmModel& m, const std::vector<
             else if (ok && fuse && !pf) ok = P("conv", gpu::op_lm_conv_dec_q(g.C, g.cst[ci], g.bslot, g.taps[ci], T, d));          // decode: gate + state in one launch
             else if (ok) ok = P("conv", gpu::op_lm_conv_q(g.C, g.bsrc1, g.bsrc2, g.cst[ci], g.taps[ci], T, d))
                               && P("conv_state", gpu::op_lm_conv_state(g.C, g.cst[ci], g.bslot, g.br1, g.br2, ns, d));
+            if (ok && cap_n > 0 && ci < g.caps[(size_t)cap_sl].st.size())          // same C, same arithmetic: the boundary state
+                ok = P("conv_cap", gpu::op_lm_conv_state(g.C, g.caps[(size_t)cap_sl].st[ci], g.caps[(size_t)cap_sl].slot,
+                                                         g.caps[(size_t)cap_sl].r1, g.caps[(size_t)cap_sl].r2, cap_n, d));
             ok = ok && P("gemm", gpu::op_gemm_q(l.out_proj.gpu_slot, T, g.D));
             ++ci;
         } else {
@@ -422,6 +470,37 @@ void LmEngine::reset(LmSeq& s) const {
 
 LmPrefix::~LmPrefix() { for (void* b : kv) if (b) gpu::release(b); for (void* b : kvs) if (b) gpu::release(b); for (void* b : cst) if (b) gpu::release(b); }
 
+bool LmEngine::capture_blocks(int blk) {
+    if (!impl_ || !impl_->g.ok || blk <= 0 || max_ctx_ <= 0) return false;
+    impl_->g.cap_blk = blk;
+    impl_->g.cap_maxb = max_ctx_ / blk + 2;
+    return true;
+}
+
+bool LmEngine::take_captures(int gpu_slot, std::vector<std::pair<int, std::vector<uint8_t>>>* out) {
+    if (!impl_ || !impl_->g.ok || !out || gpu_slot < 0 || (size_t)gpu_slot >= impl_->g.caps.size()) return false;
+    auto& g = impl_->g;
+    auto& cs = g.caps[(size_t)gpu_slot];
+    if (cs.pos.empty()) return false;
+    const size_t d = (size_t)m_.n_embd, nc = g.cst.size(), per = (size_t)g.cap_maxb * 2 * d * 4;
+    std::vector<uint8_t> host(nc * per);
+    for (size_t ci = 0; ci < nc; ++ci) gpu::read_nb(cs.st[ci], host.data() + ci * per, per);   // one sync for all layers
+    if (!gpu::finish()) return false;
+    out->clear();
+    for (size_t i = 0; i < cs.pos.size(); ++i) {
+        std::vector<uint8_t> cst(nc * 2 * d * 4);                          // prefix-blob order: per conv layer 2*d floats
+        for (size_t ci = 0; ci < nc; ++ci)
+            std::memcpy(cst.data() + ci * 2 * d * 4, host.data() + ci * per + i * 2 * d * 4, 2 * d * 4);
+        out->emplace_back(cs.pos[i], std::move(cst));
+    }
+    return true;
+}
+
+void LmEngine::clear_captures(int gpu_slot) {
+    if (!impl_ || gpu_slot < 0 || (size_t)gpu_slot >= impl_->g.caps.size()) return;
+    impl_->g.caps[(size_t)gpu_slot].pos.clear();
+}
+
 BlockGeom LmEngine::block_geom() const {
     const size_t kvw = (size_t)2 * m_.n_kv * m_.head_dim;
     BlockGeom g; g.n_layers = (uint32_t)m_.n_attn_layers; g.n_conv = (uint32_t)m_.n_conv_layers;
@@ -475,8 +554,8 @@ bool LmEngine::export_prefix(const LmPrefix& p, std::vector<uint8_t>* out) const
     return ok && off == out->size();
 }
 
-bool LmEngine::export_block(const LmSeq& s, int from, int to, std::vector<uint8_t>* kv, std::vector<uint8_t>* cst) const {
-    if (!impl_ || !impl_->g.ok || s.gpu_slot < 0 || !kv || !cst) return false;
+bool LmEngine::export_block(const LmSeq& s, int from, int to, std::vector<uint8_t>* kv, std::vector<uint8_t>* cst, bool wait) const {
+    if (!impl_ || !impl_->g.ok || s.gpu_slot < 0 || !kv) return false;
     if (from < 0 || to <= from || to > s.n_past) return false;
     auto& g = impl_->g;
     const size_t kvw = (size_t)2 * m_.n_kv * m_.head_dim, d = (size_t)m_.n_embd, esz = kvesz(), rows = (size_t)(to - from);
@@ -485,15 +564,19 @@ bool LmEngine::export_block(const LmSeq& s, int from, int to, std::vector<uint8_
     size_t off = 0; bool ok = true;
     for (size_t l = 0; ok && l < g.kv.size(); ++l) {
         const size_t base = (size_t)s.gpu_slot * g.cap * kvw * esz + (size_t)from * kvw * esz;
-        ok = gpu::read_at(g.kv[l], base, kv->data() + off, rows * kvw * esz); off += rows * kvw * esz;
+        ok = (wait ? gpu::read_at(g.kv[l], base, kv->data() + off, rows * kvw * esz)
+                   : gpu::read_nb_at(g.kv[l], base, kv->data() + off, rows * kvw * esz)); off += rows * kvw * esz;
         if (ok && kv_dtype_ == 1) {
             const size_t sbase = (size_t)s.gpu_slot * g.cap * srb + (size_t)from * srb;
-            ok = gpu::read_at(g.kvs[l], sbase, kv->data() + off, rows * srb); off += rows * srb;
+            ok = (wait ? gpu::read_at(g.kvs[l], sbase, kv->data() + off, rows * srb)
+                       : gpu::read_nb_at(g.kvs[l], sbase, kv->data() + off, rows * srb)); off += rows * srb;
         }
     }
-    cst->resize(2 * d * 4 * g.cst.size());
-    size_t co = 0;
-    for (size_t l = 0; ok && l < g.cst.size(); ++l) { ok = gpu::read_at(g.cst[l], (size_t)s.gpu_slot * 2 * d * 4, cst->data() + co, 2 * d * 4); co += 2 * d * 4; }
+    if (cst) {                                                         // the conv state as of s.n_past
+        cst->resize(2 * d * 4 * g.cst.size());
+        size_t co = 0;
+        for (size_t l = 0; ok && l < g.cst.size(); ++l) { ok = gpu::read_at(g.cst[l], (size_t)s.gpu_slot * 2 * d * 4, cst->data() + co, 2 * d * 4); co += 2 * d * 4; }
+    }
     return ok && off == kv->size();
 }
 

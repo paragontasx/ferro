@@ -175,6 +175,9 @@ struct GenJob {
     int pf_pos = 0; std::vector<int> pf_cuts; bool pc_on = false; double pf_ms = 0;   // resumable prefill: next prompt position, snapshot boundaries still to leave, compute time so far
     bool spec = true; int spec_fail = 0, spec_skip = 0; uint64_t spec_d = 0, spec_a = 0; double spec_acc = 0.55;     // speculative decoding: allowed, back-off state, drafted / accepted tokens
     double ttft_ms = -1;                          // time from enqueue to the first generated token
+    // Where a warm turn's time goes, so the cache is judged per phase instead of by one wall number: waiting for a
+    // slot, reading blocks off disk, uploading them, copying them into the slot, and the prompt work itself.
+    double q_ms = 0, blk_disk_ms = 0, blk_up_ms = 0, blk_rest_ms = 0;
     int think_budget = -1, think_n = 0; bool in_think = false, forced_close = false, ignore_eos = false;   // reasoning-token cap and tracker (independent of reasoning_format)
     int next = 0, n_gen = 0, mode = 0;            // mode: 0 = content, 1 = reasoning (inside <think>)
     std::string pend;                             // decoded text not yet emitted (incomplete UTF-8 / possible stop-string prefix)
@@ -280,10 +283,11 @@ struct Server {
     std::atomic<uint64_t> n_mem_rejected{0};
     std::atomic<uint64_t> spec_drafted{0}, spec_accepted{0}, spec_steps{0};
     std::vector<float> lg_spec;                    // worker only: logits of every row of a verification window
-    std::unique_ptr<PrefixStore> pstore;           // on-disk prefix snapshots (null = off)
-    std::unique_ptr<BlockStore> bstore;            // on-disk block-granular prefix cache (null = off; replaces pstore)
+    std::unique_ptr<PrefixStore> pstore;
+    std::unique_ptr<BlockStore> bstore;            // block-granular prefix cache (null = off; replaces pstore)
+    std::atomic<uint64_t> bs_hits{0};
+    std::atomic<uint64_t> bc_disk_us{0}, bc_up_us{0}, bc_rest_us{0}, bc_q_us{0}, bc_ttft_us{0};   // per-phase cache costs              // requests that restored a block chain from disk           // on-disk prefix snapshots (null = off)
     std::atomic<uint64_t> ps_hits{0};              // requests that restored a snapshot from disk
-    std::atomic<uint64_t> bs_hits{0};              // requests that restored a block chain from disk
     std::atomic<bool> trim_pending{false};         // a media request ran: return freed heap to the OS when the worker is idle
     clk::time_point t_start = clk::now();
 };
@@ -348,9 +352,27 @@ static bool gen_token(Server& S, GenJob& j, int id) {
 }
 static void gen_finish(Server& S, const std::shared_ptr<GenJob>& jp, const char* err = nullptr, int status = 500) {
     GenJob& j = *jp;
+    // One tip per conversation: the exact end of prompt+reply, so the next turn of this conversation restores there instead of
+    // re-prefilling the stretch between the last whole block and where the conversation actually stopped. Captured before the
+    // slot is released, because that is the only moment the conv state for these tokens exists.
+    if (S.bstore && j.cache_prompt && !err && j.seq.n_past > 0 && (int)j.hist.size() >= j.seq.n_past) {
+        const int n = j.seq.n_past, base = S.bstore->block_depth(j.hist);
+        if (n > base) {
+            std::vector<uint8_t> kvb, cstb;
+            const int B = S.bstore->block();
+            if (S.lm.export_block(j.seq, base, n, &kvb, &cstb)) {
+                if (n % B == 0 && base == n - B) S.bstore->save_async(j.hist, n, std::move(kvb), std::move(cstb));   // exactly one whole block
+                else S.bstore->save_tip_async(j.hist, base, n, std::move(kvb), std::move(cstb));
+            }
+        }
+    }
+    if (j.seq.gpu_slot >= 0) S.lm.clear_captures(j.seq.gpu_slot);
     S.lm.release(j.seq);
     if (!err && j.finish == "length" && j.in_think) fprintf(stderr, "[serve] warning: reply reached max_tokens inside the reasoning block (content is empty); raise max_tokens or set thinking_budget\n");
     j.gen_ms = ms_since(j.t_gen0);
+    S.bc_disk_us += (uint64_t)(j.blk_disk_ms * 1000); S.bc_up_us += (uint64_t)(j.blk_up_ms * 1000);
+    S.bc_rest_us += (uint64_t)(j.blk_rest_ms * 1000); S.bc_q_us += (uint64_t)(j.q_ms * 1000);
+    if (j.ttft_ms >= 0) S.bc_ttft_us += (uint64_t)(j.ttft_ms * 1000);
     if (j.ttft_ms >= 0) { static const double ub[7] = {100, 250, 500, 1000, 2500, 5000, 10000}; int b = 0; while (b < 7 && j.ttft_ms > ub[b]) ++b; S.ttft_b[b]++; S.ttft_n++; S.ttft_us += (uint64_t)(j.ttft_ms * 1000); }
     S.n_gen_req++; S.n_gen_tok += (uint64_t)j.n_gen; S.n_prompt_tok += j.prompt.size(); S.gen_us += (uint64_t)(j.gen_ms * 1000); S.pp_us += (uint64_t)(j.prompt_ms * 1000);
     { std::lock_guard<std::mutex> g(j.m); if (err) { j.err = err; j.status = status; } j.done = true; }
@@ -418,17 +440,28 @@ static void gen_begin(Server& S, const std::shared_ptr<GenJob>& jp) {
                 }
             }
         }
-        if (S.bstore) {
+        j.q_ms = ms_since(j.t_enq);                                            // queue wait: enqueue -> worker picks it up
+        if (S.bstore) {                                                            // the disk chain may reach further than the device cache
             BlockStore::Entry be;
-            if (S.bstore->longest(head, &be) && (!e || be.toks.size() > e->toks.size() + 32)) {   // the disk chain reaches further than the device cache
+            const auto c0 = clk::now();
+            if (S.bstore->longest(head, &be) && (!e || be.toks.size() > e->toks.size() + 32)) {
                 std::vector<uint8_t> blob;
-                if (S.bstore->load(be, &blob)) {
+                const bool got = S.bstore->load(be, &blob);
+                j.blk_disk_ms = ms_since(c0);                                       // read + assemble off the NVMe
+                const auto c1 = clk::now();
+                if (got) {
                     if (auto px = S.lm.import_prefix((int)be.toks.size(), blob.data(), blob.size())) {
-                        pc_store(S, j.prompt, std::move(px), false); S.bstore->touch(be); S.bs_hits++;
-                        e = pc_longest(S, j.prompt);
+                        j.blk_up_ms = ms_since(c1);                                 // host -> device, whole prefix
+                        const auto c2 = clk::now();
+                        // A long prefix can exceed the device cache budget (a 15k-token prefix is ~360 MB against a 128 MB
+                        // default). That must not throw the restore away: cache it when it fits, otherwise use it once.
+                        if (px->bytes <= ((size_t)S.o.prefix_cache_mb << 20)) { pc_store(S, j.prompt, px, false); e = pc_longest(S, j.prompt); }
+                        else if (S.lm.restore(j.seq, *px)) { pos = px->n; S.pc_hits++; S.pc_saved += (uint64_t)pos; }
+                        j.blk_rest_ms = ms_since(c2);                           // device -> slot, or into the device cache
+                        S.bstore->touch(be); S.bs_hits++;
                     }
                 }
-            }
+            } else j.blk_disk_ms = ms_since(c0);
         }
         if (e) {
             if (S.lm.restore(j.seq, *e->px)) { pos = e->px->n; e->used = ++S.pc_tick; S.pc_hits++; S.pc_saved += (uint64_t)pos; }
@@ -470,13 +503,7 @@ static void gen_prefill_chunk(Server& S) {
         const double rate = S.pf_rate > 0 ? S.pf_rate : 300.0;
         end = std::min(n, j.pf_pos + std::max(64, std::min(1024, (int)(rate * S.o.prefill_slice_ms / 1000.0))));
     }
-    bool cut_applied = false;
-    for (int c : j.pf_cuts) if (c > j.pf_pos && c < end) { end = c; cut_applied = true; }   // never step over a snapshot boundary
-    if (S.bstore) {                                                                  // block mode: slices end where a block can be captured
-        const int B = S.bstore->block(), nb = ((j.pf_pos / B) + 1) * B;
-        if (end >= nb) end = std::min(end, nb);                                      // never cross a boundary: the conv state is only valid there
-        else if (!cut_applied && end < n) end = std::min(n, nb);                     // a short time slice: extend up to the boundary
-    }
+    for (int c : j.pf_cuts) if (c > j.pf_pos && c < end) end = c;                    // never step over a snapshot boundary                    // never step over a snapshot boundary
     std::string err; bool ok = true;
     const auto t0 = clk::now();
     try { ok = S.lm.step({&j.seq}, {j.prompt.data() + j.pf_pos}, {end - j.pf_pos}, S.lg.data(), &err, true); } catch (const std::exception& e) { err = e.what(); ok = false; }
@@ -485,11 +512,6 @@ static void gen_prefill_chunk(Server& S) {
     if (end - j.pf_pos >= 48 && ms > 0) { const double r = (end - j.pf_pos) * 1000.0 / ms; S.pf_rate = S.pf_rate > 0 ? 0.6 * S.pf_rate + 0.4 * r : r; }
     S.rw_prefill.add(end - j.pf_pos, ms);
     j.pf_ms += ms; j.pf_pos = end;
-    if (S.bstore && j.cache_prompt && end % S.bstore->block() == 0) {                                  // capture [end-B, end): one block, O(B) copy
-        const int B = S.bstore->block();
-        std::vector<uint8_t> kvb, cstb;
-        if (S.lm.export_block(j.seq, end - B, end, &kvb, &cstb)) S.bstore->save_async(j.prompt, end, std::move(kvb), std::move(cstb));
-    }
     if (end < n) {
         if (std::find(j.pf_cuts.begin(), j.pf_cuts.end(), end) != j.pf_cuts.end()) {   // reached a boundary: leave a snapshot behind
             const auto ts = clk::now();
@@ -500,6 +522,18 @@ static void gen_prefill_chunk(Server& S) {
     }
     upd();
     j.prompt_ms = j.pf_ms;
+    if (S.bstore && j.cache_prompt) {                                                // one pass over every boundary this prefill captured
+        std::vector<std::pair<int, std::vector<uint8_t>>> states;
+        const int B = S.bstore->block();
+        if (S.lm.take_captures(j.seq.gpu_slot, &states))
+            for (auto& st : states) {
+                const int p = st.first;
+                std::vector<uint8_t> kvb;
+                if (S.lm.export_block(j.seq, p - B, p, &kvb, nullptr, false) && gpu::finish())
+                    S.bstore->save_async(j.prompt, p, std::move(kvb), std::move(st.second));
+            }
+        S.lm.clear_captures(j.seq.gpu_slot);
+    }
     if (std::find(j.pf_cuts.begin(), j.pf_cuts.end(), n) != j.pf_cuts.end()) {      // end-of-prompt snapshot (several messages or tools), before the first token
         const auto ts = clk::now();
         pc_store(S, j.prompt, S.lm.snapshot(j.seq), false, true);
@@ -692,12 +726,15 @@ static void worker_loop(Server& S, std::promise<std::string>& ready) {
             S.lg.assign((size_t)S.lm.n_slots() * (size_t)S.lm.n_vocab(), 0.0f);
             if (!S.o.snapshot_dir.empty() && S.o.block_cache > 0 && S.lm.on_gpu()) {
                 S.bstore.reset(new BlockStore); std::string e;
-                const BlockGeom gm = S.lm.block_geom();
-                if (!S.bstore->open(S.o.snapshot_dir + "/blocks", S.lm.state_id(), S.o.block_cache, (uint64_t)S.o.snapshot_mb << 20, gm, &e)) {
+                S.lm.capture_blocks(S.o.block_cache);                      // boundary conv states, captured during prefill
+                if (!S.bstore->open(S.o.snapshot_dir + "/blocks", S.lm.state_id(), S.o.block_cache,
+                                    (uint64_t)S.o.snapshot_mb << 20, S.lm.block_geom(), &e)) {
                     fprintf(stderr, "[serve] block cache disabled: %s\n", e.c_str()); S.bstore.reset();
                 } else {
-                    fprintf(stderr, "[serve] block cache: %d-token blocks, %zu stored for this model (%.1f MB) in %s, budget %d MB\n",
-                            S.bstore->block(), S.bstore->entries(), S.bstore->bytes() / 1048576.0, (S.o.snapshot_dir + "/blocks").c_str(), S.o.snapshot_mb);
+                    S.bstore->set_ttl((int64_t)(S.o.block_ttl_h * 3600), (int64_t)(S.o.tip_ttl_h * 3600));
+                    fprintf(stderr, "[serve] block cache: %d-token blocks, %zu stored (%.1f MB) in %s, budget %d MB\n",
+                            S.bstore->block(), S.bstore->entries(), S.bstore->bytes() / 1048576.0,
+                            (S.o.snapshot_dir + "/blocks").c_str(), S.o.snapshot_mb);
                 }
             }
             if (!S.o.snapshot_dir.empty() && S.o.block_cache == 0 && S.o.prefix_cache_mb > 0 && S.lm.on_gpu()) {
@@ -933,12 +970,14 @@ static std::string health_json(Server& S) {
                                (unsigned long long)S.spec_drafted.load(), (unsigned long long)S.spec_accepted.load(), (unsigned long long)S.spec_steps.load());
         out.pop_back(); out += lv; out += '}';
         double inflight; { std::lock_guard<std::mutex> g(S.mem_m); inflight = S.mem_inflight; }
-        if (S.bstore) {
+        if (S.bstore) {                                                          // insert before the closing brace: position independent
             char sb[320];
-            snprintf(sb, sizeof sb, ",\"block_cache\":{\"block\":%d,\"entries\":%zu,\"mb\":%.1f,\"saved\":%llu,\"disk_hits\":%llu}",
+            snprintf(sb, sizeof sb, ",\"block_cache\":{\"block\":%d,\"entries\":%zu,\"mb\":%.1f,\"tips\":%zu,\"blocks_mb\":%.2f,\"tips_mb\":%.2f,\"links\":\"%s\",\"saved\":%llu,\"disk_hits\":%llu,\"evicted\":%llu,\"expired\":%llu,\"orphans\":%llu,\"dangling\":%zu}",
                      S.bstore->block(), S.bstore->entries(), S.bstore->bytes() / 1048576.0,
-                     (unsigned long long)S.bstore->saved(), (unsigned long long)S.bs_hits.load());
-            out.insert(out.size() - 1, sb);   // before the closing brace: position-independent
+                     S.bstore->tips(), S.bstore->blocks_bytes() / 1048576.0, (S.bstore->bytes() - S.bstore->blocks_bytes()) / 1048576.0, S.bstore->link_dump().c_str(), (unsigned long long)S.bstore->saved(), (unsigned long long)S.bs_hits.load(),
+                     (unsigned long long)S.bstore->evicted(), (unsigned long long)S.bstore->expired(),
+                     (unsigned long long)S.bstore->orphans(), S.bstore->dangling());
+            out.insert(out.size() - 1, sb);
         }
         const double lim = cgroup_limit_mb(), used = cgroup_used_mb();
         char l[300];
@@ -1047,7 +1086,11 @@ static std::string usage_json(const GenJob& j) {
     const double pp = j.prompt_ms > 0 ? fresh / (j.prompt_ms / 1000.0) : 0, tg = j.gen_ms - j.prompt_ms > 0 ? (j.n_gen > 1 ? (j.n_gen - 1) / ((j.gen_ms - j.prompt_ms) / 1000.0) : 0) : 0;
     snprintf(b, sizeof b, "\"usage\":{\"prompt_tokens\":%zu,\"completion_tokens\":%d,\"total_tokens\":%zu,\"prompt_tokens_details\":{\"cached_tokens\":%d}},\"timings\":{\"cache_n\":%d,\"prompt_ms\":%.1f,\"prompt_per_second\":%.1f,\"predicted_ms\":%.1f,\"predicted_per_second\":%.2f}",
              j.prompt.size(), j.n_gen, j.prompt.size() + (size_t)j.n_gen, j.cached, j.cached, j.prompt_ms, pp, j.gen_ms - j.prompt_ms, tg);
-    return b;
+    // The cache's own account of a warm turn: the phases add up to TTFT, so the slow one is visible rather than inferred.
+    char c[320];
+    snprintf(c, sizeof c, ",\"cache_split\":{\"queue_ms\":%.1f,\"disk_ms\":%.1f,\"upload_ms\":%.1f,\"restore_ms\":%.1f,"
+             "\"prefill_ms\":%.1f,\"ttft_ms\":%.1f}", j.q_ms, j.blk_disk_ms, j.blk_up_ms, j.blk_rest_ms, j.prompt_ms, j.ttft_ms);
+    return b + std::string(c);
 }
 
 // POST /v1/chat/completions and /v1/completions. Returns the HTTP status, or -1 when the response has already been written to `fd` (streaming).
