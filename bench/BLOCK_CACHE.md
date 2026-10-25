@@ -126,6 +126,16 @@ Two things this test surfaced that short prompts hide:
 For long contexts, set `--prefix-cache-mb` above the prefix size to keep a restored prefix reusable; otherwise each
 restore is a single use.
 
+## Decision: the tip stays best-effort
+
+Making the tip deterministic needs ids rather than text: either a client that sends token ids, or a server that owns the
+conversation (`previous_response_id` style, replaying its own stored history). Neither changes the cache, and neither makes
+prefill faster — they only make the existing saving deterministic. That saving is 332 ms per chat turn on the 350M and
+950 ms on the 1.2B, but only 0.2% of a turn at 15k context, where the blocks do all the work. It is bounded on a miss and
+never wrong, so best-effort is the right default for an OpenAI-compatible endpoint. If stateful conversations are ever
+added they would make the tip deterministic as a side effect, and would earn their keep by not re-sending history every
+turn — not by fixing the tip.
+
 ## Known limitations
 
 - **The tip is best-effort: it fires only when the echoed turn re-tokenises to the same ids.** A KV cache is keyed on
