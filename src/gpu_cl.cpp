@@ -680,8 +680,8 @@ __kernel void add_scale(__global const float* a, __global const float* b, __glob
 
 // ============================ LFM2 decision models (d1-omni) ============================
 // lane owns float8 (elements 8*lid..+7); a 32-block = 4 lanes. Same packed layout as quant_x.
-inline void quant_lane8(float8 v, __local float* am, __global uint* Xp, __global float* Xs, int t, int cols) {
-  const int lid = get_local_id(0);
+inline void quant_lane8(float8 v, __local float* am, __global uint* Xp, __global float* Xs, int t, int cols, int lane) {
+  const int lid = min(lane, cols / 8 - 1);   // clamp: chunked launches may over-run; duplicates write identical bytes
   const float8 a = fabs(v);
   const float4 m4 = fmax(a.lo, a.hi); const float2 m2 = fmax(m4.lo, m4.hi);
   barrier(CLK_LOCAL_MEM_FENCE);
@@ -752,12 +752,14 @@ __kernel void conv_gate_q3(__global const float* C, __global const int* prev, __
   quant_lane4(vload4(lid, r + d) * y, am, Xp, Xs, t, d);
 }
 // SwiGLU: silu(G[:, :FF]) * G[:, FF:] -> int8. WG per token, LS = FF/8.
-__kernel void silu_mul_q8(__global const float* G, int FF, __global uint* Xp, __global float* Xs) {
+__kernel void silu_mul_q8(__global const float* G, int FF, __global uint* Xp, __global float* Xs, int nch) {
   __local float am[1024];
-  const int t = get_group_id(0), lid = get_local_id(0);
+  const int gid = get_group_id(0), lid = get_local_id(0);
+  const int t = gid / nch, lane = (gid - t * nch) * (int)get_local_size(0) + lid;
+  const int lc = min(lane, FF / 8 - 1);      // chunked launch tail: clamp loads; duplicate stores are identical bytes
   const __global float* g = G + (size_t)t * 2 * FF;
-  const float8 x = vload8(lid, g);
-  quant_lane8(x / (1.0f + native_exp2(x * -1.4426950408889634f)) * vload8(lid, g + FF), am, Xp, Xs, t, FF);
+  const float8 x = vload8(lc, g);
+  quant_lane8(x / (1.0f + native_exp2(x * -1.4426950408889634f)) * vload8(lc, g + FF), am, Xp, Xs, t, FF, lane);
 }
 // act(G + b) -> int8. act: 0 none, 1 relu, 2 gelu (tanh approximation), 3 gelu (erf). WG per token, LS = cols/8.
 __kernel void bias_act_q8(__global const float* G, __global const float* b, int act, __global uint* Xp, __global float* Xs, int cols) {
@@ -767,7 +769,7 @@ __kernel void bias_act_q8(__global const float* G, __global const float* b, int 
   if (act == 1) v = fmax(v, (float8)(0.f));
   else if (act == 2) v = 0.5f * v * (1.0f + tanh(0.7978845608028654f * v * (1.0f + 0.044715f * v * v)));
   else if (act == 3) v = 0.5f * v * (1.0f + erf(v * 0.70710678118654752f));
-  quant_lane8(v, am, Xp, Xs, t, cols);
+  quant_lane8(v, am, Xp, Xs, t, cols, get_local_id(0));
 }
 // plain quantization of f32 rows. WG per row, LS = cols/4.
 __kernel void quant_q3(__global const float* X, __global uint* Xp, __global float* Xs, int cols) {
@@ -879,8 +881,12 @@ __kernel void attention_q4(__global const float* C, int ldc, int qoff, int koff,
 // query: ~20 GB/layer at 2.2k tokens). Softmax stays inside the lane (no cross-lane reductions). Queries of a
 // tile may span segments: the tile walks the union of their key ranges and each lane masks foreign keys.
 // t_base: first query of this launch (long batches are split into several launches).
+#ifndef QT5
 #define QT5 32
-#define KT5 16
+#endif
+#ifndef KT5
+#define KT5 8          // key-chunk tile: 8 measured fastest on BOTH drivers (Mesa -47%, NEO -61% at 1.9k-3.6k ctx)
+#endif
 // pre_lo/pre_hi (has_pre): a second key range per query, the media prefix the text of a question reads
 // (empty when pre_lo > pre_hi). Each lane reads its prefix keys first, then its own range, ascending.
 __kernel void attention_q5(__global const float* C, int ldc, int qoff, int koff, int voff,
@@ -1402,8 +1408,10 @@ __kernel void lm_attn_pf(__global const float* C, int ldc, __global const float*
   const int tq = t0 + lid, t = min(tq, T - 1);
   const int kvh = h / (nq / nkv);
   const __global float* qr = C + (size_t)t * ldc + h * 64;
+  #pragma unroll
   for (int i = 0; i < 16; ++i) vstore4(vload4(i, qr) * (scale * 1.4426950408889634f), i, Qs + lid * 68);
   float4 acc[16];
+  #pragma unroll
   for (int i = 0; i < 16; ++i) acc[i] = (float4)(0.f);
   float m = -1e30f, l = 0.f;
   const int thi = pos0 + min(t0 + QT5 - 1, T - 1);
@@ -1411,29 +1419,37 @@ __kernel void lm_attn_pf(__global const float* C, int ldc, __global const float*
   for (int k0 = 0; k0 <= thi; k0 += KT5) {
     const int kn = min(KT5, thi - k0 + 1);
     barrier(CLK_LOCAL_MEM_FENCE);
+    // 64-bit base hoisted out of the staging loop (Xe-LP has no native 64-bit multiply; IGC emulates it,
+    // and a per-row (size_t) multiply here was the same trap that made the Q8 GEMM look load-bound).
+    const __global float* kvrow0 = KV + (size_t)(kvbase + k0) * ldkv + kvh * 64;
     for (int i = lid; i < kn * 16; i += QT5) {
       const int r = i >> 4, c4 = i & 15;
-      const __global float* row = KV + (size_t)(kvbase + k0 + r) * ldkv + kvh * 64;
+      const __global float* row = kvrow0 + r * ldkv;
       vstore4(vload4(c4, row), c4, Ks + r * 64);
       vstore4(vload4(c4, row + voff), c4, Vs + r * 64);
     }
     barrier(CLK_LOCAL_MEM_FENCE);
     float sc[KT5];
-    for (int j = 0; j < kn; ++j) {
+    #pragma unroll
+    for (int j = 0; j < KT5; ++j) { if (j >= kn) continue;
       float4 s4 = (float4)(0.f);
+      #pragma unroll
       for (int i = 0; i < 16; ++i) s4 = mad(vload4(i, Qs + lid * 68), vload4(i, Ks + j * 64), s4);
       sc[j] = (k0 + j <= myhi) ? (s4.x + s4.y + s4.z + s4.w) : -1e30f;
     }
-    for (int j = 0; j < kn; ++j) {
+    #pragma unroll
+    for (int j = 0; j < KT5; ++j) { if (j >= kn) continue;
       const float sj = sc[j];
       if (sj < -1e29f) continue;
       if (sj > m) {
         const float a = native_exp2(m - sj);
+        #pragma unroll
         for (int i = 0; i < 16; ++i) acc[i] *= a;
         l *= a; m = sj;
       }
       const float p = native_exp2(sj - m);
       l += p;
+      #pragma unroll
       for (int i = 0; i < 16; ++i) acc[i] = mad((float4)(p), vload4(i, Vs + j * 64), acc[i]);
     }
   }
@@ -1859,6 +1875,7 @@ __kernel void lm_conv_win_q(__global const float* C, __global const int* src1, _
 struct Slot { cl_mem wp = nullptr, ws = nullptr; int rows = 0, cols = 0, nb = 0; size_t lws = 0; int kb = FERRO_GPU_KB; };
 static bool g_ok = false;
 static std::string g_name;
+static size_t g_maxwg = 1024;   // CL_DEVICE_MAX_WORK_GROUP_SIZE (NEO Xe-LP reports 512; rusticl allowed 1024)
 static cl_context g_ctx = nullptr;
 static cl_command_queue g_q = nullptr;
 static cl_program g_prog = nullptr;
@@ -1931,6 +1948,7 @@ bool init(bool verbose) {
     char nm[256] = {0};
     cl.clGetDeviceInfo(dev, CL_DEVICE_NAME, sizeof nm - 1, nm, nullptr);
     g_name = nm;
+    { size_t mw = 0; if (cl.clGetDeviceInfo(dev, CL_DEVICE_MAX_WORK_GROUP_SIZE, sizeof mw, &mw, nullptr) == CL_SUCCESS && mw > 0) g_maxwg = mw; }
     cl_int err = 0;
     g_ctx = cl.clCreateContext(nullptr, 1, &dev, nullptr, nullptr, &err); CK(err);
     g_q = cl.clCreateCommandQueueWithProperties(g_ctx, dev, nullptr, &err); CK(err);
@@ -1938,8 +1956,11 @@ bool init(bool verbose) {
     g_prog = cl.clCreateProgramWithSource(g_ctx, 1, &kSrc, nullptr, &err); CK(err);
     char opts[256];
     // no -cl-fast-relaxed-math: exp/erf/sqrt must stay accurate (softmax, gelu, rmsnorm)
-    snprintf(opts, sizeof opts, "-cl-std=CL3.0 -DTT=%d -DKB=%d -DMAXS=%d -cl-mad-enable",
-             FERRO_GPU_TT, FERRO_GPU_KB, ATTN_MAXS);
+    // FERRO_GPU_GRF=256 -> IGC large register file (Xe-LP spill remedy; verified accepted by IGC 2.41).
+    // The classic -cl-intel-256-GRF spelling is REJECTED by this build: use -ze-opt-large-register-file.
+    static const char* grfopt = getenv("FERRO_GPU_GRF") ? " -ze-opt-large-register-file" : "";
+    snprintf(opts, sizeof opts, "-cl-std=CL3.0 -DTT=%d -DKB=%d -DMAXS=%d -cl-mad-enable%s",
+             FERRO_GPU_TT, FERRO_GPU_KB, ATTN_MAXS, grfopt);
     if (cl.clBuildProgram(g_prog, 1, &dev, opts, nullptr, nullptr) != CL_SUCCESS) {
         if (verbose) {
             size_t n = 0; cl.clGetProgramBuildInfo(g_prog, dev, CL_PROGRAM_BUILD_LOG, 0, nullptr, &n);
@@ -2023,7 +2044,14 @@ static bool ensure_small(int i) {
     if (err != CL_SUCCESS) return false;
     char opts[256];
     snprintf(opts, sizeof opts, "-cl-std=CL3.0 -DTT=%d -DKB=%d -DMAXS=%d -cl-mad-enable", kSmallTT[i], FERRO_GPU_KB, ATTN_MAXS);
-    if (cl.clBuildProgram(g_prog_small[i], 1, &g_dev, opts, nullptr, nullptr) != CL_SUCCESS) return false;
+    if (cl.clBuildProgram(g_prog_small[i], 1, &g_dev, opts, nullptr, nullptr) != CL_SUCCESS) {
+        if (getenv("FERRO_VERBOSE")) {
+            size_t n = 0; cl.clGetProgramBuildInfo(g_prog_small[i], g_dev, CL_PROGRAM_BUILD_LOG, 0, nullptr, &n);
+            std::string log(n, '\0'); cl.clGetProgramBuildInfo(g_prog_small[i], g_dev, CL_PROGRAM_BUILD_LOG, n, &log[0], nullptr);
+            fprintf(stderr, "[gpu] small variant %d build FAILED (%s):\n%s\n", i, opts, log.c_str());
+        }
+        return false;
+    }
     k_gemm_small[i] = cl.clCreateKernel(g_prog_small[i], "q8gemm", &err);
     if (err != CL_SUCCESS) { k_gemm_small[i] = nullptr; return false; }
     k_gemv_small[i] = cl.clCreateKernel(g_prog_small[i], "q8gemv", &err);
@@ -2927,8 +2955,10 @@ bool op_lm_qkv_post_kvq(Buf C, int rowc, int T, int nq, int nkv, int hd, Buf qw,
 }
 bool op_silu_mul_q(Buf G, int T, int FF) {
     if (FF % 32 || FF / 8 > 1024) return false;
-    set_args(k_siluq, G, (cl_int)FF, (Buf)g_Xp, (Buf)g_Xs);
-    size_t g[1] = {(size_t)T * (FF / 8)}, l[1] = {(size_t)FF / 8};
+    const int lws = (int)std::min<size_t>((size_t)(FF / 8), g_maxwg);
+    const int nch = ((int)(FF / 8) + lws - 1) / lws;
+    set_args(k_siluq, G, (cl_int)FF, (Buf)g_Xp, (Buf)g_Xs, (cl_int)nch);
+    size_t g[1] = {(size_t)T * nch * lws}, l[1] = {(size_t)lws};
     return launch(k_siluq, 1, g, l);
 }
 bool op_bias_act_q(Buf G, Buf b, bool relu, int T, int cols) { return op_bias_act_mode_q(G, b, relu ? 1 : 0, T, cols); }

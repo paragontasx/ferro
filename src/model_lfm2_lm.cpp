@@ -280,6 +280,7 @@ static bool gpu_forward(LmEngine::Impl& in, const LmModel& m, const std::vector<
     static struct Dump { ~Dump() { if (!prof) return; double tot = 0; for (auto& kv : times) tot += kv.second.first;
         for (auto& kv : times) fprintf(stderr, "[lm-prof] %-14s %8.1f ms total  %6d calls  %7.3f ms/call  %5.1f%%\n", kv.first.c_str(), kv.second.first * 1e3, kv.second.second, kv.second.first * 1e3 / kv.second.second, 100 * kv.second.first / tot); } } dump_at_exit;
     auto P_impl = [&](const char* name, bool r) {
+        if (!r && getenv("FERRO_VERBOSE")) fprintf(stderr, "[gpu] op FAILED: %s%s\n", pf ? "pf:" : "dec:", name);
         if (!prof || !r) return r;
         const auto t0 = std::chrono::steady_clock::now(); gpu::finish();
         auto& e = times[std::string(pf ? "pf:" : "dec:") + name]; e.first += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); e.second++;
