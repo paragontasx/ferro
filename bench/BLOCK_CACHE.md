@@ -157,12 +157,12 @@ The mechanism set now ships in production engines. Mapping, so a reviewer can ch
 
 | here | equivalent elsewhere |
 |---|---|
-| blocks keyed by tokens + parent hash (chained) | **vLLM APC** ("we hash each kv-cache block by the tokens in the block and the tokens in the prefix"); **TensorRT-LLM** blocks in a radix search tree; **d-inference** `<blockHashHex>.darkbloom-kv` files |
-| prefix sharing + LRU over those blocks | **SGLang RadixAttention**; TensorRT-LLM's radix tree |
-| disk/remote tier behind the same prefix identity | **LMCache** (GPU/CPU/disk/remote); **SGLang HiCache** L1 GPU, L2 host, L3 `file`/`mooncake`/`hf3fs`/`nixl`/`aibrix`/`eic`/SeaweedFS |
-| **conv/recurrent state at a boundary -> exact resume** | **SGLang Unified Radix Cache**: MAMBA/SSM checkpoints as components, copy-on-write, "the deepest boundary accepted by all components", int8 checkpoints, default since v0.5.16 |
+| blocks keyed by tokens + parent hash (chained) | [**vLLM APC**](https://docs.vllm.ai/en/stable/design/prefix_caching/) ("we hash each kv-cache block by the tokens in the block and the tokens in the prefix"); [**TensorRT-LLM**](https://nvidia.github.io/TensorRT-LLM/features/kvcache.html) blocks in a radix search tree; [**d-inference**](https://github.com/Layr-Labs/d-inference/blob/master/docs/reference/ssd-kv-cache.md) `<blockHashHex>.darkbloom-kv` files |
+| prefix sharing + LRU over those blocks | [**SGLang RadixAttention**](https://arxiv.org/html/2312.07104v2); TensorRT-LLM's radix tree |
+| disk/remote tier behind the same prefix identity | [**LMCache**](https://docs.lmcache.ai/kv_cache/storage_backends/local_storage.html) (GPU/CPU/disk/remote); [**SGLang HiCache**](https://docs.sglang.io/docs/advanced_features/hicache_design) L1 GPU, L2 host, L3 `file`/`mooncake`/`hf3fs`/`nixl`/`aibrix`/`eic`/SeaweedFS |
+| **conv/recurrent state at a boundary -> exact resume** | [**SGLang Unified Radix Cache**](https://www.sglang.io/blog/unified-radix-cache): MAMBA/SSM checkpoints as components, copy-on-write, "the deepest boundary accepted by all components", int8 checkpoints, default since v0.5.16 |
 | **tip (prompt+output, exact stop point)** | SGLang stores the full token path, "input *and* output", per completed request |
-| whole-prefix exact reuse, no dedupe or tiering | **llama.cpp** slot `cache_prompt` + `--prompt-cache`; **Ollama** RAM-only |
+| whole-prefix exact reuse, no dedupe or tiering | **llama.cpp** slot `cache_prompt` + `--prompt-cache`; **Ollama** RAM-only ([open request](https://github.com/ollama/ollama/issues/17247)) |
 | the approximate alternative | **DeepSeek** SWA state slot + bounded replay (their own word: approximate) |
 
 **So the design is not novel, and this doc should not claim it is.** It is the same mechanism class as
@@ -179,7 +179,7 @@ not serve:
 Where nothing equivalent exists: **hybrid conv/SSM models on iGPU/CPU-only consumer boxes**. The engines
 those boxes actually run top out at RAM-only reuse (Ollama) or one whole-prefix file per slot
 (llama.cpp), and llama.cpp's exact restore for hybrid/recurrent and SWA models is an open bug (`/slots`
-restore yields no reuse, #28194) - the exact failure mode this design exists to avoid. At this prefill
+restore yields no reuse, [#28194](https://github.com/ggml-org/llama.cpp/issues/28194)) - the exact failure mode this design exists to avoid. At this prefill
 rate the technique is also worth more than on a 4090, where the same 15k prefill costs a few hundred
 milliseconds: here it is 84.6 s -> 721 ms.
 
@@ -193,9 +193,10 @@ cache-specific parts that transfer:
 - KV pages at **64-token granularity** (FlashMLA), the same unit the API cache uses;
 - entries are **prefix units** persisted at three triggers - request boundaries **including the end of
   model output**, detected common prefixes, and fixed token intervals - and a request hits only on a
-  **full unit match**;
-- the store is a **disaggregated NVMe fleet**: 3FS, 6.6 TiB/s aggregate, **40+ GiB/s per client**, CRAQ
-  chain replication, metadata in FoundationDB;
+  **full unit match** ([DeepSeek context caching](https://api-docs.deepseek.com/guides/kv_cache/));
+- the store is a **disaggregated NVMe fleet**: [3FS](https://github.com/deepseek-ai/3FS), 6.6 TiB/s aggregate,
+  **40+ GiB/s per client**, CRAQ chain replication, metadata in FoundationDB (system overview:
+  [open-infra-index](https://github.com/deepseek-ai/open-infra-index));
 - for SWA/sparse generations they keep one state slot per sequence with **bounded replay** and accept
   approximate KV.
 
@@ -207,8 +208,8 @@ Sizing is where this box differs by orders of magnitude. Feed rate needed = pref
 | KV per token | 24.6 KB fp32 / ~12.3 KB int8 | MLA latent, 64-token pages |
 | **feed rate needed** | **~4.4 / ~2.2 MB/s per stream** | **40+ GiB/s per client** |
 
-Gigabit therefore carries ~28 concurrent int8 restores here, so the fabric is not the design problem -
-latency and prefetch are.
+Gigabit therefore carries ~28 concurrent **fp32** restores here (~56 at int8), so the fabric is not the
+design problem - latency and prefetch are.
 
 ### A. One box
 
@@ -228,6 +229,16 @@ async writer, the LRU budget, `/health` + `/metrics`. To match the idea:
 
 Footprint: a 15k-token chain is 345 MB fp32 / 172 MB int8, so 1 TB of NVMe holds ~2,900 such chains.
 Capacity is not the constraint on one box.
+
+Two notes carried over from the earlier roadmap draft, because they are design constraints rather than
+tasks:
+
+- **A hot RAM tier is deliberately absent.** On this box the iGPU and the CPU share physical memory, so a
+  "device cache" and a "RAM cache" are the same memory; a separate RAM tier is just a bigger
+  `--prefix-cache-mb`. At 24.6 KB/token an exact 4k prefix costs 96 MB, so that tier holds about one
+  entry either way. The tip is what makes a tier that small sufficient.
+- **Choose N per workload.** Smaller blocks share more finely but pay more slice overhead; N=128 measured
+  +0.6% prefill against unsliced, N=512 +0.1%, so the cost is small either way but not zero.
 
 ### B. Inference box + cache box
 
@@ -269,20 +280,6 @@ pass unchanged against `RemoteBlocks`.
 requirement here is "immutable block + atomic rename", which POSIX provides; the metadata is an index
 rebuilt from the directory. Their scale is why they need a storage *system*; this needs a directory and,
 at most, a small object server.
-
-## Where this could go next
-
-1. **Async prefetch**: the chain is matched before the slot is free, so the read could overlap the queue.
-2. **A hot tier is deliberately absent.** On this box (iGPU, unified memory) "device cache" and "RAM cache" are the same
-   physical memory, so a separate RAM tier is just a bigger `--prefix-cache-mb`; at 24 KB/token an exact 4k prefix costs
-   96 MB, so the hot tier holds ~1 entry either way. The tip is what makes that small tier sufficient.
-2. **Direct-to-device block writes**: apply blocks into the slot at their offsets instead of assembling a full host
-   buffer (removes an `O(prefix)` copy; needs a `restore_range` on the engine).
-3. **TTL by traffic class** and an eviction policy that prefers leaves: evicting a mid-chain block truncates every
-   descendant. Correct (lookup stops at the first miss) but wasteful.
-4. **A remote backend**: the same block format behind a `get/put/has` interface, so one cache node can serve several
-   engines. Break-even is ~3.4 MB/s of link bandwidth to beat this box's prefill rate.
-5. Choose N per workload: small N shares more finely but pays more slice overhead.
 
 ## Running it
 
