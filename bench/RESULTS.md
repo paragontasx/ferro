@@ -635,3 +635,22 @@ Numerics unchanged: partial unroll does not reorder any floating-point operation
 top-1, mean TV 0.0100 (NEO) / 0.0168 (Mesa). KV dtype (f32/f16/int8) makes no difference to the
 prefill attention cost (280.7 / 280.4 / 285.7 ms per call at 1954 tok), confirming the bottleneck
 was register pressure, not bytes.
+
+## 2026-10-25 — ferro GPU numbers refreshed for the README (NEO default; llama.cpp baseline NOT re-run)
+
+Single tenant, N100, Q8_0, 784-token prompt, 32 tokens greedy, default driver stack (NEO
+26.35 + IGC 2.41), build = `main` @ e475da3 (KT5=8 + `#pragma unroll 8`):
+
+| model | prefill | decode |
+|---|---|---|
+| LFM2.5-350M | 747.6 tok/s | 56.75 tok/s |
+| LFM2.5-1.2B-Thinking | 221.8 tok/s | 21.05 tok/s |
+
+Against the llama.cpp CPU (2 threads) baseline already in the README (measured 2026-10-20, not re-run
+— llama.cpp is unchanged, so those numbers stand): 350M prefill 66.7 -> **11.2x**, decode 31.8 -> **1.8x**;
+1.2B prefill 11.2 -> **19.8x**, decode 6.1 -> **3.4x**. At 3,626 tokens (2026-10-24, same build):
+350M prefill 487.6 / decode 36.5; 1.2B prefill 143.0 / decode 15.5 tok/s.
+
+A llama-bench run was started for a fresh CPU baseline and aborted: on this 4-core SoC the readings
+were contention-dominated and inconsistent run to run (350M pp408 41.6 vs pp762 15.5 tok/s), so the
+existing pinned baseline is the more useful reference.
