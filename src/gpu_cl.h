@@ -23,6 +23,7 @@ Buf alloc(size_t bytes);
 Buf upload(const void* src, size_t bytes);          // alloc + blocking copy (load-time constants)
 bool write(Buf b, const void* src, size_t bytes);   // non-blocking enqueue (src must stay valid until next read/finish)
 bool read(Buf b, void* dst, size_t bytes);
+bool read_at(Buf b, size_t off, void* dst, size_t bytes);
 bool copy(Buf dst, size_t dst_off, Buf src, size_t src_off, size_t bytes);   // device-side, enqueued          // blocking: the per-forward sync point
 bool finish();
 void release(Buf b);

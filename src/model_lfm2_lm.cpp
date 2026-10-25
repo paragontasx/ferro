@@ -422,6 +422,14 @@ void LmEngine::reset(LmSeq& s) const {
 
 LmPrefix::~LmPrefix() { for (void* b : kv) if (b) gpu::release(b); for (void* b : kvs) if (b) gpu::release(b); for (void* b : cst) if (b) gpu::release(b); }
 
+BlockGeom LmEngine::block_geom() const {
+    const size_t kvw = (size_t)2 * m_.n_kv * m_.head_dim;
+    BlockGeom g; g.n_layers = (uint32_t)m_.n_attn_layers; g.n_conv = (uint32_t)m_.n_conv_layers;
+    g.row_bytes = (uint32_t)(kvw * kvesz()); g.scale_row_bytes = (uint32_t)(kv_dtype_ == 1 ? (kvw / 32) * 4 : 0);
+    g.conv_layer_bytes = (uint32_t)((size_t)2 * m_.n_embd * 4);
+    return g;
+}
+
 size_t LmEngine::prefix_bytes(int n_tokens) const {
     const size_t kvw = (size_t)2 * m_.n_kv * m_.head_dim, per_row = kvw * kvesz() + (kv_dtype_ == 1 ? kvw / 32 * 4 : 0);
     return (size_t)n_tokens * per_row * m_.n_attn_layers + (size_t)2 * m_.n_embd * 4 * m_.n_conv_layers;
@@ -465,6 +473,28 @@ bool LmEngine::export_prefix(const LmPrefix& p, std::vector<uint8_t>* out) const
     for (size_t l = 0; ok && l < p.kv.size(); ++l) { ok = rd(p.kv[l], (size_t)p.n * kvw * esz); if (ok && kv_dtype_ == 1) ok = rd(p.kvs[l], (size_t)p.n * (kvw / 32) * 4); }
     for (size_t l = 0; ok && l < p.cst.size(); ++l) ok = rd(p.cst[l], 2 * d * 4);
     return ok && off == out->size();
+}
+
+bool LmEngine::export_block(const LmSeq& s, int from, int to, std::vector<uint8_t>* kv, std::vector<uint8_t>* cst) const {
+    if (!impl_ || !impl_->g.ok || s.gpu_slot < 0 || !kv || !cst) return false;
+    if (from < 0 || to <= from || to > s.n_past) return false;
+    auto& g = impl_->g;
+    const size_t kvw = (size_t)2 * m_.n_kv * m_.head_dim, d = (size_t)m_.n_embd, esz = kvesz(), rows = (size_t)(to - from);
+    const size_t srb = (kvw / 32) * 4;                                   // int8: one fp32 scale per 32 values
+    kv->resize((rows * (kvw * esz + (kv_dtype_ == 1 ? srb : 0))) * g.kv.size());
+    size_t off = 0; bool ok = true;
+    for (size_t l = 0; ok && l < g.kv.size(); ++l) {
+        const size_t base = (size_t)s.gpu_slot * g.cap * kvw * esz + (size_t)from * kvw * esz;
+        ok = gpu::read_at(g.kv[l], base, kv->data() + off, rows * kvw * esz); off += rows * kvw * esz;
+        if (ok && kv_dtype_ == 1) {
+            const size_t sbase = (size_t)s.gpu_slot * g.cap * srb + (size_t)from * srb;
+            ok = gpu::read_at(g.kvs[l], sbase, kv->data() + off, rows * srb); off += rows * srb;
+        }
+    }
+    cst->resize(2 * d * 4 * g.cst.size());
+    size_t co = 0;
+    for (size_t l = 0; ok && l < g.cst.size(); ++l) { ok = gpu::read_at(g.cst[l], (size_t)s.gpu_slot * 2 * d * 4, cst->data() + co, 2 * d * 4); co += 2 * d * 4; }
+    return ok && off == kv->size();
 }
 
 std::shared_ptr<LmPrefix> LmEngine::import_prefix(int n_tokens, const uint8_t* data, size_t len) const {

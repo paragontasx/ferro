@@ -9,6 +9,7 @@
 #include "server.h"
 #include "memplan.h"
 #include "prefix_store.h"
+#include "block_store.h"
 #include "webui.h"
 #include <malloc.h>
 #include "gpu_cl.h"
@@ -279,7 +280,9 @@ struct Server {
     std::atomic<uint64_t> n_mem_rejected{0};
     std::atomic<uint64_t> spec_drafted{0}, spec_accepted{0}, spec_steps{0};
     std::vector<float> lg_spec;                    // worker only: logits of every row of a verification window
-    std::unique_ptr<PrefixStore> pstore;           // on-disk prefix snapshots (null = off)
+    std::unique_ptr<PrefixStore> pstore;
+    std::unique_ptr<BlockStore> bstore;            // block-granular prefix cache (null = off; replaces pstore)
+    std::atomic<uint64_t> bs_hits{0};              // requests that restored a block chain from disk           // on-disk prefix snapshots (null = off)
     std::atomic<uint64_t> ps_hits{0};              // requests that restored a snapshot from disk
     std::atomic<bool> trim_pending{false};         // a media request ran: return freed heap to the OS when the worker is idle
     clk::time_point t_start = clk::now();
@@ -415,6 +418,18 @@ static void gen_begin(Server& S, const std::shared_ptr<GenJob>& jp) {
                 }
             }
         }
+        if (S.bstore) {                                                            // the disk chain may reach further than the device cache
+            BlockStore::Entry be;
+            if (S.bstore->longest(head, &be) && (!e || be.toks.size() > e->toks.size() + 32)) {
+                std::vector<uint8_t> blob;
+                if (S.bstore->load(be, &blob)) {
+                    if (auto px = S.lm.import_prefix((int)be.toks.size(), blob.data(), blob.size())) {
+                        pc_store(S, j.prompt, std::move(px), false); S.bstore->touch(be); S.bs_hits++;
+                        e = pc_longest(S, j.prompt);
+                    }
+                }
+            }
+        }
         if (e) {
             if (S.lm.restore(j.seq, *e->px)) { pos = e->px->n; e->used = ++S.pc_tick; S.pc_hits++; S.pc_saved += (uint64_t)pos; }
             else S.lm.reset(j.seq);                                                // a failed restore may have left partial conv state: start clean
@@ -455,7 +470,13 @@ static void gen_prefill_chunk(Server& S) {
         const double rate = S.pf_rate > 0 ? S.pf_rate : 300.0;
         end = std::min(n, j.pf_pos + std::max(64, std::min(1024, (int)(rate * S.o.prefill_slice_ms / 1000.0))));
     }
-    for (int c : j.pf_cuts) if (c > j.pf_pos && c < end) end = c;                    // never step over a snapshot boundary
+    bool cut_applied = false;
+    for (int c : j.pf_cuts) if (c > j.pf_pos && c < end) { end = c; cut_applied = true; }
+    if (S.bstore && j.cache_prompt) {                                                // only a prompt that will be cached pays this
+        const int B = S.bstore->block(), nb = ((j.pf_pos / B) + 1) * B;
+        if (end >= nb) end = std::min(end, nb);                                      // never cross a boundary: the conv state is only valid there
+        else if (!cut_applied && end < n) end = std::min(n, nb);                     // a short time slice: extend up to the boundary
+    }                    // never step over a snapshot boundary
     std::string err; bool ok = true;
     const auto t0 = clk::now();
     try { ok = S.lm.step({&j.seq}, {j.prompt.data() + j.pf_pos}, {end - j.pf_pos}, S.lg.data(), &err, true); } catch (const std::exception& e) { err = e.what(); ok = false; }
@@ -464,6 +485,11 @@ static void gen_prefill_chunk(Server& S) {
     if (end - j.pf_pos >= 48 && ms > 0) { const double r = (end - j.pf_pos) * 1000.0 / ms; S.pf_rate = S.pf_rate > 0 ? 0.6 * S.pf_rate + 0.4 * r : r; }
     S.rw_prefill.add(end - j.pf_pos, ms);
     j.pf_ms += ms; j.pf_pos = end;
+    if (S.bstore && j.cache_prompt && end % S.bstore->block() == 0) {               // capture [end-B, end): O(B), not O(prefix)
+        const int B = S.bstore->block();
+        std::vector<uint8_t> kvb, cstb;
+        if (S.lm.export_block(j.seq, end - B, end, &kvb, &cstb)) S.bstore->save_async(j.prompt, end, std::move(kvb), std::move(cstb));
+    }
     if (end < n) {
         if (std::find(j.pf_cuts.begin(), j.pf_cuts.end(), end) != j.pf_cuts.end()) {   // reached a boundary: leave a snapshot behind
             const auto ts = clk::now();
@@ -664,7 +690,18 @@ static void worker_loop(Server& S, std::promise<std::string>& ready) {
             S.chat_opt.typed_content = lfm_template_is_typed(S.lm.model().gguf.get_str("tokenizer.chat_template"));
             S.think_open = S.ltok.token_id("<think>"); S.think_close = S.ltok.token_id("</think>"); S.eos_id = S.lm.model().eos_id;
             S.lg.assign((size_t)S.lm.n_slots() * (size_t)S.lm.n_vocab(), 0.0f);
-            if (!S.o.snapshot_dir.empty() && S.o.prefix_cache_mb > 0 && S.lm.on_gpu()) {
+            if (!S.o.snapshot_dir.empty() && S.o.block_cache > 0 && S.lm.on_gpu()) {
+                S.bstore.reset(new BlockStore); std::string e;
+                if (!S.bstore->open(S.o.snapshot_dir + "/blocks", S.lm.state_id(), S.o.block_cache,
+                                    (uint64_t)S.o.snapshot_mb << 20, S.lm.block_geom(), &e)) {
+                    fprintf(stderr, "[serve] block cache disabled: %s\n", e.c_str()); S.bstore.reset();
+                } else {
+                    fprintf(stderr, "[serve] block cache: %d-token blocks, %zu stored (%.1f MB) in %s, budget %d MB\n",
+                            S.bstore->block(), S.bstore->entries(), S.bstore->bytes() / 1048576.0,
+                            (S.o.snapshot_dir + "/blocks").c_str(), S.o.snapshot_mb);
+                }
+            }
+            if (!S.o.snapshot_dir.empty() && S.o.block_cache == 0 && S.o.prefix_cache_mb > 0 && S.lm.on_gpu()) {
                 S.pstore.reset(new PrefixStore); std::string e;
                 if (!S.pstore->open(S.o.snapshot_dir, S.lm.state_id(), (uint64_t)S.o.snapshot_mb << 20, &e)) { fprintf(stderr, "[serve] prefix snapshots disabled: %s\n", e.c_str()); S.pstore.reset(); }
                 else fprintf(stderr, "[serve] prefix snapshots: %zu stored for this model (%.1f MB) in %s, budget %d MB\n", S.pstore->entries(), S.pstore->bytes() / 1048576.0, S.o.snapshot_dir.c_str(), S.o.snapshot_mb);
@@ -897,6 +934,13 @@ static std::string health_json(Server& S) {
                                (unsigned long long)S.spec_drafted.load(), (unsigned long long)S.spec_accepted.load(), (unsigned long long)S.spec_steps.load());
         out.pop_back(); out += lv; out += '}';
         double inflight; { std::lock_guard<std::mutex> g(S.mem_m); inflight = S.mem_inflight; }
+        if (S.bstore) {                                                          // insert before the closing brace: position independent
+            char sb[320];
+            snprintf(sb, sizeof sb, ",\"block_cache\":{\"block\":%d,\"entries\":%zu,\"mb\":%.1f,\"saved\":%llu,\"disk_hits\":%llu}",
+                     S.bstore->block(), S.bstore->entries(), S.bstore->bytes() / 1048576.0,
+                     (unsigned long long)S.bstore->saved(), (unsigned long long)S.bs_hits.load());
+            out.insert(out.size() - 1, sb);
+        }
         const double lim = cgroup_limit_mb(), used = cgroup_used_mb();
         char l[300];
         snprintf(l, sizeof l, ",\"memory\":{\"limit_mb\":%.0f,\"used_mb\":%.0f,\"headroom_mb\":%.0f,\"reserved_mb\":%.0f,\"rejected\":%llu}", lim, used, lim > 0 ? lim - used : 0.0, inflight, (unsigned long long)S.n_mem_rejected.load());
@@ -1255,6 +1299,12 @@ static std::string metrics_text(Server& S) {
         metric("ferro_lm_prefix_cache_evictions_total", "counter", "Prefix cache entries evicted.", (double)S.pc_evict.load());
         metric("ferro_lm_prefix_cache_entries", "gauge", "Entries in the device prefix cache.", (double)S.pc_entries.load());
         metric("ferro_lm_prefix_cache_bytes", "gauge", "Device memory held by the prefix cache.", (double)S.pc_used.load());
+        if (S.bstore) {
+            metric("ferro_lm_block_cache_blocks", "gauge", "Blocks stored on disk for this model.", (double)S.bstore->entries());
+            metric("ferro_lm_block_cache_bytes", "gauge", "Disk used by the block cache.", (double)S.bstore->bytes());
+            metric("ferro_lm_block_cache_blocks_written_total", "counter", "Blocks written.", (double)S.bstore->saved());
+            metric("ferro_lm_block_cache_chain_hits_total", "counter", "Requests that restored a chain from disk.", (double)S.bs_hits.load());
+        }
         if (S.pstore) {
             metric("ferro_lm_prefix_snapshots_entries", "gauge", "Prefix snapshots on disk for this model.", (double)S.pstore->entries());
             metric("ferro_lm_prefix_snapshots_bytes", "gauge", "Disk used by prefix snapshots.", (double)S.pstore->bytes());
