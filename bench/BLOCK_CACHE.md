@@ -128,11 +128,16 @@ restore is a single use.
 
 ## Known limitations
 
-- **The tip needs the client to echo the assistant turn back in the same token form.** With `LFM2.5-1.2B-Thinking`'s chat
-  template it does not fire: the reply is detokenised and re-tokenised on the way back, so the boundary no longer matches.
-  Blocks still restore (measured 512 tokens of 667) and the answer is bit-identical — the cost is up to `blk` tokens of
-  re-prefill per turn. `scripts/test_blocks.py` reports this case as a failure on that model; set
-  `FERRO_TEST_NO_THINK=1` when running it there.
+- **The tip is best-effort: it fires only when the echoed turn re-tokenises to the same ids.** A KV cache is keyed on
+  token ids, not text, so `" hello"` vs `"hello"` is a different bookmark, and a chat template that carries a Thinking
+  model's reasoning in a separate field will not reproduce the generated ids on the way back. Measured: it fires for the
+  350M through the chat path (645 of 667 tokens reused) and for the 1.2B through raw completions (492 of 508), and it
+  misses for the 1.2B through chat and for the 350M through completions — i.e. it depends on the template and the
+  tokenizer seam, not on the model. A miss is safe and bounded: the block chain still restores the head (512 tokens of
+  667 in the chat case) and the answer stays bit-identical; the cost is up to `blk` tokens of re-prefill that turn.
+  `scripts/test_tip_roundtrip.py` asserts the contract (always exact, head always restored) and reports a seam drift as
+  INFO, because text round-trips cannot be id-exact by construction. `test_blocks.py` on the 1.2B will report the tip
+  check as a failure for the same reason; pass `FERRO_TEST_NO_THINK=1` there.
 - Tested at 128-token blocks on the 350M (fp32 and int8) and the 1.2B (fp32); the 1.2B at 16k was not run (prefill is
   4x slower per token, ~4 minutes per pass).
 
