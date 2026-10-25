@@ -604,3 +604,34 @@ budget or subgroup width. Model-level impact is now bounded: 1.2B prefill at 3.6
 tok/s (NEO) vs 111.5 (Mesa) — 1.34x — while the 350M production model is faster on NEO at every
 length and d1 is at parity. Deployed NEO as the prod default (`scripts/serve_prod.sh`,
 FERRO_GPU_DRIVER=neo|rusticl) on 2026-10-24; rollback is one variable.
+
+## 2026-10-24 (cont.) — NEO prefill PARITY+ : `#pragma unroll 8` on the QK inner loop (`ff8a7db`)
+
+Root cause found for the IGC attention deficit: the fully unrolled QK loop hoists the query vector
+into **64 GRF per lane**; with the PV accumulators' 64 GRF, IGC sits at the 128-register limit and
+spills. Partial unroll (8 of the 16 float4 dims live, the rest reloaded from SLM) removes the
+pressure. Per-layer `lm_attn_pf`, same source, one flag:
+
+| T (tokens) | Mesa | NEO before | **NEO after** |
+|---|---|---|---|
+| 408 | 17.3 ms | 53.7 | **12.1 ms (1.43x faster than Mesa)** |
+| 1,900 | 320.4 | 1046.1 | **230.2 ms** |
+| 3,626 | 1143.1 | 3728.5 | **823.2 ms** |
+
+End-to-end, 3,626-token prompt, single tenant, alternating arms:
+
+| | NEO before | NEO after | rusticl | NEO vs rusticl |
+|---|---|---|---|---|
+| 350M prefill | 227.0 tok/s | **487.6** | 364.9 | **+34%** |
+| 350M decode | 24.8 | **36.5** | 18.4 | **+98%** |
+| 1.2B prefill | 83.5 tok/s | **143.0** | 104.5 | **+37%** |
+| 1.2B decode | 15.5 | **15.5** | 8.8 | **+76%** |
+
+Crossover map (350M prefill tok/s, NEO vs rusticl): 20 tok 274.7/153.7, 964 tok 465.9/479.9,
+1954 tok 586.6/423.5 (after the fix), 3626 tok 487.6/364.9, 7219 tok (pre-fix) 135.4/261.9.
+**There is no longer a crossover: NEO now wins at every prompt length and both models.**
+
+Numerics unchanged: partial unroll does not reorder any floating-point operation — lm_parity 12/12
+top-1, mean TV 0.0100 (NEO) / 0.0168 (Mesa). KV dtype (f32/f16/int8) makes no difference to the
+prefill attention cost (280.7 / 280.4 / 285.7 ms per call at 1954 tok), confirming the bottleneck
+was register pressure, not bytes.
