@@ -33,6 +33,8 @@ struct Gemma4Model {
     int swa_win = 512, n_kv_layers = 0, n_ctx_train = 0;
     float rms_eps = 1e-6f, softcap = 0.f, rope_base = 1e6f, rope_base_swa = 1e4f;
     int bos_id = 2, eos_id = 1;
+    int stop_ids[4] = {1, -1, -1, -1};   // eos + end-of-turn
+    int n_stop = 1;
     GgufFile gguf;
     WMat tok_embd;                 // tied LM head, int8 planes
     WMat pl_model_proj;            // [n_embd_pl * n_layer][n_embd] f32-origin (small)

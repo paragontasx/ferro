@@ -69,7 +69,9 @@ static int run_generate_gemma4(const GenArgs& a) {
     for (int i = 0; i < a.n_predict; ++i) {
         const int id = smp.sample(logits.data(), m.n_vocab, hist);
         hist.push_back(id);
-        if (id == m.eos_id) break;
+        bool stop = false;
+        for (int k = 0; k < m.n_stop; ++k) if (id == m.stop_ids[k]) stop = true;
+        if (stop) break;
         ++n_gen;
         if (!a.quiet) { fputs(tok.decode_piece(id).c_str(), stdout); fflush(stdout); }
         if (i + 1 >= a.n_predict) break;

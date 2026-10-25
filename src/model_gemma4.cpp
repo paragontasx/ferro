@@ -29,6 +29,7 @@ static void rmsnorm(const float* x, const float* w, int n, float eps, float* y) 
 // Y[T x rows] = X[T x cols] @ W^T: iGPU when the weights are resident, else per-32-block int8 on the CPU
 static inline void mm(const WMat& W, const float* X, int T, float* Y, int y_ld) {
     if (W.gpu_slot >= 0 && y_ld == W.rows && gpu::gemm(W.gpu_slot, X, T, Y)) return;
+    if (!W.wq_row.empty()) { gemm_q8_int8(W, X, T, Y, y_ld); return; }
     ActQ aq;
     quant_act(X, T, W.cols, aq);
     gemm_q8(W, aq, T, Y, y_ld);
@@ -156,6 +157,13 @@ static WMat mat_of(const GgufFile& g, const std::string& name) {
             W.ws.clear(); W.ws.shrink_to_fit();
             W.rs.clear(); W.rs.shrink_to_fit();
         }
+    } else {
+        // CPU: keep only the row-domain int8 planes (one scale per row, VNNI madd) - 4 GiB budget, 4x
+        // faster than the per-32-block path (gemm_q8) on this N100
+        pack_q8_rowdomain(W);
+        W.wq.clear(); W.wq.shrink_to_fit();
+        W.ws.clear(); W.ws.shrink_to_fit();
+        W.rs.clear(); W.rs.shrink_to_fit();
     }
     return W;                      // CPU fallback keeps block planes: gemm_q8 + ActQ (per-32-block int8)
 }
@@ -168,9 +176,11 @@ bool Gemma4Model::load(const std::string& path, int max_ctx, std::string* err) {
     try {
         if (!gguf.open_file(path.c_str(), err)) return false;
         if (!is_gemma4(gguf)) { *err = "not a gemma4 model"; return false; }
-        {   // iGPU backend: FERRO_LM_GPU=0 forces the CPU path
+        {   // iGPU backend: opt-in via FERRO_LM_GPU=1. The current GPU path syncs per GEMM (~280 round
+            // trips/token), so it is slower than the CPU int8 path; a resident forward like LFM's is the
+            // next step. FERRO_LM_GPU=0 (default) uses the CPU int8 GEMMs.
             const char* ge = getenv("FERRO_LM_GPU");
-            g4_gpu = (!ge || atoi(ge) != 0) && gpu::init(getenv("FERRO_VERBOSE") != nullptr);
+            g4_gpu = (ge && atoi(ge) != 0) && gpu::init(getenv("FERRO_VERBOSE") != nullptr);
             if (g4_gpu) fprintf(stderr, "[gemma4] iGPU: %s\n", gpu::device_name());
         }
         const std::string P = "gemma4.";
@@ -192,6 +202,11 @@ bool Gemma4Model::load(const std::string& path, int max_ctx, std::string* err) {
         n_kv_layers = n_layer - n_kv_shared;
         bos_id = (int)gguf.get_int("tokenizer.ggml.bos_token_id", 2);
         eos_id = (int)gguf.get_int("tokenizer.ggml.eos_token_id", 1);
+        // gemma chat turns end on <turn|> (eot); the CLI stops on either
+        n_stop = 1;
+        stop_ids[0] = eos_id;
+        const int eot = (int)gguf.get_int("tokenizer.ggml.eot_token_id", -1);
+        if (eot >= 0 && eot != eos_id && n_stop < 4) stop_ids[n_stop++] = eot;
 
         auto is_swa = gguf.get_iarr(P + "attention.sliding_window_pattern");
         auto ffn_arr = gguf.get_iarr(P + "feed_forward_length");

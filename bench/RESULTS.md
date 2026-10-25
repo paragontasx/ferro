@@ -681,3 +681,35 @@ Against llama.cpp CPU (2 threads, 2026-10-20, kept unchanged): 350M 11.2x prefil
 1.2B 19.8x prefill / 3.4x decode. Ferro's edge shrinks with context length (2.03x -> 1.73x prefill,
 2.30x -> 1.44x decode at 3.6k on the 350M): llama.cpp's Vulkan path scales better at long context,
 ferro's remaining long-context cost is the O(n^2) attention term (see the lm_attn_pf entries above).
+
+## Gemma 4 E2B (Q4_0 QAT, text path) — 2026-10-25
+
+Model: `models/gemma4/gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf` (unsloth QAT, 2.6 GB, arch `gemma4`).
+Oracle: llama.cpp (this tree's `baselines/llama.cpp`, build-cpu) on the same GGUF.
+
+Correctness: `scripts/gemma4_parity.py` + `scripts/g4_diff.py` (stage-by-stage tensor diff against
+llama.cpp graph dumps). Tokenizer is byte-identical to llama.cpp (`llama-tokenize --ids` matches).
+Next-token parity over 6 raw prompts (top-1 / TV / mean |dlogprob|):
+
+| path | top-1 | mean TV | worst TV | decode | prefill |
+| :-- | :-- | :-- | :-- | :-- | :-- |
+| CPU int8 per-row domain (`gemm_q8_int8`, default) | 6/6 | 0.0441 | 0.1567 | 3.80 tok/s | 4.7 tok/s |
+| CPU int8 per-32-block (`gemm_q8`) | 6/6 | 0.0298 | 0.1019 | 0.81 tok/s | 1.0 tok/s |
+| iGPU hybrid (`FERRO_LM_GPU=1`, NEO) | — | — | — | 0.85 tok/s | 18.9 tok/s |
+| iGPU hybrid (rusticl) | — | — | — | 1.81 tok/s | 11.4 tok/s |
+
+Numbers are single-tenant, 39-token chat prompt, `--temp 0`, 16-20 generated tokens.
+
+Notes
+- iGPU weights go resident (`gpu::upload_q8`, int8 DP4A). Per-token decode currently pays ~280
+  blocking `gpu::gemm` round trips, which is why it is slower than the CPU path; prefill (many rows
+  per GEMM) already wins by 4x. The fix is the LFM-style resident forward (persistent device buffers,
+  one sync per forward, `op_qkv_post` + `op_attention*` + `op_gelu_mul` + `op_gemm_q`) — not yet done.
+- Architecture as implemented (from `src/models/gemma4.cpp`): 35 layers, d 1536, 8 q / 1 kv heads
+  (MQA), head dim 512 global / 256 SWA, global every fifth layer (4,9,14,19,24,29,34), per-head q/k
+  RMSNorm, weightless V RMSNorm, attention scale 1.0 (no 1/sqrt(d)), NEOX rope with proportional
+  rope_freqs on global layers, PLE (per-layer embeddings, pl 256), post-attention / post-FFW /
+  post-PLE RMSNorms before each residual add, layer output scale, logits softcap 30, tied lm_head.
+- Two porting bugs that cost the most: `gguf_get_iarr` did not decode BOOL arrays (the SWA pattern is
+  a bool array — an empty parse silently made every layer SWA), and the gemma4 RoPE is NEOX
+  (rotate-half), not the interleaved pairs used by the byte-level tokenizer models.
