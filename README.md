@@ -16,6 +16,7 @@ DP4A), with automatic CPU fallback. Three model kinds from the same binary, dete
 | **EmbeddingGemma-2** | `gemma-embedding2` | `embed` / `bench` | sentence embeddings (+ image / audio / video via `--mmproj`) |
 | **LiquidAI d1-omni-600M** | `lfm2` + `lfm2.decision.*` | `decide` / `bench` | typed answers (yes/no, choice, score) over a state, one forward pass, no generated tokens |
 | **LiquidAI LFM2 / LFM2.5** (1.2B-Thinking, 350M, ...) | `lfm2` (causal) | `generate` / `serve --lm` | text generation: chat + completions, streaming, OpenAI-compatible |
+| **Gemma 4 E2B/E4B** (QAT Q4_0 GGUFs) | `gemma4` | `generate --lm` | text generation: hybrid SWA/global attention, PLE, 262k vocab |
 
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![language: C++](https://img.shields.io/github/languages/top/paragontasx/ferro)
@@ -253,6 +254,25 @@ vs F16) ferro's fp32-activation CPU reference is *closer* to F16 than llama.cpp'
 activations to int8 like llama.cpp and lands on the same TV. Debug knobs: `FERRO_LM_GPU=0` (CPU reference, ~0.5 tok/s decode), `FERRO_LM_PROF=1` (per-op device times),
 `FERRO_LM_STEPTIME=1`, `FERRO_LM_SELFCHECK=1` (chunked prefill / token-by-token decode vs one prefill), `FERRO_LM_KEEP_HOST=1`, `FERRO_GPU_SMALL=0` / `FERRO_GPU_GEMV=0`.
 Fusion / timing-experiment knobs: `FERRO_LM_FUSE=0` (unfused launches), `=2` (opt-in prologue-fused GEMVs, break-even on this GPU), `FERRO_PRO_MASK`, `FERRO_LM_ABL=op,..` / `FERRO_LM_DUP=op,..` (skip / double ops to measure their cost), `FERRO_LM_NOEOS=1`.
+
+## Using Gemma 4 (E2B / E4B, QAT Q4_0)
+
+`unsloth/gemma-4-E2B-it-qat-GGUF:UD-Q4_K_XL` (arch `gemma4`) runs natively, text path: 35 layers,
+hybrid sliding-window(512)/global attention (global every fifth layer), 8:1 MQA with head dim 512
+global / 256 SWA, per-head q/k RMSNorm, weightless V RMSNorm, proportional RoPE, Per-Layer Embeddings
+(PLE), layer output scales, logits softcap 30, tied LM head, and the model's `<start_of_turn>` chat
+template with `<turn|>` as the end-of-turn stop token. Q4_0 weights are repacked to int8 planes on
+load (no f32 round trip).
+```sh
+./ferro-embed generate --lm models/gemma4/gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf \
+  --prompt "Name the three primary colors." --n-predict 64 --temp 0
+```
+Validated against llama.cpp on the same GGUF: `scripts/gemma4_parity.py` (6/6 next-token top-1
+agreement, mean total-variation 0.044) and `scripts/g4_diff.py`, which diffs per-layer hidden states
+against llama.cpp graph dumps. Measured on the N100 CPU path (int8 row-domain GEMMs): 4.2 tok/s
+prefill and 3.5 tok/s decode on a 365-token prompt. The iGPU path (`FERRO_LM_GPU=1`) uploads the
+weights with DP4A but currently syncs per GEMM, which is slower than the CPU for decode (18.9 tok/s
+prefill, 0.85 tok/s decode on NEO) — the resident single-sync forward is the next step.
 
 ## Serving over HTTP (`ferro-embed serve`)
 One resident process, OpenAI-compatible, embeddings and/or language model and/or the d1 decision model on the same iGPU (one worker thread owns the device):
