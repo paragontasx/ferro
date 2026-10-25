@@ -581,3 +581,26 @@ d1_parity 15/15 token counts, 23/23 top answers, batched==alone 0.0e+00 (NEO).
 **Stability.** Two host hangs during GPU experiments (Oct-23 SKV=16 variant on rusticl; Oct-24 a
 16-run NEO matrix) — unvalidated GPU paths get single supervised runs only; a hung driver takes
 the whole box (no SSH).
+
+### 2026-10-24 — follow-up: ATTACKING the IGC residue on `lm_attn_pf` (all REJECTED)
+
+Baseline after the KT5=8 tile (T=408, per-layer): Mesa 17.20 ms, NEO 53.69 ms. Variants measured with
+`ferro-lab/cl_bench` (single-kernel harness, reproduces the in-engine number to <1%):
+
+| variant | Mesa | NEO | verdict |
+|---|---|---|---|
+| per-`j` hoisted K pointer | 16.69 | 57.95 | neutral/rejected |
+| `vload8` K loads (8 floats/load) | 26.87 | 54.19 | hurts Mesa |
+| SLM stride 68 (misaligned; 72 would be the aligned pad) | timeout | 74.95 | rejected — `vload4` needs 16 B alignment |
+| `reqd_work_group_size(32,1,1)` | 19.84 | 100.00 | rejected |
+| (earlier) global-memory K | 52.70 | 117.73 | rejected |
+| (earlier) Q hoisted into registers | 167.13 | 167.39 | rejected — 64+64 float regs spill on BOTH drivers |
+| (earlier) forced SIMD32 | — | 560.02 | rejected |
+
+Conclusion: the residual NEO deficit on this kernel is an IGC codegen property of SLM reads whose
+address is uniform across lanes and varies per iteration (~3.7x vs Mesa's code for the same
+addresses); it does not respond to load width, pointer form, alignment, WG-size hints, register
+budget or subgroup width. Model-level impact is now bounded: 1.2B prefill at 3.6k tokens is 83.5
+tok/s (NEO) vs 111.5 (Mesa) — 1.34x — while the 350M production model is faster on NEO at every
+length and d1 is at parity. Deployed NEO as the prod default (`scripts/serve_prod.sh`,
+FERRO_GPU_DRIVER=neo|rusticl) on 2026-10-24; rollback is one variable.
