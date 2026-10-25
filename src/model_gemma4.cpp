@@ -87,6 +87,7 @@ static WMat pack_q4_0(const uint8_t* raw, int rows, int cols, const char* name) 
 }
 
 // dequantize one row of a Q4_0 tensor (embeddings / PLE lookups)
+void g4_q4_0_row(const GgufFile& g, const GGUFTensor& t, int row, float* out);   // see below
 static void q4_0_row(const GgufFile& g, const GGUFTensor& t, int row, float* out) {
     const int cols = (int)t.dims[0], nb = cols / 32;
     const uint8_t* rowp = g.tensor_data(t) + (size_t)row * nb * 18;
@@ -100,6 +101,8 @@ static void q4_0_row(const GgufFile& g, const GGUFTensor& t, int row, float* out
         }
     }
 }
+
+void g4_q4_0_row(const GgufFile& g, const GGUFTensor& t, int row, float* out) { q4_0_row(g, t, row, out); }
 
 // any GGUF tensor -> f32 (F32/F16/BF16/Q8_0/Q4_0)
 static std::vector<float> to_f32(const GgufFile& g, const GGUFTensor& t) {
@@ -144,12 +147,28 @@ static std::vector<float> vec_of(const GgufFile& g, const std::string& name) {
 
 // GGUF [ne0=cols, ne1=rows] -> WMat (rows, cols)
 static bool g4_gpu = false;            // weights resident on the iGPU (set by Gemma4Model::load)
+static bool g4_defer = false;          // load() builds fused qkv/gateup matrices before uploading
+
+static void g4_free_planes(WMat& W) {
+    W.wq.clear(); W.wq.shrink_to_fit();
+    W.ws.clear(); W.ws.shrink_to_fit();
+    W.rs.clear(); W.rs.shrink_to_fit();
+    W.wf.clear(); W.wf.shrink_to_fit();
+    W.wq_row.clear(); W.wq_row.shrink_to_fit();
+}
+
+static void g4_up_free(WMat& W) {              // upload to the iGPU, then drop the host planes (4 GiB budget)
+    if (W.rows <= 0 || W.wq.empty()) return;
+    W.gpu_slot = gpu::upload_q8(W);
+    g4_free_planes(W);
+}
 
 static WMat mat_of(const GgufFile& g, const std::string& name) {
     const GGUFTensor& t = need(g, name);
     const int cols = (int)t.dims[0], rows = t.dims.size() > 1 ? (int)t.dims[1] : 1;
     WMat W = (t.type == T_Q4_0) ? pack_q4_0(g.tensor_data(t), rows, cols, name.c_str())
                                 : pack_from_f32(to_f32(g, t).data(), rows, cols, cols, name.c_str());
+    if (g4_gpu && g4_defer) return W;             // caller fuses + uploads (gemma4 GPU path)
     if (g4_gpu) {
         W.gpu_slot = gpu::upload_q8(W);           // int8 DP4A resident copy
         if (W.gpu_slot >= 0) {                     // iGPU owns the weights; drop the host planes (4 GiB budget)
@@ -172,16 +191,16 @@ bool is_gemma4(const GgufFile& g) { return g.arch == "gemma4"; }
 
 // ------------------------------------------------------------------ load
 bool Gemma4Model::load(const std::string& path, int max_ctx, std::string* err) {
-    (void)max_ctx;
+    ctx = max_ctx > 0 ? max_ctx : 2048;
     try {
         if (!gguf.open_file(path.c_str(), err)) return false;
         if (!is_gemma4(gguf)) { *err = "not a gemma4 model"; return false; }
-        {   // iGPU backend: opt-in via FERRO_LM_GPU=1. The current GPU path syncs per GEMM (~280 round
-            // trips/token), so it is slower than the CPU int8 path; a resident forward like LFM's is the
-            // next step. FERRO_LM_GPU=0 (default) uses the CPU int8 GEMMs.
+        {   // iGPU backend: the resident forward (one host sync per forward). Opt out with FERRO_LM_GPU=0.
             const char* ge = getenv("FERRO_LM_GPU");
-            g4_gpu = (ge && atoi(ge) != 0) && gpu::init(getenv("FERRO_VERBOSE") != nullptr);
-            if (g4_gpu) fprintf(stderr, "[gemma4] iGPU: %s\n", gpu::device_name());
+            gpu_enabled = (!ge || atoi(ge) != 0) && gpu::init(getenv("FERRO_VERBOSE") != nullptr);
+            g4_gpu = gpu_enabled;
+            g4_defer = gpu_enabled;
+            if (g4_gpu) fprintf(stderr, "[gemma4] iGPU: %s (resident forward)\n", gpu::device_name());
         }
         const std::string P = "gemma4.";
         n_layer  = (int)gguf.get_int(P + "block_count", 0);
@@ -196,8 +215,8 @@ bool Gemma4Model::load(const std::string& path, int max_ctx, std::string* err) {
         softcap  = (float)gguf.get_f64(P + "final_logit_softcapping", 0.0);
         rope_base = (float)gguf.get_f64(P + "rope.freq_base", 1e6);
         rope_base_swa = (float)gguf.get_f64(P + "rope.freq_base_swa", 1e4);
-        const int hd_g = (int)gguf.get_int(P + "attention.key_length", 512);
-        const int hd_s = (int)gguf.get_int(P + "attention.key_length_swa", hd_g);
+        hd_g = (int)gguf.get_int(P + "attention.key_length", 512);
+        hd_s = (int)gguf.get_int(P + "attention.key_length_swa", hd_g);
         const int n_kv_shared = (int)gguf.get_int(P + "attention.shared_kv_layers", 0);
         n_kv_layers = n_layer - n_kv_shared;
         bos_id = (int)gguf.get_int("tokenizer.ggml.bos_token_id", 2);
@@ -216,11 +235,13 @@ bool Gemma4Model::load(const std::string& path, int max_ctx, std::string* err) {
         tok_embd_raw = gguf.tensor("token_embd.weight");
         if (!tok_embd_raw) throw std::runtime_error("missing token_embd.weight");
         tok_embd = mat_of(gguf, "token_embd.weight");           // tied lm_head
+        if (g4_gpu) g4_up_free(tok_embd);
 
 
         if (n_embd_pl > 0) {
             pl_proj_norm = vec_of(gguf, "per_layer_proj_norm.weight");
             pl_model_proj = mat_of(gguf, "per_layer_model_proj.weight");
+            if (g4_gpu) g4_up_free(pl_model_proj);
             ple_tok_raw = gguf.tensor("per_layer_token_embd.weight");
             if (!ple_tok_raw) throw std::runtime_error("missing per_layer_token_embd.weight");
         }
@@ -255,6 +276,24 @@ bool Gemma4Model::load(const std::string& path, int max_ctx, std::string* err) {
                 l.proj     = mat_of(gguf, B + "proj.weight");
             }
             if (ffn_arr.size() > (size_t)il) n_ff = (int)ffn_arr[il];
+            if (g4_gpu) {   // fuse q|k|v and gate|up -> ONE GEMM per block; upload, drop the host planes
+                if (l.own_kv) {
+                    l.qkv = pack_concat({&l.wq, &l.wk, &l.wv}, "qkv");
+                    g4_up_free(l.qkv);
+                } else {
+                    g4_up_free(l.wq);      // shared-KV layer: q projection only
+                }
+                g4_free_planes(l.wq); g4_free_planes(l.wk); g4_free_planes(l.wv);
+                l.gateup = pack_concat({&l.ffn_gate, &l.ffn_up}, "gateup");
+                g4_up_free(l.gateup);
+                g4_free_planes(l.ffn_gate); g4_free_planes(l.ffn_up);
+                g4_up_free(l.wo); g4_up_free(l.ffn_down); g4_up_free(l.inp_gate); g4_up_free(l.proj);
+            }
+        }
+
+        if (g4_gpu) {                       // buffers for the resident forward (weights are already device-resident)
+            g4_defer = false;
+            if (!upload_gpu(err)) return false;
         }
         return true;
     } catch (const std::exception& e) {
@@ -276,6 +315,7 @@ void Gemma4Model::reset(State& s) const {
 
 // ------------------------------------------------------------------ forward (CPU)
 bool Gemma4Model::forward(State& s, const int* ids, int T, float* logits, std::string* err) {
+    if (gpu) return forward_gpu(s, ids, T, logits, err);
     try {
         const int d = n_embd, pl = n_embd_pl;
         const int pos0 = s.n;

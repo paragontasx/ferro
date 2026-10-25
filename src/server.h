@@ -19,6 +19,7 @@ struct ServerOptions {
     int prefix_cache_mb = 128;                 // LM prompt-prefix cache budget (device memory, LRU); 0 = off. A snapshot costs ~25 KB per cached token (LFM2.5, 6 attention layers)
     std::string snapshot_dir;                  // --snapshot-dir: persist prompt-prefix snapshots here (survive restarts; also the spill target when the device cache evicts)
     int snapshot_mb = 2048;                    // disk budget for the snapshot directory (oldest files go first)
+    int block_cache = 0;                       // --block-cache N: store the prompt cache as N-token blocks (0 = whole-prefix snapshots)
     bool plan_only = false;                    // `ferro-embed plan`: print the memory plan and exit
     bool no_memory_check = false;              // start even when the plan says the configuration does not fit the container limit
     int kv_dtype = 0;                           // --kv-dtype: 0 f32, 1 int8 (+ one fp32 scale per 32 values, 3.6x smaller, small accuracy cost), 2 f16 (half storage, fp32 arithmetic, 1.8x smaller)

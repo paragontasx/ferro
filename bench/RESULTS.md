@@ -716,3 +716,33 @@ Notes
 - Two porting bugs that cost the most: `gguf_get_iarr` did not decode BOOL arrays (the SWA pattern is
   a bool array — an empty parse silently made every layer SWA), and the gemma4 RoPE is NEOX
   (rotate-half), not the interleaved pairs used by the byte-level tokenizer models.
+
+## Gemma 4 E2B resident iGPU forward — 2026-10-25
+
+The GPU path is now a single-sync resident forward (weights device-resident, fused [q|k|v] and
+[gate|up] matrices, KV caches in device buffers, producers writing the int8 scratch that the next
+GEMM reads). Single-tenant runs on NEO, `--temp 0`, box lock held (shared with the other agent
+session), one GPU process at a time.
+
+| workload | CPU int8 (before) | GPU, sync per GEMM (before) | resident GPU forward |
+| :-- | :-- | :-- | :-- |
+| prefill, 365-token prompt | 4.2 tok/s | 18.9 tok/s | **100.9 tok/s** |
+| prefill, 32-token prompt | 4.7 tok/s | 37.0 tok/s | (same kernel path, chunk-amortised) |
+| decode, 32-token context | 3.8 tok/s | 0.85 tok/s | **8.07 tok/s** |
+| decode, 365-token context | 3.5 tok/s | — | **4.86 tok/s** |
+
+Correctness: top-1/2/3 next-token logits identical to the CPU path on the same prompt, and the CPU
+path is the one validated against llama.cpp (6/6 top-1, mean TV 0.030).
+
+What the measurement says about the remaining headroom
+- **Prefill is compute-bound at ~200 GMAC/s** (the DP4A ceiling measured earlier): 365 tokens x
+  1.9 GMAC in 3.6 s. Little left without more int8 throughput.
+- **Decode is bandwidth-bound**: one token must stream ~1.6 GB of int8 weights (1.2 GB layers +
+  402 MB tied lm_head) -> 8.07 tok/s is ~13 GB/s, in line with what the LFM path sustains
+  (12.8 GB/s). Kernel launches are NOT the limit: a trivial launch costs 18.8 us, so ~600
+  launches/token = ~11 ms of the ~124 ms.
+- Next levers, in order of expected value: (1) keep weights in native Q4_0 (4.5 bits/value instead
+  of the 1 byte/value int8 planes) -> 1.8x less decode traffic and 0.85 GB instead of 1.5 GB
+  resident; (2) a decode-shaped attention kernel - the tiled QK/PV kernels process 64 query rows
+  per tile regardless, so at 365 tokens one query row still costs a whole tile, which is why decode
+  drops from 8.07 to 4.86 tok/s with context.

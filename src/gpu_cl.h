@@ -23,6 +23,7 @@ Buf alloc(size_t bytes);
 Buf upload(const void* src, size_t bytes);          // alloc + blocking copy (load-time constants)
 bool write(Buf b, const void* src, size_t bytes);   // non-blocking enqueue (src must stay valid until next read/finish)
 bool read(Buf b, void* dst, size_t bytes);
+bool read_at(Buf b, size_t off, void* dst, size_t bytes);   // read a byte range: block capture without a copy first
 bool copy(Buf dst, size_t dst_off, Buf src, size_t src_off, size_t bytes);   // device-side, enqueued          // blocking: the per-forward sync point
 bool finish();
 void release(Buf b);
@@ -54,6 +55,11 @@ bool op_qkv_post(Buf C, int rowc, int T, int nq, int nkv, int hd, Buf qw, Buf kw
 bool op_qkv_post_g4(Buf C, int rowc, int T, int nq, int nkv, int hd, Buf qw, Buf kw, Buf invf, Buf posx, Buf posy, float eps);
 // dense attention for one fully visible segment, any head dim multiple of 64 (<= 512), grouped-query; f32 out O[n][nq*hd]
 bool op_dense_attention_h(Buf C, int ldc, int qoff, int koff, int voff, int n, int nq, int nkv, int hd, float scale, Buf S, Buf O, int ldo, int window = -1, size_t s_floats = (size_t)1 << 62);   // S capacity in floats: queries are tiled to fit   // window > 0: keys with |i-j| >= window are masked (SWA)
+// One explicit query tile with the KV cache in a separate buffer: Q holds the chunk only (rows relative,
+// stride qld), K/V live in KV (row stride ldkv, K at koff, V at voff, rows = absolute positions). causal:
+// a query sees keys <= q0 + i; window > 0 is the SWA band. O gets the chunk's rows (stride ldo, relative).
+bool op_attn_split(Buf Q, int qld, Buf KV, int ldkv, int qoff, int koff, int voff, int n, int q0, int nr,
+                   int nq, int nkv, int hd, float scale, Buf S, Buf O, int ldo, int window, int causal);
 // ---- Gemma 4 audio conformer (see mm_gemma4a.cpp); all rows are f32 [T][cols], quantized outputs go to the shared int8 scratch
 bool op_a_norm_quant(Buf X, Buf w, bool do_rms, float lo, float hi, int T, int cols, float eps);   // [rms] [*w] clamp -> int8
 bool op_a_act_quant(Buf Y, int act, float olo, float ohi, float ilo, float ihi, int T, int cols);   // clamp [silu] clamp -> int8 (act 1 = silu)

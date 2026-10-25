@@ -232,6 +232,7 @@ int main(int argc, char** argv) {
         else if (a == "--prefix-cache-mb") so.prefix_cache_mb = atoi(next("--prefix-cache-mb"));
         else if (a == "--snapshot-dir") so.snapshot_dir = next("--snapshot-dir");
         else if (a == "--snapshot-mb") so.snapshot_mb = std::max(1, atoi(next("--snapshot-mb")));
+        else if (a == "--block-cache") so.block_cache = std::max(0, atoi(next("--block-cache")));
         else if (a == "--no-memory-check") so.no_memory_check = true;
         else if (a == "--no-prefix-tail") so.prefix_tail = false;
         else if (a == "--kv-dtype") { const std::string v = next("--kv-dtype"); if (v != "f32" && v != "int8" && v != "f16") { fprintf(stderr, "--kv-dtype must be f32, int8 or f16\n"); return 2; } so.kv_dtype = v == "int8" ? 1 : v == "f16" ? 2 : 0; }

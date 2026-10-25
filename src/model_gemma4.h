@@ -19,6 +19,8 @@
 
 namespace ferro {
 
+struct G4Gpu;                    // resident iGPU state (model_gemma4_gpu.cpp)
+
 struct G4Layer {
     bool swa = true;          // sliding-window layer (head_dim_swa) vs global (head_dim)
     bool own_kv = true;       // owns k/v projections + cache
@@ -26,11 +28,12 @@ struct G4Layer {
     int hd = 0;               // head dim for this layer (512 global, 256 swa)
     std::vector<float> attn_norm, q_norm, k_norm, post_attn_norm, ffn_norm, post_ffw_norm, post_norm, out_scale;
     WMat wq, wk, wv, wo, ffn_gate, ffn_up, ffn_down, inp_gate, proj;
+    WMat qkv, gateup;         // GPU path: fused [q|k|v] and [gate|up]; only gpu_slot is valid
 };
 
 struct Gemma4Model {
     int n_layer = 0, n_embd = 0, n_head = 0, n_kv = 1, n_vocab = 0, n_ff = 0, n_embd_pl = 0;
-    int swa_win = 512, n_kv_layers = 0, n_ctx_train = 0;
+    int swa_win = 512, n_kv_layers = 0, n_ctx_train = 0, ctx = 2048, hd_s = 256, hd_g = 512;
     float rms_eps = 1e-6f, softcap = 0.f, rope_base = 1e6f, rope_base_swa = 1e4f;
     int bos_id = 2, eos_id = 1;
     int stop_ids[4] = {1, -1, -1, -1};   // eos + end-of-turn
@@ -42,6 +45,9 @@ struct Gemma4Model {
     std::vector<G4Layer> L;
     const GGUFTensor* tok_embd_raw = nullptr;   // Q4_0 rows, dequantized on demand (embeddings)
     const GGUFTensor* ple_tok_raw = nullptr;    // Q4_0 rows [n_embd_pl*n_layer] per token
+    G4Gpu* gpu = nullptr;                       // resident iGPU forward state (null = CPU path)
+    bool g4_gpu_ok() const { return gpu_enabled; }
+    bool gpu_enabled = false;
     bool load(const std::string& path, int max_ctx, std::string* err);
 
     struct State {
@@ -51,8 +57,12 @@ struct Gemma4Model {
     void reset(State& s) const;
     // Run T tokens starting at position s.n, extend the caches, write [T][n_vocab] logits (may be null).
     bool forward(State& s, const int* ids, int T, float* logits, std::string* err);
+    bool upload_gpu(std::string* err);          // build fused weights + device buffers (needs gpu_enabled)
+    bool forward_gpu(State& s, const int* ids, int T, float* logits, std::string* err);
+    void free_gpu();
 };
 
 bool is_gemma4(const GgufFile& g);   // arch gemma4
+void g4_q4_0_row(const GgufFile& g, const GGUFTensor& t, int row, float* out);   // one Q4_0 row -> f32
 
 }  // namespace ferro

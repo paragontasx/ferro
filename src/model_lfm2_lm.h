@@ -6,6 +6,7 @@
 //   attn block:  q/k RMSNorm per head -> RoPE (neox) -> causal GQA attention over the KV cache
 // Per-sequence state: the last two `b*x` rows of every conv block + K/V of every attention block.
 #pragma once
+#include "block_store.h"
 #include "gguf.h"
 #include "kernels.h"
 #include <memory>
@@ -70,6 +71,12 @@ public:
     // Persist / reload a prefix snapshot through host memory (layout: per attention layer [K/V data][scales if int8], per conv layer 2*d floats; exactly
     // prefix_bytes(n) bytes). state_id() hashes what the state depends on (model file, KV dtype, kernel build): only equal ids may exchange snapshots.
     bool export_prefix(const LmPrefix& p, std::vector<uint8_t>* out) const;
+    // Capture one block of a live sequence: K/V rows [from,to) of every attention layer, then the conv state as it stands at
+    // s.n_past (so the caller passes to == s.n_past -- the conv state is only valid at the end of what has been computed).
+    // Layout is a prefix blob restricted to those rows: per attention layer [K/V][scales if int8], then per conv layer 2*d
+    // floats. Blocks of one chain therefore concatenate into a prefix blob, and a block costs O(block tokens) to capture
+    // instead of O(prefix), which is what makes block-granular caching affordable during a sliced prefill.
+    bool export_block(const LmSeq& s, int from, int to, std::vector<uint8_t>* kv, std::vector<uint8_t>* cst) const;
     std::shared_ptr<LmPrefix> import_prefix(int n_tokens, const uint8_t* data, size_t len) const;
     uint64_t state_id() const { return state_id_; }
     // Speculative decoding. verify(): for each sequence a window of tokens [last sampled, draft_1 .. draft_k] is run as k+1 decode rows with exactly the
@@ -95,6 +102,7 @@ public:
     std::shared_ptr<LmPrefix> snapshot(const LmSeq& s) const;
     bool restore(LmSeq& s, const LmPrefix& p) const;
     size_t prefix_bytes(int n_tokens) const;          // device bytes a snapshot of n_tokens takes
+    BlockGeom block_geom() const;                     // payload shape of one cache block (see block_store.h)
 
 private:
     LmModel m_;
