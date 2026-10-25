@@ -4,7 +4,7 @@
 usage: d1_parity.py MODEL.gguf [server_url] [extra ferro args...]
 Compares every probability / noul / score; prints max abs diff and top-answer agreement.
 """
-import json, subprocess, sys, urllib.request
+import json, os, subprocess, sys, urllib.request
 
 MODEL = sys.argv[1]
 URL = sys.argv[2] if len(sys.argv) > 2 else "http://127.0.0.1:8089"
@@ -114,7 +114,7 @@ for r in REQS:
         json.dump(cache, open(CACHE, "w"))
     ref.append(cache[h])
 open("/opt/data/cache/scratch/d1_req.json", "w").write(json.dumps(REQS))
-p = subprocess.run(["./ferro-embed", "decide", "--model", MODEL, "--request", "/opt/data/cache/scratch/d1_req.json"] + EXTRA,
+p = subprocess.run([os.environ.get("FERRO_BIN","./ferro-embed"), "decide", "--model", MODEL, "--request", "/opt/data/cache/scratch/d1_req.json"] + EXTRA,
                    capture_output=True, text=True)
 if p.returncode != 0:
     print(p.stderr); sys.exit(1)
@@ -137,7 +137,7 @@ print(f"\nSUMMARY: {len(REQS)} requests, token counts equal {tok_ok}/{len(REQS)}
 alone_worst = 0.0
 for i, r in enumerate(REQS):
     json.dump(r, open("/opt/data/cache/scratch/d1_one.json", "w"))
-    p1 = subprocess.run(["./ferro-embed", "decide", "--model", MODEL, "--request", "/opt/data/cache/scratch/d1_one.json"] + EXTRA,
+    p1 = subprocess.run([os.environ.get("FERRO_BIN","./ferro-embed"), "decide", "--model", MODEL, "--request", "/opt/data/cache/scratch/d1_one.json"] + EXTRA,
                         capture_output=True, text=True)
     one = json.loads(p1.stdout)
     fa, fb = flat(one), flat(got[i])
