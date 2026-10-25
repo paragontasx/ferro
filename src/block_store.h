@@ -1,15 +1,16 @@
-// block_store.h — block-granular prompt cache on local disk.
+// block_store.h — block-granular prompt cache on local disk, with an exact per-conversation tip.
 //
 // A prompt prefix is cut into fixed blocks of `blk` tokens. Each block is stored once, content-addressed by a hash chain:
-// block i's hash depends on block i-1's hash, so two conversations that share a system prompt share the physical blocks,
-// and a lookup costs O(prefix/blk) hashes instead of a comparison against every stored prefix.
+// block i's key depends on block i-1's key, so two conversations that share a system prompt share the physical blocks and
+// a hit can only be served for a prefix that really matches.
 //
-// A block holds the K/V rows of its own token range (per attention layer, with int8 scales) plus the conv state as it stood
-// at the end of the block. That conv state is why blocks are only taken at block boundaries: it is a rolling 2-timestep
-// value that cannot be reconstructed from the KV alone, so a chain may only be resumed where a block recorded it.
+// A block holds the K/V rows of its own token range (per attention layer, with int8 scales) and the conv state as it stood
+// at the end of that range. The conv state is a rolling 2-timestep value that cannot be reconstructed from K/V, so a chain
+// may only be resumed where a block recorded it — which is why blocks are only taken at block boundaries.
 //
-// Layout of a block's K/V payload is a prefix blob restricted to its own rows, so blocks of one chain concatenate (per
-// layer) into exactly what LmEngine::import_prefix expects. `blob_bytes()` is the assembled size for a chain of k blocks.
+// The tip closes the gap that leaves: the tokens between the last whole block and the exact end of a conversation (prompt
+// plus reply) are stored as one variable-length block, replaced on every turn. Without it a resumed conversation re-prefills
+// up to blk-1 tokens; with it, a continuation turn re-prefills only what the client actually added.
 #pragma once
 #include <condition_variable>
 #include <cstdint>
@@ -33,8 +34,9 @@ struct BlockGeom {
 class BlockStore {
 public:
     struct Entry {
-        std::vector<int> toks;                  // the stored prefix (a whole number of blocks)
-        std::vector<uint64_t> chain;            // one hash per block, deepest last
+        std::vector<int> toks;                  // the hit prefix, including the tip
+        std::vector<uint64_t> chain;            // one key per whole block, deepest last
+        int tip_len = 0;                        // tokens covered by the tip past the last whole block (0 = none)
         std::string path;
         int64_t mtime = 0;
         uint64_t bytes = 0;
@@ -45,16 +47,22 @@ public:
     bool open(const std::string& dir, uint64_t id, int blk, uint64_t budget_bytes, const BlockGeom& geom, std::string* err);
     int block() const { return blk_; }
     const BlockGeom& geom() const { return geom_; }
-    size_t blob_bytes(int n_tokens) const;                          // assembled prefix blob for n_tokens (multiple of blk)
-    // deepest stored prefix of `prompt` that is strictly shorter than `prompt` (false if none)
+    size_t blob_bytes(int n_tokens) const;                          // assembled prefix blob for n_tokens
+    // deepest stored prefix of `prompt` strictly shorter than `prompt`; extends past the last whole block when a tip matches
     bool longest(const std::vector<int>& prompt, Entry* out) const;
-    bool load(const Entry& e, std::vector<uint8_t>* blob) const;     // assemble the chain; false if a block is gone/corrupt
+    bool load(const Entry& e, std::vector<uint8_t>* blob) const;     // assemble chain + tip; false if a piece is gone/corrupt
     // store the block ending at `end` (a multiple of blk) of `prompt`; kv/cst come from LmEngine::export_block
     void save_async(const std::vector<int>& prompt, int end, std::vector<uint8_t>&& kv, std::vector<uint8_t>&& cst);
+    // store the exact end of `prompt` from `start` (the last whole block that actually exists) to `end`
+    void save_tip_async(const std::vector<int>& prompt, int start, int end, std::vector<uint8_t>&& kv, std::vector<uint8_t>&& cst);
+    // how many whole blocks of `prompt` are stored (multiple of blk); the depth a tip must hang off
+    int block_depth(const std::vector<int>& prompt) const;
     void touch(const Entry& e);
     bool has_chain(uint64_t chain) const;
     size_t entries() const;
+    size_t tips() const;
     uint64_t bytes() const;
+    uint64_t blocks_bytes() const;
     uint64_t saved() const { return n_saved_; }
     size_t loads() const { return n_loads_; }
     void flush();
@@ -62,9 +70,12 @@ public:
 
 private:
     struct Rec { std::string path; uint64_t bytes = 0; int64_t mtime = 0; uint64_t used = 0; int32_t n_tokens = 0; };
-    struct Job { std::vector<int> toks; int end = 0; uint64_t chain = 0, parent = 0; std::vector<uint8_t> kv, cst; };
+    struct Tip : Rec { uint64_t hash = 0; };
+    struct Job { std::vector<int> toks; int start = 0, end = 0; uint64_t chain = 0, parent = 0; bool tip = false;
+                 std::vector<uint8_t> kv, cst; };
     uint64_t chain_next(uint64_t parent, const int* toks, int n) const;
-    std::string path_for(uint64_t chain) const;
+    uint64_t chain_at(const std::vector<int>& prompt, int end) const;   // key of the last whole block before `end`
+    std::string path_for(uint64_t hash) const;
     void writer_loop();
     void enforce_budget_locked(const std::string& keep);
     bool read_block(const std::string& path, uint64_t chain, std::vector<uint8_t>* kv, std::vector<uint8_t>* cst, std::vector<int>* toks) const;
@@ -76,7 +87,8 @@ private:
     BlockGeom geom_;
     mutable size_t n_loads_ = 0;
     mutable std::mutex m_;
-    std::unordered_map<uint64_t, Rec> idx_;
+    std::unordered_map<uint64_t, Rec> idx_;          // whole blocks, by chain
+    std::unordered_map<uint64_t, Tip> tips_;         // parent chain -> the exact end of that conversation
     std::deque<Job> jobs_;
     std::condition_variable cv_, idle_cv_;
     bool stop_ = false, busy_ = false;

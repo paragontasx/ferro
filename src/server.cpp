@@ -348,6 +348,20 @@ static bool gen_token(Server& S, GenJob& j, int id) {
 }
 static void gen_finish(Server& S, const std::shared_ptr<GenJob>& jp, const char* err = nullptr, int status = 500) {
     GenJob& j = *jp;
+    // One tip per conversation: the exact end of prompt+reply, so the next turn of this conversation restores there instead of
+    // re-prefilling the stretch between the last whole block and where the conversation actually stopped. Captured before the
+    // slot is released, because that is the only moment the conv state for these tokens exists.
+    if (getenv("FERRO_TIP_DEBUG"))
+        fprintf(stderr, "[tip] n_past=%d hist=%zu cache_prompt=%d err=%d\n", j.seq.n_past, j.hist.size(), (int)j.cache_prompt, err != nullptr);
+    if (S.bstore && j.cache_prompt && !err && j.seq.n_past > 0 &&
+        (int)j.hist.size() >= j.seq.n_past && (int)j.hist.size() - j.seq.n_past <= 1) {   // stopping at max_tokens leaves the last token un-consumed
+        const int n = j.seq.n_past, base = S.bstore->block_depth(j.hist);
+        if (getenv("FERRO_TIP_DEBUG")) fprintf(stderr, "[tip] base=%d n=%d L=%d\n", base, n, n - base);
+        if (n > base) {
+            std::vector<uint8_t> kvb, cstb;
+            if (S.lm.export_block(j.seq, base, n, &kvb, &cstb)) S.bstore->save_tip_async(j.hist, base, n, std::move(kvb), std::move(cstb));
+        }
+    }
     S.lm.release(j.seq);
     if (!err && j.finish == "length" && j.in_think) fprintf(stderr, "[serve] warning: reply reached max_tokens inside the reasoning block (content is empty); raise max_tokens or set thinking_budget\n");
     j.gen_ms = ms_since(j.t_gen0);
@@ -936,9 +950,9 @@ static std::string health_json(Server& S) {
         double inflight; { std::lock_guard<std::mutex> g(S.mem_m); inflight = S.mem_inflight; }
         if (S.bstore) {                                                          // insert before the closing brace: position independent
             char sb[320];
-            snprintf(sb, sizeof sb, ",\"block_cache\":{\"block\":%d,\"entries\":%zu,\"mb\":%.1f,\"saved\":%llu,\"disk_hits\":%llu}",
+            snprintf(sb, sizeof sb, ",\"block_cache\":{\"block\":%d,\"entries\":%zu,\"mb\":%.1f,\"tips\":%zu,\"blocks_mb\":%.2f,\"tips_mb\":%.2f,\"saved\":%llu,\"disk_hits\":%llu}",
                      S.bstore->block(), S.bstore->entries(), S.bstore->bytes() / 1048576.0,
-                     (unsigned long long)S.bstore->saved(), (unsigned long long)S.bs_hits.load());
+                     S.bstore->tips(), S.bstore->blocks_bytes() / 1048576.0, (S.bstore->bytes() - S.bstore->blocks_bytes()) / 1048576.0, (unsigned long long)S.bstore->saved(), (unsigned long long)S.bs_hits.load());
             out.insert(out.size() - 1, sb);
         }
         const double lim = cgroup_limit_mb(), used = cgroup_used_mb();

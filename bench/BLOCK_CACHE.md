@@ -28,6 +28,24 @@ prompt therefore share the physical blocks, and a lookup costs `O(prefix / N)` h
 Body layout is a prefix blob restricted to the block's own rows, so blocks of one chain concatenate per layer into
 exactly what `LmEngine::import_prefix` already takes. No change to the restore path.
 
+### The tip: one exact end per conversation
+
+Blocks alone strand up to `blk-1` tokens. A conversation that stops at token 2,253 only has whole blocks up to 2,176, so the
+next turn re-prefills 77 tokens that never became a block. The tip is that stretch: one variable-length block, parented to
+the last block that actually exists, replaced on every turn (one per conversation).
+
+It is captured at the end of **generation**, not at the end of the prompt, so it covers prompt + reply. The next turn of the
+same conversation therefore restores to exactly where the model stopped and re-prefills only what the client added.
+
+Measured on a 2,270-token continuation turn after a restart (350M, greedy, same answer both ways):
+
+| | cached | re-prefilled | prefill |
+|---|---|---|---|
+| blocks only | 2,176 | 94 tokens | 442 ms |
+| with tip | 2,253 | **17 tokens** | **147 ms** |
+
+Cost: one tip per conversation, 1.9 MB here, overwritten each turn — versus 96 MB for a whole-prefix tail at this length.
+
 ### Why blocks are only taken at block boundaries
 
 The conv state is `bx(t-2), bx(t-1)` — a rolling 2-timestep value that is a function of the *whole* preceding prefix
@@ -55,6 +73,8 @@ therefore `O(prefix)`, not `O(prefix^2)`.
 | sibling conversation reuses shared blocks | 607 of 626 tokens cached, **0 new blocks written** |
 | sibling served from blocks == cold prefill | identical tokens |
 | storage, 6 growing turns | **15.4 MB vs 98.8 MB** whole-prefix = **6.41x** |
+| restart then continue the same conversation | 17 tokens re-prefilled instead of 94 (442 -> 147 ms) |
+| tip-served continuation == cold prefill | identical tokens |
 
 Per-block cost: 3.08 MB at N=128 (24.6 KB/token), i.e. blocks of one chain share nothing wasted.
 
@@ -80,6 +100,9 @@ Warm-path check: after a restart, a 1,938-token prompt with a 768-token chain re
 ## Where this could go next
 
 1. **Async prefetch**: the chain is matched before the slot is free, so the read could overlap the queue.
+2. **A hot tier is deliberately absent.** On this box (iGPU, unified memory) "device cache" and "RAM cache" are the same
+   physical memory, so a separate RAM tier is just a bigger `--prefix-cache-mb`; at 24 KB/token an exact 4k prefix costs
+   96 MB, so the hot tier holds ~1 entry either way. The tip is what makes that small tier sufficient.
 2. **Direct-to-device block writes**: apply blocks into the slot at their offsets instead of assembling a full host
    buffer (removes an `O(prefix)` copy; needs a `restore_range` on the engine).
 3. **TTL by traffic class** and an eviction policy that prefers leaves: evicting a mid-chain block truncates every

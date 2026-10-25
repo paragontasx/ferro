@@ -143,7 +143,7 @@ def main():
             settle(port, bc(port).get("saved", 0))
             h = bc(port)
             blocks, mb = h.get("entries", 0), h.get("mb", 0.0)
-            per_block = (mb * 2**20) / max(blocks, 1)
+            per_block = ((mb - h.get("tips_mb", 0.0)) * 2**20) / max(blocks, 1)
             per_tok = per_block / BLK
             unique = max(h.get("saved", 0), 1)
             naive = sum_tokens * per_tok
@@ -155,6 +155,34 @@ def main():
             print("  block-chained actually uses:       %.1f MB" % (actual / 2**20))
             print("  saving: %.2fx" % (naive / actual if actual else 0))
             check("storage grew with unique tokens, not with history", actual < naive * 0.75, "%.2fx" % (naive / actual if actual else 0))
+        finally:
+            stop(p)
+
+        # ---------------- 4. the tip: restart, then continue the same conversation ----------------
+        tipdir = os.path.join(tmp, "tip")
+        p = start(port, tipdir)
+        try:
+            a1, p1, _ = chat(port, convo(0, TURNS[0]))
+            settle(port, 1)
+            h1 = bc(port)
+            check("a tip is stored for the conversation", h1.get("tips", 0) >= 1, h1)
+        finally:
+            stop(p)
+        turn2 = convo(0, TURNS[0]) + [{"role": "assistant", "content": a1},
+                                      {"role": "user", "content": TURNS[1]}]
+        p = start(port, tipdir)                       # restart: only the disk tier survives
+        try:
+            c1, p2, cached = chat(port, turn2)
+            blockonly = (p1 - 1) // BLK * BLK
+            check("a continuation after a restart reuses the conversation end", cached > blockonly,
+                  "cached %d of %d (blocks alone would be %d, turn-1 prompt was %d)" % (cached, p2, blockonly, p1))
+        finally:
+            stop(p)
+        p = start(port, os.path.join(tmp, "tipcold"), block=0)
+        try:
+            d1, _, dcached = chat(port, turn2)
+            check("the tip-served continuation matches a cold prefill", c1 == d1, repr(c1[:60]) + " vs " + repr(d1[:60]))
+            check("(control) the cold server had no cache", dcached == 0, "cached=%d" % dcached)
         finally:
             stop(p)
     finally:
