@@ -29,6 +29,8 @@ def start(port, snapdir, block=BLK):
             "--snapshot-dir", snapdir, "--snapshot-mb", "512"]
     if block:
         args += ["--block-cache", str(block)]
+    if os.environ.get("FERRO_TEST_KV"):
+        args += ["--kv-dtype", os.environ["FERRO_TEST_KV"]]
     p = subprocess.Popen(args, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     for _ in range(900):
         try:
@@ -50,14 +52,19 @@ def stop(p):
 
 
 def chat(port, messages, n=24):
+    body = {"messages": messages, "max_tokens": n, "temperature": 0, "cache_prompt": True}
+    if os.environ.get("FERRO_TEST_NO_THINK"):
+        body["thinking_budget"] = 0          # a Thinking model's reply is <think>..</think>content: the echo cannot match
     req = urllib.request.Request("http://127.0.0.1:%d/v1/chat/completions" % port,
-                                 data=json.dumps({"messages": messages, "max_tokens": n, "temperature": 0,
-                                                  "cache_prompt": True}).encode(),
+                                 data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"})
     o = json.load(urllib.request.urlopen(req, timeout=300))
     u = o["usage"]
     cached = (u.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
-    return o["choices"][0]["message"]["content"], u["prompt_tokens"], cached
+    m = o["choices"][0]["message"]
+    # a Thinking model is still inside <think> at max_tokens=24, so content alone would compare empty == empty
+    txt = (m.get("reasoning_content") or "") + (m.get("content") or "")
+    return txt, u["prompt_tokens"], cached
 
 
 def bc(port):

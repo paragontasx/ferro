@@ -351,12 +351,15 @@ static void gen_finish(Server& S, const std::shared_ptr<GenJob>& jp, const char*
     // One tip per conversation: the exact end of prompt+reply, so the next turn of this conversation restores there instead of
     // re-prefilling the stretch between the last whole block and where the conversation actually stopped. Captured before the
     // slot is released, because that is the only moment the conv state for these tokens exists.
-    if (S.bstore && j.cache_prompt && !err && j.seq.n_past > 0 &&
-        (int)j.hist.size() >= j.seq.n_past && (int)j.hist.size() - j.seq.n_past <= 1) {   // stopping at max_tokens leaves the last token un-consumed
+    if (S.bstore && j.cache_prompt && !err && j.seq.n_past > 0 && (int)j.hist.size() >= j.seq.n_past) {
         const int n = j.seq.n_past, base = S.bstore->block_depth(j.hist);
         if (n > base) {
             std::vector<uint8_t> kvb, cstb;
-            if (S.lm.export_block(j.seq, base, n, &kvb, &cstb)) S.bstore->save_tip_async(j.hist, base, n, std::move(kvb), std::move(cstb));
+            const int B = S.bstore->block();
+            if (S.lm.export_block(j.seq, base, n, &kvb, &cstb)) {
+                if (n % B == 0 && base == n - B) S.bstore->save_async(j.hist, n, std::move(kvb), std::move(cstb));   // exactly one whole block
+                else S.bstore->save_tip_async(j.hist, base, n, std::move(kvb), std::move(cstb));
+            }
         }
     }
     if (j.seq.gpu_slot >= 0) S.lm.clear_captures(j.seq.gpu_slot);
@@ -436,8 +439,11 @@ static void gen_begin(Server& S, const std::shared_ptr<GenJob>& jp) {
                 std::vector<uint8_t> blob;
                 if (S.bstore->load(be, &blob)) {
                     if (auto px = S.lm.import_prefix((int)be.toks.size(), blob.data(), blob.size())) {
-                        pc_store(S, j.prompt, std::move(px), false); S.bstore->touch(be); S.bs_hits++;
-                        e = pc_longest(S, j.prompt);
+                        // A long prefix can exceed the device cache budget (a 15k-token prefix is ~360 MB against a 128 MB
+                        // default). That must not throw the restore away: cache it when it fits, otherwise use it once.
+                        if (px->bytes <= ((size_t)S.o.prefix_cache_mb << 20)) { pc_store(S, j.prompt, px, false); e = pc_longest(S, j.prompt); }
+                        else if (S.lm.restore(j.seq, *px)) { pos = px->n; S.pc_hits++; S.pc_saved += (uint64_t)pos; }
+                        S.bstore->touch(be); S.bs_hits++;
                     }
                 }
             }

@@ -104,6 +104,38 @@ removing the per-layer i915 `finish()` changed nothing, and skipping the block c
 Warm-path check: after a restart, a 1,938-token prompt with a 768-token chain restored prefilled 1,170 tokens in
 3,475 ms (337 tok/s), where a cold prefill of the full prompt is ~5,750 ms.
 
+## Long context: 15,013 tokens on the 350M (ctx 16384, fp32 KV)
+
+| | cold | warm, after a restart |
+|---|---|---|
+| prefill | 84,601 ms (177 tok/s) | **721 ms** |
+| tokens re-prefilled | 15,013 | **37** |
+| answer | identical | identical |
+
+Chain: 112 blocks, 345 MB on disk (3.08 MB per block, 24.6 KB/token), plus a tip. **117x faster to first token.**
+
+Two things this test surfaced that short prompts hide:
+
+- **The device prefix cache budget can be smaller than one prefix.** A 15k-token prefix is ~360 MB against a 128 MB
+  default `--prefix-cache-mb`, and the restore used to be dropped on that check, silently discarding a chain that had
+  just been read from disk. A prefix that does not fit the cache is now used once and not cached.
+- **The tail is not always one block.** When prefill and generation together leave a longer stretch uncaptured, the tip
+  absorbs all of it (observed at 1,829 tokens in one run). That is correct but costs disk: prefer a block size that
+  divides the usual conversation shape, or accept a bigger tip.
+
+For long contexts, set `--prefix-cache-mb` above the prefix size to keep a restored prefix reusable; otherwise each
+restore is a single use.
+
+## Known limitations
+
+- **The tip needs the client to echo the assistant turn back in the same token form.** With `LFM2.5-1.2B-Thinking`'s chat
+  template it does not fire: the reply is detokenised and re-tokenised on the way back, so the boundary no longer matches.
+  Blocks still restore (measured 512 tokens of 667) and the answer is bit-identical — the cost is up to `blk` tokens of
+  re-prefill per turn. `scripts/test_blocks.py` reports this case as a failure on that model; set
+  `FERRO_TEST_NO_THINK=1` when running it there.
+- Tested at 128-token blocks on the 350M (fp32 and int8) and the 1.2B (fp32); the 1.2B at 16k was not run (prefill is
+  4x slower per token, ~4 minutes per pass).
+
 ## Where this could go next
 
 1. **Async prefetch**: the chain is matched before the slot is free, so the read could overlap the queue.

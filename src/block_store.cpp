@@ -106,7 +106,7 @@ bool BlockStore::open(const std::string& dir, uint64_t id, int blk, uint64_t bud
                 if (!ok || std::memcmp(h.magic, kMagic, 8) || h.version != kVersion || h.state_id != id_ || h.blk != blk ||
                     h.n_layers != geom_.n_layers || h.row_bytes != geom_.row_bytes || h.scale_row_bytes != geom_.scale_row_bytes ||
                     h.n_conv != geom_.n_conv || h.conv_layer_bytes != geom_.conv_layer_bytes ||
-                    h.n_tokens <= 0 || h.n_tokens > 4 * blk) { ++bad; continue; }
+                    h.n_tokens <= 0 || h.n_tokens > 8 * blk) { ++bad; continue; }
                 struct stat st; if (stat(p.c_str(), &st) != 0) continue;
                 if (!h.is_tip) {
                     Rec r; r.path = p; r.bytes = (uint64_t)st.st_size; r.mtime = (int64_t)st.st_mtime; r.used = ++tick_; r.n_tokens = h.n_tokens;
@@ -245,7 +245,7 @@ void BlockStore::save_async(const std::vector<int>& prompt, int end, std::vector
 void BlockStore::save_tip_async(const std::vector<int>& prompt, int start, int end, std::vector<uint8_t>&& kv, std::vector<uint8_t>&& cst) {
     if (end <= 0 || end > (int)prompt.size() || start < 0 || start >= end) return;
     const int L = end - start;
-    if (L % blk_ == 0) return;                                  // lands on a boundary: a whole block covers it
+    if (L <= 0 || L > 8 * blk_) return;                          // a whole block is stored as a block; this is the exact end
     const size_t want_kv = (size_t)L * ((size_t)geom_.row_bytes + geom_.scale_row_bytes) * geom_.n_layers;
     if (kv.size() != want_kv || cst.size() != (size_t)geom_.n_conv * geom_.conv_layer_bytes) return;
     Job j;
