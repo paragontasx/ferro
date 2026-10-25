@@ -23,8 +23,8 @@ DP4A), with automatic CPU fallback. Three model kinds from the same binary, dete
 ![OpenAI--compatible](https://img.shields.io/badge/OpenAI--compatible-server-informational)
 ![no dependencies](https://img.shields.io/badge/runtime%20deps-none%20(libOpenCL%20dlopen'd)-lightgrey)
 
-**Why:** on a ~6 W N100 box, ferro beats llama.cpp's own iGPU backend by ~2x (measured 2.1-2.3x on
-embeddings and decisions), and 1.6-1.7x on agent-loop TTFT through its prefix cache — while keeping an
+**Why:** on a ~6 W N100 box, ferro beats llama.cpp's own iGPU (Vulkan) backend by ~2x — measured
+2.1-2.3x on embeddings and decisions and 1.4-2.3x on LFM2.5 generation — and 1.6-1.7x on agent-loop TTFT through its prefix cache — while keeping an
 exactness contract llama.cpp does not offer: a stream decodes identically alone or among any number of
 streams, speculative decoding is provably a no-op, and every number on this page is reproducible from
 [`bench/RESULTS.md`](bench/RESULTS.md) with the scripts in `scripts/`.
@@ -196,33 +196,36 @@ defaults are LiquidAI's recommended 0.05 / 50 / 1.05). Q8_0, F16, BF16 and F32 G
 Everything runs on the iGPU: Q8 weights stay device-resident, the KV cache (attention layers) and the 2-token conv state live in per-sequence
 device slots, prefill uses a causal tiled attention kernel, decode batches one token of every active sequence into a single pass
 (split-K GEMV for the 1-4 token GEMMs, one-query-per-row attention over the cache). Measured on the N100 (Q8_0, same file as llama.cpp),
-ferro on its default GPU stack — Intel NEO/compute-runtime, `FERRO_GPU_DRIVER=neo` (Mesa rusticl remains a one-variable fallback):
+both engines on the same iGPU, ferro on its default GPU stack — Intel NEO/compute-runtime, `FERRO_GPU_DRIVER=neo` (Mesa rusticl remains a
+one-variable fallback); llama.cpp = its Vulkan backend, this repo's pinned baseline build (`baselines/llama.cpp/build-vk`,
+`-ngl 99`, `GGML_VK_VISIBLE_DEVICES=0`), re-measured 2026-10-25:
 
-| LFM2.5-1.2B-Thinking Q8_0 | ferro iGPU (2026-10-25) | llama.cpp CPU, 2 threads (2026-10-20) |
-|---|---|---|
-| prefill, 784 tokens | **222 tok/s** | 11.2 tok/s (**19.8×**) |
-| prefill, 3,626 tokens | **143 tok/s** | not measured |
-| decode, 1 stream, short ctx | **21 tok/s** | 6.1 tok/s (**3.4×**) |
-| decode, 1 stream, @ 3.6k ctx | **15.5 tok/s** | not measured |
-| decode, aggregate over 2 / 4 streams (server) | 22 / 35 tok/s (2026-10-20) | |
+| LFM2.5-1.2B-Thinking Q8_0 | ferro iGPU | llama.cpp Vulkan (same iGPU) | speedup |
+|---|---|---|---|
+| prefill, 784 tokens | **222 tok/s** | 124 tok/s | **1.79×** |
+| prefill, 3,626 tokens | **143 tok/s** | 105 tok/s | **1.37×** |
+| decode, 1 stream, short ctx | **21 tok/s** | 10.6 tok/s | **2.00×** |
+| decode, 1 stream, @ 3.6k ctx | **15.5 tok/s** | 10.4 tok/s | **1.48×** |
+| decode, aggregate over 2 / 4 streams (server) | 22 / 35 tok/s (2026-10-20) | | |
 
 **LFM2.5-350M** (`LiquidAI/LFM2.5-350M-GGUF`, Q8_0, same code path, no model-specific changes) measured the same way:
 
-| LFM2.5-350M Q8_0 | ferro iGPU (2026-10-25) | llama.cpp CPU, 2 threads (2026-10-20) |
-|---|---|---|
-| prefill, 784 tokens | **748 tok/s** | 66.7 tok/s (**11.2×**) |
-| prefill, 3,626 tokens | **488 tok/s** | not measured |
-| decode, 1 stream, short ctx | **57 tok/s** | 31.8 tok/s (**1.8×**) |
-| decode, 1 stream, @ 3.6k ctx | **36.5 tok/s** | not measured |
-| decode, aggregate over 2 / 4 / 8 streams (server) | 58 / 98 / 132 tok/s (2026-10-20) | |
+| LFM2.5-350M Q8_0 | ferro iGPU | llama.cpp Vulkan (same iGPU) | speedup |
+|---|---|---|---|
+| prefill, 784 tokens | **748 tok/s** | 368 tok/s | **2.03×** |
+| prefill, 3,626 tokens | **488 tok/s** | 283 tok/s | **1.73×** |
+| decode, 1 stream, short ctx | **57 tok/s** | 24.7 tok/s | **2.30×** |
+| decode, 1 stream, @ 3.6k ctx | **36.5 tok/s** | 25.3 tok/s | **1.44×** |
+| decode, aggregate over 2 / 4 / 8 streams (server) | 58 / 98 / 132 tok/s (2026-10-20) | | |
 
-The llama.cpp CPU column was measured on 2026-10-20 and is kept as-is — llama.cpp has not been re-run since, so those are the same
-numbers a reader can reproduce with the pinned build; the ferro column was re-measured on 2026-10-25 on the same box, single tenant.
-The jump over the previous ferro column (1.2B prefill 153→222 tok/s, decode 15-19→21; 350M decode 36-37→57, prefill 490→748) comes from
-switching the GPU driver stack from Mesa rusticl to Intel's NEO/compute-runtime and from two kernel fixes in the prefill attention path:
-a `KT5` key-chunk retune and a `#pragma unroll 8` on the QK inner loop (full unroll had pushed the query vector into 64 GRF/lane, which
-sat exactly at the 128-register limit and spilled under Intel's compiler). Per-driver and per-kernel numbers: `bench/RESULTS.md`,
-2026-10-24/25 entries.
+Both rows measured 2026-10-25 on the same box, single tenant, same GGUF files, same 784/3,626-token prompts; llama.cpp via `llama-bench`
+(pp/tg), ferro via its own summary counters, 32 greedy tokens for the decode numbers. Against llama.cpp **CPU** (2 threads, measured
+2026-10-20, kept from earlier runs — the iGPU is the point of this page) the same ferro numbers are 11.2× / 19.8× prefill and 1.8× / 3.4×
+decode for 350M / 1.2B. The jump over the previous ferro numbers (1.2B prefill 153→222 tok/s, decode 15-19→21; 350M decode 36-37→57,
+prefill 490→748) comes from switching the GPU driver stack from Mesa rusticl to Intel's NEO/compute-runtime and from two kernel fixes in
+the prefill attention path: a `KT5` key-chunk retune and a `#pragma unroll 8` on the QK inner loop (full unroll had pushed the query
+vector into 64 GRF/lane, which sat exactly at the 128-register limit and spilled under Intel's compiler). Per-driver and per-kernel
+numbers: `bench/RESULTS.md`, 2026-10-24/25 entries.
 
 **Long-context decode, old vs new binary** (2026-10-22, same file: 64 tokens greedy, `FERRO_LM_STEPTIME`,
 median of the 64 steps, nothing else running; "old" predates split-K attention and the pool fix; the
