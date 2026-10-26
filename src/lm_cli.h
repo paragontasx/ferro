@@ -10,6 +10,7 @@ struct GenArgs {
     int n_predict = 256, ctx = 8192, threads = 2;
     SamplerParams sp;
     bool raw = false;          // --prompt is tokenized as given (BOS prepended) instead of being wrapped in the chat template
+    bool think = true;         // Gemma 4: emit the <|think|> marker in the system turn (--no-think drops it)
     bool print_ids = false;    // list prompt + generated token ids on stderr
     bool quiet = false;        // no streamed text on stdout
     bool gpu = true;

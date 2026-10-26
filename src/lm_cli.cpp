@@ -16,8 +16,54 @@
 
 namespace ferro {
 
-// Gemma 4 one-shot generation (CPU reference path). The chat format is the model's own
-// <start_of_turn>/<end_of_turn> convention; --raw sends the prompt verbatim after <bos>.
+// Gemma 4 chat rendering, exactly as the model's own template produces it (verified against
+// llama.cpp's /apply-template endpoint on the same GGUF, and token-for-token against /tokenize):
+//
+//   thinking on  -> "<|turn>system\n<|think|>\n{sys}<turn|>\n"   (emitted even with no system text)
+//   thinking off -> system turn only when {sys} is non-empty, without <|think|>
+//   each message -> "<|turn>{role}\n{content}<turn|>\n"          (assistant renders as "model")
+//   generation   -> "<|turn>model\n"
+//
+// Gemma 4 is NOT the Gemma-2/3 <start_of_turn> format; using that silently degrades instruction
+// following because the model never sees a valid system turn. The tokenizer sets
+// tokenizer.ggml.add_bos_token = true, so <bos> (id 2) leads every prompt.
+static std::string g4_role(const Json& m) {
+    const Json* r = m.find("role");
+    return (r && r->is_string()) ? r->s : std::string("user");
+}
+
+static std::string g4_content(const Json& m) {
+    const Json* c = m.find("content");
+    if (!c) return std::string();
+    if (c->is_string()) return c->s;
+    std::string out;                                    // OpenAI-style parts: keep the text parts
+    if (c->is_array())
+        for (const Json& p : c->arr) { const Json* t = p.find("text"); if (t && t->is_string()) out += t->s; }
+    return out;
+}
+
+static std::string g4_render(const Json* msgs, const std::string& sys_in, bool think, const std::string& user_in) {
+    std::string sys = sys_in, body;
+    size_t first = 0;
+    if (msgs && msgs->is_array() && !msgs->arr.empty()) {
+        const std::string r0 = g4_role(msgs->arr[0]);
+        if (sys.empty() && (r0 == "system" || r0 == "developer")) { sys = g4_content(msgs->arr[0]); first = 1; }
+        for (size_t i = first; i < msgs->arr.size(); ++i) {
+            std::string r = g4_role(msgs->arr[i]);
+            if (r == "assistant") r = "model";
+            if (r == "tool" || r == "function") continue;   // tool turns need the template's parameter helper
+            body += "<|turn>" + r + "\n" + g4_content(msgs->arr[i]) + "<turn|>\n";
+        }
+    } else {
+        body = "<|turn>user\n" + user_in + "<turn|>\n";
+    }
+    std::string t;
+    if (think || !sys.empty())
+        t = "<|turn>system\n" + std::string(think ? "<|think|>\n" : "") + sys + "<turn|>\n";
+    return t + body + "<|turn>model\n";
+}
+
+// Gemma 4 one-shot generation. --raw sends the prompt verbatim after <bos> (parity tooling).
 static int run_generate_gemma4(const GenArgs& a) {
     using clk = std::chrono::steady_clock;
     auto secs = [](clk::time_point t) { return std::chrono::duration<double>(clk::now() - t).count(); };
@@ -46,9 +92,22 @@ static int run_generate_gemma4(const GenArgs& a) {
         }
         return 0;
     }
-    if (a.raw) text = a.prompt;
+    if (a.raw) text = "<bos>" + a.prompt;
     else {
-        text = "<bos><start_of_turn>user\n" + a.prompt + "<end_of_turn>\n<start_of_turn>model\n";
+        Json body; const Json* msgs = nullptr;
+        if (!a.messages_file.empty()) {
+            std::ifstream f(a.messages_file);
+            if (!f) { fprintf(stderr, "cannot read %s\n", a.messages_file.c_str()); return 1; }
+            std::stringstream ss; ss << f.rdbuf();
+            try { body = json_parse(ss.str()); } catch (const std::exception& e) {
+                fprintf(stderr, "--messages: %s\n", e.what()); return 1;
+            }
+            msgs = body.is_array() ? &body : body.find("messages");
+            if (!msgs || !msgs->is_array()) {
+                fprintf(stderr, "--messages file must be an array of messages or an object with \"messages\"\n"); return 1;
+            }
+        }
+        text = "<bos>" + g4_render(msgs, a.system, a.think, a.prompt);
     }
     std::vector<int> ids = tok.tokenize(text, true);
     if (a.print_ids) { fprintf(stderr, "prompt ids (%zu):", ids.size()); for (int i : ids) fprintf(stderr, " %d", i); fprintf(stderr, "\n"); }

@@ -771,3 +771,31 @@ bytes gives 1.8x" reading was wrong. A single token at T=1 runs the small-T kern
 DP4A rate the same kernels reach when 128 rows share the launch - so the decode lever is *more work
 per launch* (fusion, larger T), not fewer bytes. Numerics were verified exact before the perf run
 (top-1/2/3 logits identical to int8 on both probe prompts), so this is purely a speed verdict.
+
+### Gemma 4 chat path: template corrected, token-identical to llama.cpp (2026-10-26)
+
+The CLI chat path had been emitting Gemma-2/3 markers `<start_of_turn>`/`<end_of_turn>`. Gemma 4's own
+template is `<|turn>` / `<turn|>` with a system turn that carries `<|think|>` when thinking is enabled.
+The earlier parity run used raw prompts, so nothing caught it; the model was being fed a prompt it was
+never trained on.
+
+Rendering now matches llama.cpp's `/apply-template` byte for byte, and `scripts/gemma4_template_check.py`
+compares **prompt token ids** against `/tokenize` for six cases:
+
+| case | tokens | verdict |
+|---|---|---|
+| user only | 17 | PASS |
+| system + user | 20 | PASS |
+| multi-turn (user/assistant/user) | 29 | PASS |
+| thinking off (`--no-think`) | 10 | PASS |
+| thinking off + system | 18 | PASS |
+| Unicode + newlines | 23 | PASS |
+
+Next-token distribution on a real chat prompt (CPU row-domain int8, llama.cpp same GGUF):
+
+- top-1 agrees (token 100, p = 0.9618 ferro vs 0.9590 llama), top-2 also agrees (236770)
+- **TV over llama's top-5 = 0.0029**, mean |dlogp| 0.25
+
+Greedy decoding of the same messages agrees through the `<|channel>thought` opener and then diverges at
+the first stylistic token, which is the expected behaviour at that TV distance (`scripts/gemma4_e2e_check.py`).
+`serve` rejects a Gemma 4 GGUF at startup with a pointer to `generate` instead of mis-loading it.

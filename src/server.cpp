@@ -17,6 +17,7 @@
 #include "embed_mm.h"
 #include "chat_template.h"
 #include "json.h"
+#include "model_gemma4.h"
 #include "model_lfm2_lm.h"
 #include "sampler.h"
 #include "threadpool.h"
@@ -719,7 +720,17 @@ static void worker_loop(Server& S, std::promise<std::string>& ready) {
         std::string err;
         if (S.has_emb && !S.me.init(S.o.model, S.o.mmproj, S.o.threads, &err)) { ready.set_value(err.empty() ? "embedding model init failed" : err); return; }
         if (S.has_lm) {
-            if (!S.lm.init(S.o.lm, S.o.threads, S.o.lm_ctx, &err, S.o.lm_slots, S.o.kv_dtype)) { ready.set_value(err.empty() ? "language model init failed" : "language model: " + err); return; }
+            {   // arch gate: the HTTP path is built around LmEngine's slots/batching/spec-decode, so a
+        // Gemma 4 GGUF must be rejected with an actionable message instead of LmEngine's generic
+        // "not a causal LFM2 language model".
+        GgufFile probe; std::string perr;
+        if (probe.open_file(S.o.lm.c_str(), &perr) && is_gemma4(probe)) {
+            ready.set_value("gemma 4 is supported by `ferro-embed generate --lm <gguf>` (chat template, "
+                            "--messages, --system, --no-think); `serve` currently requires an lfm2 model");
+            return;
+        }
+    }
+    if (!S.lm.init(S.o.lm, S.o.threads, S.o.lm_ctx, &err, S.o.lm_slots, S.o.kv_dtype)) { ready.set_value(err.empty() ? "language model init failed" : "language model: " + err); return; }
             if (!S.ltok.load(S.lm.model().gguf, &err)) { ready.set_value("language model tokenizer: " + err); return; }
             S.chat_opt.typed_content = lfm_template_is_typed(S.lm.model().gguf.get_str("tokenizer.chat_template"));
             S.think_open = S.ltok.token_id("<think>"); S.think_close = S.ltok.token_id("</think>"); S.eos_id = S.lm.model().eos_id;

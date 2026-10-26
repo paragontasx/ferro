@@ -260,19 +260,41 @@ Fusion / timing-experiment knobs: `FERRO_LM_FUSE=0` (unfused launches), `=2` (op
 `unsloth/gemma-4-E2B-it-qat-GGUF:UD-Q4_K_XL` (arch `gemma4`) runs natively, text path: 35 layers,
 hybrid sliding-window(512)/global attention (global every fifth layer), 8:1 MQA with head dim 512
 global / 256 SWA, per-head q/k RMSNorm, weightless V RMSNorm, proportional RoPE, Per-Layer Embeddings
-(PLE), layer output scales, logits softcap 30, tied LM head, and the model's `<start_of_turn>` chat
-template with `<turn|>` as the end-of-turn stop token. Q4_0 weights are repacked to int8 planes on
-load (no f32 round trip).
+(PLE), layer output scales, logits softcap 30, tied LM head, and the model's own chat template.
+Q4_0 weights are repacked to int8 planes on load (no f32 round trip).
+
+**The chat format is Gemma 4's `<|turn>` / `<turn|>`, not Gemma-2/3's `<start_of_turn>`.** Thinking is
+on by default, so every prompt carries a system turn with `<|think|>`:
+
+```
+<bos><|turn>system\n<|think|>\n{system}<turn|>\n<|turn>user\n{text}<turn|>\n<|turn>model\n
+```
+
 ```sh
 ./ferro-embed generate --lm models/gemma4/gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf \
   --prompt "Name the three primary colors." --n-predict 64 --temp 0
+
+# multi-turn / system prompt / thinking control
+./ferro-embed generate --lm models/gemma4/gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf \
+  --messages chat.json --system "Answer in one short line." --no-think --temp 0
 ```
-Validated against llama.cpp on the same GGUF: `scripts/gemma4_parity.py` (6/6 next-token top-1
-agreement, mean total-variation 0.044) and `scripts/g4_diff.py`, which diffs per-layer hidden states
-against llama.cpp graph dumps. Measured on the N100 CPU path (int8 row-domain GEMMs): 4.2 tok/s
-prefill and 3.5 tok/s decode on a 365-token prompt. The iGPU path (`FERRO_LM_GPU=1`) uploads the
-weights with DP4A but currently syncs per GEMM, which is slower than the CPU for decode (18.9 tok/s
-prefill, 0.85 tok/s decode on NEO) — the resident single-sync forward is the next step.
+
+Validated against llama.cpp on the same GGUF:
+
+- `scripts/gemma4_template_check.py` — renders six chat cases (user-only, system, multi-turn,
+  thinking off, thinking off + system, Unicode/newlines) and compares the **prompt token ids** against
+  llama.cpp's `/apply-template` + `/tokenize`. 6/6 byte-identical, so the model sees exactly the prompt
+  llama.cpp would give it.
+- `scripts/gemma4_parity.py` — 6/6 next-token top-1 agreement, mean total-variation 0.044 (CPU row-domain
+  int8) / 0.030 (per-32-block int8), and `scripts/g4_diff.py` diffs per-layer hidden states against
+  llama.cpp graph dumps.
+- `scripts/gemma4_e2e_check.py` — same messages, greedy decoding on both sides: identical through the
+  `<|channel>thought` opener, then divergence at the first stylistic token, which is what a 0.03 TV
+  distance predicts.
+
+`serve` does not take Gemma 4 yet: the HTTP path is built around `LmEngine`'s slots, batching and
+speculative decoding, and a Gemma 4 GGUF is rejected at startup with a pointer to `generate` rather
+than being silently mis-loaded. The CLI path is the validated one.
 
 ## Serving over HTTP (`ferro-embed serve`)
 One resident process, OpenAI-compatible, embeddings and/or language model and/or the d1 decision model on the same iGPU (one worker thread owns the device):

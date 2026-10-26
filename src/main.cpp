@@ -36,8 +36,9 @@ static void usage() {
         "       ferro-embed decide --model D1.gguf --request req.json|- [--mmproj P.gguf] [--out f] [--threads N] [--reps R] [--cpu|--gpu]\n"
         "       ferro-embed embed-media --model EG2.gguf [--mmproj P.gguf] --item text:STR|image:F|audio:F|video:F ... [--fps N] [--out f.bin]\n"
         "                   (multimodal EmbeddingGemma 2: items are interleaved in order into one 768-d embedding; vision/audio encoders on the iGPU)\n"
-        "       ferro-embed generate --lm LFM2.5.gguf (--prompt TEXT | --messages f.json) [--n-predict N] [--temp T] [--top-k K] [--rep-penalty P] [--seed S]\n"
-        "                   (text generation with an LFM2 / LFM2.5 model, e.g. LFM2.5-1.2B-Thinking; chat template + sampler built in)\n"
+        "       ferro-embed generate --lm LFM2.5.gguf|gemma-4-E2B.gguf (--prompt TEXT | --messages f.json) [--system S] [--no-think] [--raw] [--n-predict N] [--temp T] [--top-k K] [--rep-penalty P] [--seed S]\n"
+        "                   (text generation with an LFM2/LFM2.5 or Gemma 4 model; chat template + sampler built in.\n"
+        "                    Gemma 4 uses its own <|turn>/<turn|> template with a <|think|> system turn unless --no-think)\n"
         "       ferro-embed serve [--model EG2.gguf [--mmproj P.gguf]] [--lm LFM2.5.gguf [--lm-ctx N] [--lm-slots N] [--prefix-cache-mb N] [--snapshot-dir D [--snapshot-mb N]] [--api-key K]... [--api-key-file F] [--metrics-open] [--no-memory-check] [--kv-dtype f32|int8|f16] [--spec-draft N] [--thinking-budget N] [--prefill-slice-ms N] [--decode-share N] [--reasoning-format deepseek|none] [--repeat-penalty P] [--repeat-last-n N] [--penalty-scope all|generated] [--no-prefix-tail]] [--d1 d1-omni.gguf [--d1-mmproj P.gguf]] [--host H] [--port P] [--api-key K]\n"
         "       (old form follows)  ferro-embed serve --model EG2.gguf [--mmproj P.gguf] [--host H] [--port N] [--api-key K] [--max-batch-tokens N] [--batch-wait-ms N]\n"
         "                   (resident OpenAI-compatible server: POST /v1/embeddings with text / image_url / input_audio / video_url parts, GET /v1/models, GET /health)\n"
@@ -260,6 +261,7 @@ int main(int argc, char** argv) {
         else if (a == "--rep-penalty") ga.sp.repetition_penalty = (float)atof(next("--rep-penalty"));
         else if (a == "--seed") ga.sp.seed = (uint64_t)atoll(next("--seed"));
         else if (a == "--raw") ga.raw = true;
+        else if (a == "--no-think") ga.think = false;
         else if (a == "--print-ids") ga.print_ids = true;
         else if (a == "--quiet") ga.quiet = true;
         else if (a == "--dump-logits") ga.dump_logits = next("--dump-logits");
