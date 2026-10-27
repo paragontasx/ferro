@@ -1914,6 +1914,7 @@ static cl_program g_prog_ds = nullptr;                    // split-K decode atte
 static cl_kernel k_lmds = nullptr, k_lmdsq = nullptr, k_lmdm = nullptr;
 static cl_kernel k_lmkvf = nullptr, k_lmpff = nullptr, k_lmdsf = nullptr;   // fp16 KV variants (same program)
 static bool build_split_attn(bool verbose);
+static bool build_g4_dec(bool verbose);
 static std::vector<Slot> g_slots;
 static size_t g_bytes = 0;
 static cl_mem g_Xp = nullptr, g_Xs = nullptr;           // quantized-activation scratch
@@ -1990,6 +1991,7 @@ bool init(bool verbose) {
         {&k_siluq, "silu_mul_q8"}, {&k_bactq, "bias_act_q8"}, {&k_badd, "bias_add"}, {&k_score, "score_out"}, {&k_attq4, "attention_q4"}, {&k_attq5, "attention_q5"}, {&k_quantq, "quant_q3"}, {&k_lngq, "ln_gather_q3"}, {&k_dqk, "dattn_qk"}, {&k_dsm, "dattn_stats"}, {&k_dpv, "dattn_pv"}};
     for (auto& k : ks) { *k.k = cl.clCreateKernel(g_prog, k.n, &err); CK(err); }
     build_split_attn(verbose);                            // optional: when it fails, decode attention stays on the per-head kernels
+    build_g4_dec(verbose);                                // optional: gemma4 decode-shape attention (E1)
     g_ok = true;
     if (verbose) fprintf(stderr, "[gpu] %s ready (int8 DP4A GEMM TT=%d KB=%d, on-device layer loop)\n",
                          g_name.c_str(), FERRO_GPU_TT, FERRO_GPU_KB);
@@ -2262,6 +2264,149 @@ bool op_qkv_post_g4(Buf C, int rowc, int T, int nq, int nkv, int hd, Buf qw, Buf
     return launch(k_qkvg4, 2, g, l);
 }
 
+// g4 decode-shape attention (E1): one WG per (head, key-split); no 64-row tile waste. Own program so a
+// build failure leaves the tiled dattn_* path in charge. The WG stages 16 K rows at a time into local
+// memory, 16 lanes per key run the exact hd/4 float4 dot, online softmax stays in local sm, then the V
+// pass streams rows coalesced (float4 per lane); a merge kernel combines the per-split (acc, m, l).
+static const char* kSrcG4d = R"CL(
+#define G4D_SKL 128
+#define G4D_HD 512
+inline float g4d_wg_add(float v, __local float* red) {
+  const int lid = get_local_id(1) * 16 + get_local_id(0);   // true 2D linear id (WG is 16x16)
+  red[lid] = v;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (int s = 128; s > 0; s >>= 1) {
+    if (lid < s) red[lid] += red[lid + s];
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  const float r = red[0];
+  barrier(CLK_LOCAL_MEM_FENCE);
+  return r;
+}
+inline float g4d_wg_max(float v, __local float* red) {
+  const int lid = get_local_id(1) * 16 + get_local_id(0);   // true 2D linear id (WG is 16x16)
+  red[lid] = v;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (int s = 128; s > 0; s >>= 1) {
+    if (lid < s) red[lid] = fmax(red[lid], red[lid + s]);
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  const float r = red[0];
+  barrier(CLK_LOCAL_MEM_FENCE);
+  return r;
+}
+__kernel void g4_attn_dec(__global const float* Q, __global const float* KV, int ldkv, int qoff, int koff, int voff,
+                          int n, int q0, int hd, int grp, float sl2, int window, int klen,
+                          __global float* P, int nsl) {
+  __local float Qs[G4D_HD];
+  __local float sm[G4D_SKL];
+  __local float lr[256];
+  __local float pva[2 * G4D_HD];
+  __local float red[256];
+  const int h = get_group_id(0), s = get_group_id(1);
+  const int tx = get_local_id(0), ty = get_local_id(1), lid = ty * 16 + tx;   // true 2D 16x16 WG, like the production dattn tiles
+  const int kvh = h / grp;
+  const int kbeg = window > 0 ? max(0, q0 - window + 1) : 0;
+  const int kend = min(n, q0 + 1);
+  const int j0 = kbeg + s * klen;
+  const int kn = max(0, min(klen, kend - j0));
+  __global float* P0 = P + (size_t)(h * nsl + s) * (G4D_HD + 4);
+  if (kn == 0) { if (lid == 0) { P0[G4D_HD] = -1e30f; P0[G4D_HD + 1] = 0.f; } return; }
+  const int hq4 = hd >> 2;
+  if (tx == 0) {                                             // stage q*sl2 (NEO-safe local pattern): 16 lanes x hq4/16 contiguous float4 slices
+    for (int i4 = 0; i4 < hq4 / 16; ++i4) {
+      const int f4 = ty * (hq4 / 16) + i4;
+      const float4 q = vload4(0, Q + qoff + h * hd + f4 * 4) * (float4)(sl2);
+      __local float* d = Qs + f4 * 4;
+      d[0] = q.x; d[1] = q.y; d[2] = q.z; d[3] = q.w;
+    }
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  float mm = -1e30f;
+  for (int b = 0; b < kn; b += 16) {
+    const int nb = min(16, kn - b);
+    float v = 0.f;                                           // key tx streams its K row straight from global; dims ty,ty+16,..
+    if (tx < nb) {
+      const __global float* kr = KV + (size_t)(j0 + b + tx) * ldkv + koff + kvh * hd;
+      for (int t = 0; t < hq4 / 16; ++t) {
+        const float4 k4 = vload4(0, kr + (ty + 16 * t) * 4);
+        const float4 q4 = vload4(0, Qs + (ty + 16 * t) * 4);
+        v += q4.x * k4.x + q4.y * k4.y + q4.z * k4.z + q4.w * k4.w;
+      }
+    }
+    lr[lid] = v;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (ty == 0 && tx < nb) {                                // one lane per valid key folds its 16 dim-partials
+      float sv = 0.f;
+      for (int t = 0; t < 16; ++t) sv += lr[t * 16 + tx];
+      sm[b + tx] = sv;
+      mm = fmax(mm, sv);
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);                            // leaders must finish reading lr before it is rewritten
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  const float m = g4d_wg_max(mm, red);
+  float lp = 0.f;
+  for (int j = lid; j < kn; j += 256) { const float e2 = native_exp2(sm[j] - m); sm[j] = e2; lp += e2; }
+  const float ls = g4d_wg_add(lp, red);
+  const int c4 = lid % hq4, kh = lid / hq4, nh = 256 / hq4;  // V: hq4 float4 columns x nh key halves, coalesced rows
+  float4 acc = (float4)(0.f);
+  for (int j = kh; j < kn; j += nh)
+    acc = mad((float4)(sm[j]), vload4(0, KV + (size_t)(j0 + j) * ldkv + voff + kvh * hd + c4 * 4), acc);
+  { __local float* pv = pva + kh * hd + c4 * 4;
+    pv[0] = acc.x; pv[1] = acc.y; pv[2] = acc.z; pv[3] = acc.w; }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  if (kh == 0) {
+    float4 a2 = acc;
+    for (int hh = 1; hh < nh; ++hh) { const __local float* pv1 = pva + hh * hd + c4 * 4;
+      a2.x += pv1[0]; a2.y += pv1[1]; a2.z += pv1[2]; a2.w += pv1[3]; }
+    __global float* pd = P0 + c4 * 4;
+    pd[0] = a2.x; pd[1] = a2.y; pd[2] = a2.z; pd[3] = a2.w;
+    if (lid == 0) { P0[G4D_HD] = m; P0[G4D_HD + 1] = ls; }
+  }
+}
+__kernel void g4_attn_dec_m(__global const float* P, int nsl, int hd, __global float* O, int ldo) {
+  const int h = get_group_id(0), lid = get_local_id(0);
+  const int hq4 = hd >> 2;
+  if (lid >= hq4) return;
+  const __global float* Ph = P + (size_t)h * nsl * (G4D_HD + 4);
+  float m = -1e30f;
+  for (int s = 0; s < nsl; ++s) m = fmax(m, Ph[s * (G4D_HD + 4) + G4D_HD]);
+  float4 acc = (float4)(0.f);
+  float l = 0.f;
+  for (int s = 0; s < nsl; ++s) {
+    const __global float* Ps = Ph + s * (G4D_HD + 4);
+    const float ms = Ps[G4D_HD];
+    if (ms <= -1e29f) continue;
+    const float w = native_exp2(ms - m);
+    const float4 v4 = vload4(0, Ps + lid * 4);
+    acc = mad((float4)(w), v4, acc);
+    l += w * Ps[G4D_HD + 1];
+  }
+  float4* o = (float4*)(O + (size_t)h * hd);
+  o[lid] = acc * (float4)(l > 0.f ? 1.0f / l : 0.f);
+}
+)CL";
+static cl_program g_prog_g4d = nullptr;
+static cl_kernel k_g4dec = nullptr, k_g4dec_m = nullptr;
+static Buf g_g4P = nullptr; static size_t g_g4Pcap = 0;
+static bool build_g4_dec(bool verbose) {
+    cl_int err = 0;
+    g_prog_g4d = cl.clCreateProgramWithSource(g_ctx, 1, &kSrcG4d, nullptr, &err);
+    if (err != CL_SUCCESS || !g_prog_g4d) { g_prog_g4d = nullptr; return false; }
+    if (cl.clBuildProgram(g_prog_g4d, 1, &g_dev, "-cl-std=CL3.0 -cl-mad-enable", nullptr, nullptr) != CL_SUCCESS) {
+        size_t nl = 0; cl.clGetProgramBuildInfo(g_prog_g4d, g_dev, CL_PROGRAM_BUILD_LOG, 0, nullptr, &nl);
+        std::string log(nl, '\0'); if (nl) cl.clGetProgramBuildInfo(g_prog_g4d, g_dev, CL_PROGRAM_BUILD_LOG, nl, &log[0], nullptr);
+        fprintf(stderr, "[gpu] g4 decode attention did not build; decode stays on the tiled kernels%s\n%s",
+                verbose ? ":" : " (FERRO_VERBOSE=1 shows the log)", verbose ? log.c_str() : "");
+        cl.clReleaseProgram(g_prog_g4d); g_prog_g4d = nullptr;
+        return false;
+    }
+    k_g4dec = cl.clCreateKernel(g_prog_g4d, "g4_attn_dec", &err);     if (err != CL_SUCCESS) k_g4dec = nullptr;
+    k_g4dec_m = cl.clCreateKernel(g_prog_g4d, "g4_attn_dec_m", &err); if (err != CL_SUCCESS) k_g4dec_m = nullptr;
+    return k_g4dec && k_g4dec_m;
+}
+
 // head-dim generic dense attention for one fully visible segment of n tokens (hd multiple of 64): f32 output O[n][nq*hd].
 // S: scratch of nq*n*n floats. The softmax max reuses dattn_stats (dimension independent).
 // One explicit query tile against a separate KV cache (rows = absolute positions). Q holds only the
@@ -2272,6 +2417,28 @@ bool op_attn_split(Buf Q, int qld, Buf KV, int ldkv, int qoff, int koff, int vof
                    int nq, int nkv, int hd, float scale, Buf S, Buf O, int ldo, int window, int causal) {
     if (hd % 64 || hd > 512 || nq % nkv || nr <= 0 || q0 < 0 || q0 + nr > n) return false;
     const int grp = nq / nkv;
+    static const bool g4d_on = !(getenv("FERRO_G4_DEC") && atoi(getenv("FERRO_G4_DEC")) == 0);
+    if (g4d_on && nr == 1 && causal && k_g4dec && k_g4dec_m && (hd == 128 || hd == 256 || hd == 512)
+        && qld == nq * hd && ldo == nq * hd) {
+        const int kbeg = window > 0 ? std::max(0, q0 - window + 1) : 0;
+        const int kend = std::min(n, q0 + 1);
+        const int span = kend - kbeg;
+        if (span > 0) {
+            int nsl = std::min(16, std::max(1, (span + 127) / 128));
+            if ((size_t)nq * nsl < 24 && span > 32) nsl = std::min(16, (span + 31) / 32);
+            int klen = std::min(128, (span + nsl - 1) / nsl);
+            nsl = (span + klen - 1) / klen;
+            const size_t need = (size_t)nq * nsl * (512 + 4) * 4;
+            if (need > g_g4Pcap) { if (g_g4P) release(g_g4P); g_g4P = alloc(need); g_g4Pcap = g_g4P ? need : 0; if (!g_g4P) return false; }
+            set_args(k_g4dec, Q, KV, (cl_int)ldkv, (cl_int)qoff, (cl_int)koff, (cl_int)voff, (cl_int)n, (cl_int)q0,
+                     (cl_int)hd, (cl_int)grp, (float)(scale * 1.4426950408889634), (cl_int)window, (cl_int)klen, g_g4P, (cl_int)nsl);
+            size_t gd[2] = {(size_t)nq * 16, (size_t)nsl * 16}, ld[2] = {16, 16};   // one 16x16 WG per (head, split)
+            if (!launch(k_g4dec, 2, gd, ld)) return false;
+            set_args(k_g4dec_m, g_g4P, (cl_int)nsl, (cl_int)hd, O, (cl_int)ldo);
+            size_t gm[1] = {(size_t)nq * 256}, lm[1] = {256};                        // one WG per head
+            return launch(k_g4dec_m, 1, gm, lm);
+        }
+    }
     static Buf g_dst = nullptr; static size_t g_dstcap = 0;
     const size_t stb = (size_t)nq * nr * 8;
     if (stb > g_dstcap) { if (g_dst) release(g_dst); g_dst = alloc(stb); g_dstcap = g_dst ? stb : 0; if (!g_dst) return false; }

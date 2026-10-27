@@ -17,3 +17,4 @@ bench/ferro_ref
 bench/ferro_ref_vk
 bench/mm/ggml_ops_ref
 serve_prod.log
+tests/test_g4dec
