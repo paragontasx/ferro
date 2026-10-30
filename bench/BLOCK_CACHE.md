@@ -161,6 +161,12 @@ still restore **1152 of 1180** tokens. `/health` reports `evicted`, `expired`, `
 
 ## Known limitations
 
+- **Foreign-`state_id` shards are never reclaimed.** `open()` indexes out blocks written by an older
+  build/config but leaves their files: the prod box held 1.3 GB with `entries:0`, because the in-process
+  reclaimer is scoped to the current `state_id`. On a box where `state_id` shifts with every build this is
+  unbounded silent growth on the volume the cache is supposed to bound. Fix shape: at `open()`, list the
+  top-level shard directories and delete those whose manifest `state_id` does not match, counted into a
+  `reclaimed_foreign` counter so it is observable the way a failed open now is.
 - **The tip is best-effort: it fires only when the echoed turn re-tokenises to the same ids.** A KV cache is keyed on
   token ids, not text, so `" hello"` vs `"hello"` is a different bookmark, and a chat template that carries a Thinking
   model's reasoning in a separate field will not reproduce the generated ids on the way back. Measured: it fires for the
@@ -306,6 +312,17 @@ Rules that make it safe:
   against ~2.8 s at 125 MB/s, still 30x better than the 84.6 s cold prefill but a downgrade. Split only
   when one cache must serve several inference boxes, the inference box has no NVMe headroom, or the cache
   must outlive a reinstall.
+- **async prefetch: measured, archived, not shipped** - an async chain reader (`--prefetch-mb`) was built and
+  measured twice; both negative: medians of 3 on a 345 MB chain with a concurrent stream gave +119% stall
+  with the reader off against +129% on, and behind a genuine 28 s queue a 5k-token request took 27.37 s
+  with the reader versus 27.58 s without. On a shared-memory iGPU the upload and the D2D copy contend for
+  the same DRAM whoever issues them; moving the issue point cannot create bandwidth. Code and harnesses are
+  preserved at tag `archive/block-prefetch-reader` (and `archive/block-prefetch-measured` for the first
+  experiment), so this is not re-derived from zero. It revives only for a remote/slow tier, where restore is
+  I/O-bound for hundreds of milliseconds: the gate is **restore >10% of request wall time**. What ships from
+  that work is the accounting - `block_cache.read_fails` / `ferro_lm_block_cache_read_fails_total` counts a
+  chain that vanished or failed CRC (previously it failed silently), and a configured-but-not-open cache
+  reports `{"state":"disabled","reason":...}` in `/health`.
 
 Acceptance gate for the split already exists: `scripts/test_blocks.py` (exactness, sharing, storage) must
 pass unchanged against `RemoteBlocks`.

@@ -286,6 +286,8 @@ struct Server {
     std::vector<float> lg_spec;                    // worker only: logits of every row of a verification window
     std::unique_ptr<PrefixStore> pstore;
     std::unique_ptr<BlockStore> bstore;            // block-granular prefix cache (null = off; replaces pstore)
+    std::string bstore_err;                        // why the block cache is not open (empty = open, or not configured): /health reports it instead of leaving one startup stderr line as the only trace
+    std::atomic<uint64_t> bf_read_fails{0};        // chain reads that failed (a block vanished or failed CRC): the request recomputed from zero. Both paths count; this is the observable that made the prefetch negative checkable
     std::atomic<uint64_t> bs_hits{0};
     std::atomic<uint64_t> bc_disk_us{0}, bc_up_us{0}, bc_rest_us{0}, bc_q_us{0}, bc_ttft_us{0};   // per-phase cache costs              // requests that restored a block chain from disk           // on-disk prefix snapshots (null = off)
     std::atomic<uint64_t> ps_hits{0};              // requests that restored a snapshot from disk
@@ -447,7 +449,7 @@ static void gen_begin(Server& S, const std::shared_ptr<GenJob>& jp) {
             const auto c0 = clk::now();
             if (S.bstore->longest(head, &be) && (!e || be.toks.size() > e->toks.size() + 32)) {
                 std::vector<uint8_t> blob;
-                const bool got = S.bstore->load(be, &blob);
+                const bool got = S.bstore->load(be, &blob); if (!got) S.bf_read_fails++;   // a failed chain read is chain-absent: recompute, never trust a partial chain
                 j.blk_disk_ms = ms_since(c0);                                       // read + assemble off the NVMe
                 const auto c1 = clk::now();
                 if (got) {
@@ -735,12 +737,16 @@ static void worker_loop(Server& S, std::promise<std::string>& ready) {
             S.chat_opt.typed_content = lfm_template_is_typed(S.lm.model().gguf.get_str("tokenizer.chat_template"));
             S.think_open = S.ltok.token_id("<think>"); S.think_close = S.ltok.token_id("</think>"); S.eos_id = S.lm.model().eos_id;
             S.lg.assign((size_t)S.lm.n_slots() * (size_t)S.lm.n_vocab(), 0.0f);
+            if (S.o.block_cache > 0) {                                     // configured but a gate is unmet: /health must still say why, or "disabled" with an empty reason reads as an unnamed storage error
+                if (S.o.snapshot_dir.empty()) S.bstore_err = "snapshot_dir not set";
+                else if (!S.lm.on_gpu()) S.bstore_err = "language model is not on the GPU (block cache needs the iGPU path)";
+            }
             if (!S.o.snapshot_dir.empty() && S.o.block_cache > 0 && S.lm.on_gpu()) {
                 S.bstore.reset(new BlockStore); std::string e;
                 S.lm.capture_blocks(S.o.block_cache);                      // boundary conv states, captured during prefill
                 if (!S.bstore->open(S.o.snapshot_dir + "/blocks", S.lm.state_id(), S.o.block_cache,
                                     (uint64_t)S.o.snapshot_mb << 20, S.lm.block_geom(), &e)) {
-                    fprintf(stderr, "[serve] block cache disabled: %s\n", e.c_str()); S.bstore.reset();
+                    fprintf(stderr, "[serve] block cache disabled: %s\n", e.c_str()); S.bstore.reset(); S.bstore_err = e;
                 } else {
                     S.bstore->set_ttl((int64_t)(S.o.block_ttl_h * 3600), (int64_t)(S.o.tip_ttl_h * 3600));
                     fprintf(stderr, "[serve] block cache: %d-token blocks, %zu stored (%.1f MB) in %s, budget %d MB\n",
@@ -983,12 +989,15 @@ static std::string health_json(Server& S) {
         double inflight; { std::lock_guard<std::mutex> g(S.mem_m); inflight = S.mem_inflight; }
         if (S.bstore) {                                                          // insert before the closing brace: position independent
             char sb[320];
-            snprintf(sb, sizeof sb, ",\"block_cache\":{\"block\":%d,\"entries\":%zu,\"mb\":%.1f,\"tips\":%zu,\"blocks_mb\":%.2f,\"tips_mb\":%.2f,\"links\":\"%s\",\"saved\":%llu,\"disk_hits\":%llu,\"evicted\":%llu,\"expired\":%llu,\"orphans\":%llu,\"dangling\":%zu}",
+            snprintf(sb, sizeof sb, ",\"block_cache\":{\"block\":%d,\"entries\":%zu,\"mb\":%.1f,\"tips\":%zu,\"blocks_mb\":%.2f,\"tips_mb\":%.2f,\"links\":\"%s\",\"saved\":%llu,\"disk_hits\":%llu,\"evicted\":%llu,\"expired\":%llu,\"orphans\":%llu,\"dangling\":%zu,\"read_fails\":%llu}",
                      S.bstore->block(), S.bstore->entries(), S.bstore->bytes() / 1048576.0,
                      S.bstore->tips(), S.bstore->blocks_bytes() / 1048576.0, (S.bstore->bytes() - S.bstore->blocks_bytes()) / 1048576.0, S.bstore->link_dump().c_str(), (unsigned long long)S.bstore->saved(), (unsigned long long)S.bs_hits.load(),
                      (unsigned long long)S.bstore->evicted(), (unsigned long long)S.bstore->expired(),
-                     (unsigned long long)S.bstore->orphans(), S.bstore->dangling());
+                     (unsigned long long)S.bstore->orphans(), S.bstore->dangling(), (unsigned long long)S.bf_read_fails.load());
             out.insert(out.size() - 1, sb);
+        } else if (S.o.block_cache > 0) {                                         // configured but not open: without this, "no cache", "cache open" and "cache failed at startup" are indistinguishable on /health
+            std::string why = S.bstore_err; for (char& c : why) if (c == '"' || c == '\\') c = ' ';
+            out.insert(out.size() - 1, ",\"block_cache\":{\"state\":\"disabled\",\"block\":" + std::to_string(S.o.block_cache) + ",\"reason\":\"" + why + "\"}");
         }
         const double lim = cgroup_limit_mb(), used = cgroup_used_mb();
         char l[300];
@@ -1357,6 +1366,7 @@ static std::string metrics_text(Server& S) {
             metric("ferro_lm_block_cache_bytes", "gauge", "Disk used by the block cache.", (double)S.bstore->bytes());
             metric("ferro_lm_block_cache_blocks_written_total", "counter", "Blocks written.", (double)S.bstore->saved());
             metric("ferro_lm_block_cache_chain_hits_total", "counter", "Requests that restored a chain from disk.", (double)S.bs_hits.load());
+            metric("ferro_lm_block_cache_read_fails_total", "counter", "Chain reads that failed (block vanished or failed CRC); the request recomputed from zero.", (double)S.bf_read_fails.load());
         }
         if (S.pstore) {
             metric("ferro_lm_prefix_snapshots_entries", "gauge", "Prefix snapshots on disk for this model.", (double)S.pstore->entries());
