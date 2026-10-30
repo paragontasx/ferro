@@ -162,8 +162,10 @@ still restore **1152 of 1180** tokens. `/health` reports `evicted`, `expired`, `
 ## Known limitations
 
 - **Foreign-`state_id` shards are never reclaimed.** `open()` indexes out blocks written by an older
-  build/config but leaves their files: the prod box held 1.3 GB with `entries:0`, because the in-process
-  reclaimer is scoped to the current `state_id`. On a box where `state_id` shifts with every build this is
+  build/config but leaves their files, saying so once at startup:
+  `[blocks] 372 foreign/corrupt block files ignored in .../blocks`. Measured on the prod box: 372 files,
+  1.3 GB, 205 shard directories held while `entries:0`, because the in-process reclaimer is scoped to the
+  current `state_id`. On a box where `state_id` shifts with every build this is
   unbounded silent growth on the volume the cache is supposed to bound. Fix shape: at `open()`, list the
   top-level shard directories and delete those whose manifest `state_id` does not match, counted into a
   `reclaimed_foreign` counter so it is observable the way a failed open now is.
@@ -342,3 +344,6 @@ python3 scripts/test_blocks.py           # needs models/ and a built binary
 ```
 `--block-cache 0` (default) keeps the whole-prefix snapshot path exactly as before.
 `/health` exposes `block_cache: {block, entries, mb, saved, disk_hits}`; `/metrics` exposes four counters/gauges.
+
+Cold start on the prod configuration (128k ctx, 1 slot, int8 KV, 512-token blocks) is ~150 s: mmproj alone
+takes 25.8 s and the foreign-block scan the rest. Budget for that before restarting a live serve.
