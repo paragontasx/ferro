@@ -107,6 +107,14 @@ bool op_lm_qkv_post_kv_f(Buf C, int rowc, int T, int nq, int nkv, int hd, Buf qw
 bool op_lm_attn_pf_f(Buf C, int ldc, Buf KV, int ldkv, int voff, int kvbase, int nq, int nkv, int pos0, float scale, int T);
 bool op_lm_attn_dec_f(Buf C, int ldc, Buf KV, int ldkv, int voff, Buf bases, Buf lens, int nq, int nkv, float scale, int B, int maxlen);
 bool op_lm_qkv_post_kvq(Buf C, int rowc, int T, int nq, int nkv, int hd, Buf qw, Buf kw, Buf cosb, Buf sinb, Buf pos, int hlf, float eps, Buf KVq, Buf KVs, Buf dst, int kvw);
+// ---- LFM3 (head_dim 128, 7-tap conv, sandwich post-norms, per-head output gate) ----
+bool op_rms_inplace(Buf D, Buf w, int T, int cols, float eps);                     // D = rms(D) * w, in place
+bool op_lm_conv_q7(Buf C, Buf S, Buf st, Buf taps, int T, int d);                  // 7-tap conv; S[t*6+k] row >= 0 or global state row -1-r
+bool op_lm_conv_state7(Buf C, Buf st, Buf slot, Buf R, int ns, int d);             // 6-row state update; R[s*6+j] row >= 0 or slot-relative old row -1-r
+bool op_lm_conv_dec_q7(Buf C, Buf st, Buf slot, Buf taps, int T, int d);           // fused decode: gate + state shift
+bool op_lm_qkv_post_kvq128(Buf C, int rowc, int T, int nq, int nkv, Buf qw, Buf kw, Buf cosb, Buf sinb, Buf pos, float eps, Buf KVq, Buf KVs, Buf dst, int kvw);
+bool op_lm_attn_pf_q128(Buf C, int ldc, Buf KVq, Buf KVs, int ldkv, int voff, int kvbase, int nq, int nkv, int pos0, float scale, Buf GA, int gld, int swa_w, int T, int bi = 0);   // GA: [T][gld] pre-gate logits or null; bi = 1: bidirectional (LFM3-d1 decision global layers)
+bool op_lm_attn_dec_q128(Buf C, int ldc, Buf KVq, Buf KVs, int ldkv, int voff, Buf bases, Buf lens, int nq, int nkv, float scale, Buf GA, int gld, int swa_w, int B);
 bool op_silu_mul_q(Buf G, int T, int FF);                    // silu(G[:, :FF]) * G[:, FF:] -> int8
 bool op_bias_act_q(Buf G, Buf b, bool relu, int T, int cols);// (G + b) [relu] -> int8
 bool op_bias_add(Buf Y, Buf b, int T, int rows);

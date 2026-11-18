@@ -353,6 +353,51 @@ The iGPU drifts +-1.5 ms between runs, so every claim below is a median of >= 4-
 **Conclusion:** single-stream decode now runs at ~75% of the weight-streaming limit on both models (350M: 19.7 ms ideal vs 26.1 ms; 1.2B: 1.17 GB at 25.9 GB/s = 45 ms ideal vs 59 ms). The remaining ~25% is the ~70 small launches (~3 ms)
 plus GEMV tail effects; the lever left is fewer weight bytes (Q4, or fp16 scales: the fp32 scales are 11% of the traffic), not more fusion.
 
+### LFM3-1.7B on the iGPU (arch `lfm3`, 2026-11-17) - new kernel set + speculative decoding shipped
+`LFM3-1.7B-Q8_0.gguf` (24 blocks: 10 short-conv Lc=7 + 14 GQA attention, 16 q / 4 kv heads, hd 128, d 2048, ffn 7680, vocab 128000, ctx 262144; sandwich post-norms
+`post_attention_norm`/`post_ffn_norm`, per-head output gate `attn_gate [2048,16]` padded to 64 rows for the tile GEMM, `attn_q_norm`/`attn_k_norm [128]`, partial rope
+rot_dims=64, rope base 1e6 full-attn / 1e4 SWA-256 on blocks 4,8,12,16,20, `rope_freqs.weight [64] = 32 ones + 32x1e30`). The iGPU path is a **different kernel set** from
+LFM2/2.5 (hd 64): `rms_inplace`, 7-tap conv `lm_conv_q7` / `lm_conv_state7` / `lm_conv_dec_q7`, `lm_qkv_post_kvq128`, `lm_attn_pf_q128`, `lm_attn_dec_q128` - enabled only with
+int8 KV (`FERRO_KV=int8`), hd 128, gated attention. GPU output is byte-identical to the CPU oracle at temp 0 over 96 tokens.
+
+**Correctness vs llama.cpp RESOLVED (2026-11-17): two recipe bugs, not KV dtype.** (1) partial-rope spacing: ferro computed `base^(-2i/(2*rot_pairs))` over the rotating pairs
+only; HF `compute_default_rope_parameters` and llama.cpp use `base^(-2i/head_dim)` over the **full head_dim** for the first `rope_angles` pairs - the `1e30` entries in
+`rope_freqs` mark identity pairs, they do not narrow the spacing (`rope.build(base, head_dim, ..., /*rot_dims=*/0)`). (2) BOS: the raw-prompt paths in `lm_cli`/`server`
+hard-prepended `<|startoftext|>` although this tokenizer has `tokenizer.ggml.add_bos_token = false` (the chat template carries it) - now gated on a new `BpeTokenizer::add_bos()`.
+After both fixes `lm_parity.py` vs llama.cpp f32-KV: **LM PARITY PASS - top-1 agree 12/12 (within 0.05 nats), TV ≤ 0.06 on 11/12, mean TV 0.0174** (`/tmp/parity_lfm3_bosfix.log`);
+selfcheck (`FERRO_LM_SELFCHECK=1`) all-pass on the same binary.
+
+**Measured device bandwidth (custom OpenCL shim, 512 MB buffers, median of 20-30):** read-only kernel 31.55 GB/s, write-only 31.11, read+write 20.94 (bus turnaround), device
+copy 15.5 GB/s copy rate = 31 GB/s bus; CPU single-thread memcpy 13.1 GB/s copy = 26.1 GB/s bus. This replaces the earlier wrong "26->81->87 GB/s at 1/4/8 streams" estimate,
+which assumed every stream re-reads all weights - batched forwards read each weight matrix once per step, so per-token traffic at conc 8 is ~216 MB not 1.73 GB.
+
+| LFM3-1.7B-Q8_0 metric | ferro iGPU | note |
+|---|---|---|
+| CLI decode, 1 stream, 128 tok temp 0 (p68) | 14.47 tok/s (68.9 ms/step) | launch/latency-bound: GEMVs stream ~21 GB/s of the 31.5 bus |
+| CLI decode with spec (p17 / p68 / p138) | 16.92 / 30.04 / 45.98 tok/s | 1.14x / 2.08x / 3.27x; acceptance 2.2% / 47.2% / 75.2%; outputs byte-identical to serial |
+| CLI prefill 180 / 690 / 1390 tok | 446 / 369 / 279 tok/s | DP4A tile GEMM, ~0.6 TFLOP/s |
+| serve aggregate conc 1 / 2 / 4 / 8, 4 slots, spec off | 14.79 / 28.16 / 46.97 / 50.09 tok/s | queue-limited at conc 8 |
+| serve aggregate, 8 slots (`--lm-slots 8`), spec off | 14.86 / 28.27 / 48.32 / **69.0-72.5** tok/s | lever 2 accepted: +44.7% at conc 8 (TTFT 3.02->1.32 s); conc-8 aggregate measured twice, 69.0-72.5 |
+| serve aggregate, 8 slots, spec on (default `--spec-draft 6`) | 16.68 / 30.09 / 49.57 (conc 8 unchanged) | lever 1 measured: +11.8% / +5.3% / +1.8% over 14.92 / 28.58 / 48.71 same-binary spec-off A/B |
+| spec verification window cost | 66.5-70.8 ms for 1-8 rows | near-flat in row count (plain step 66.0), so drafting ~1.3x a plain step for 2-3 extra tokens |
+| CPU-only oracle decode | 0.81 tok/s | |
+
+**Speculative decoding (lever 1) - shipped and exact.** Verification windows reuse the hd-128 decode kernels + the 7-tap conv window kernel with **no provisional state
+write**; the engine commits afterwards: sandwich `commit` rebuilds each conv layer's 6-row state from the committed window rows via `op_lm_conv_state7` (`r6` sourced from
+window rows `row_off+a-6+j`, or the old state row `a+j` when the window is shorter), then `gpu::finish()` before the host staging arrays are freed. Self-check
+(`FERRO_LM_SELFCHECK=1`): window of 5 rows vs 5 serial decode steps `max|diff| 0`; commit 5/3/1/2 of 5 rows then decode-on all `0`; two windows (2+3 rows) in one batch `0`.
+Drafting is prompt-lookup (the server's rule, shared with the CLI): accept the longest n-gram of the last 4 tokens that repeats in the history, return its continuation.
+Acceptance scales with how repetitive the prompt/continuation is; long windows (up to `--spec-draft 6`) only pay once >85% of a stream's drafts are accepted, streams
+start at 3, back off after misses. Server-side A/B used the same binary and same bench; the +11.8% at conc 1 shrinks to +1.8% at conc 4 because verification windows
+serialize across streams. The gains are exact-by-construction (output identical to serial decode), verified byte-identical on all three CLI prompts.
+
+**Lever status after this round:** lever 2 accepted (+44.7% conc 8); lever 1 shipped, exact, +11.8% conc 1 / +5.3% conc 2 / +1.8% conc 4 server-side, up to 3.27x CLI on
+repetitive prompts; lever 3 (fused prologue) implemented in `model_lfm2_lm.cpp` (`fpro` gate: conv-only first GEMM for the sandwich attention opening because `op_gemv_pro`
+does not write Xp/Xs and the sandwich gate GEMM reads the quantized input), built clean, **not yet A/B-measured**, LFM2.5 regression re-run post-change: 58.97 tok/s vs the
+recorded 59.5 baseline (noise, unchanged); lever 5 = `FERRO_GPU_TT` runtime knob (`tt_main()` reads the env per process, kernels JIT per process so no rebuild), not swept;
+lever 4 (Q4 weights) not started - only `attention_q4` exists, a Q4/QAD-Q4_0 LFM3 GGUF is unconfirmed on HF. `bench/RESULTS.md` is the scoreboard; the LFM3 recipe-vs-llama.cpp
+divergence is closed (parity PASS, above).
+
 ### d1 over HTTP: `POST /v1/systemone` + server-side crops (2026-10-22)
 `decide` was CLI-only; `serve --d1 d1-omni.gguf [--d1-mmproj ...]` now answers llama.cpp's `/v1/systemone` contract from the resident worker (the pipeline moved out of `main.cpp` into `DecisionService`:
 prepare -> infer -> format; the CLI uses it too and its output is byte-identical to before on text / batch / PNG / JPEG / audio requests).
@@ -799,3 +844,78 @@ Next-token distribution on a real chat prompt (CPU row-domain int8, llama.cpp sa
 Greedy decoding of the same messages agrees through the `<|channel>thought` opener and then diverges at
 the first stylistic token, which is the expected behaviour at that TV distance (`scripts/gemma4_e2e_check.py`).
 `serve` rejects a Gemma 4 GGUF at startup with a pointer to `generate` instead of mis-loading it.
+
+### LiquidAI d1-2B (`lfm3-d1` decision model) — out of the box, 2026-11-17
+
+`d1-2B-Q8_0.gguf` (1.8 GB): arch `lfm3` + `lfm3.decision.type = lfm3-d1`, 24 blocks = 13 gated short convs (Lc 7) + 5 SWA (causal, window 256, base 1e4) + 6 global
+attention (**bidirectional**, base 1e6), d 2048, hd 128, ffn 7680, vocab 128000, tied `token_embd` head, no decision-head tensors; decision temperatures
+noul/choice/score = 1.3374 from GGUF keys. ferro did **not** run it out of the box before this entry: the decision loader only matched LFM2-d1 and the LM loader rejected
+`lfm3.attention.causal = 0`. Ported:
+
+- `src/model_lfm3_d1.{h,cpp}` — stateless whole-prompt CPU engine reusing `LmModel` weights: conv state zeroed every layer (the prompt is the whole world), SWA stays
+  causal+window, global layers read all rows both directions, answer = tied last-token logits, per-option score = max over the label-token group.
+- `src/decision_lfm3.{h,cpp}` — the llama.cpp `server-decision.cpp` LFM3_D1 contract: one prompt per (state, question) from `tokenizer.chat_template.systemone`,
+  `d1_break` (ZWSP inside control-token spellings), option keys/descriptions sorted like nlohmann, letter codes with single-token pool fallback, noul = [true,false]
+  with yes/no token groups, score = median level + legend, softmax at the GGUF bucketed temperature, score-bias keys.
+- `DecisionService` dispatches on the GGUF keys (`serve --d1`, `decide --model`, batched request arrays); `--lm` now rejects a d1 checkpoint with a pointer to `--d1`.
+
+**Correctness** (this machine, Q8_0): the d1 card example — state + refund noul / team choice / topics choice-multiple / urgency score — reproduces llama.cpp
+`/v1/systemone` on **all four answers**, max |Δprobability| 0.006 (refund P=0.9996 both; team shipping; topics delivery; urgency score 1 = medium both).
+
+**Speed** (CPU; the iGPU path landed 2026-11-18, see the section below): card example 4 questions / 243 prompt tokens via
+`serve --threads 14`: **3.03 s vs llama.cpp 7.09 s — 2.3x**. CLI (`decide --reps 2`, 3 questions / 176 tok): BEST 2.35 s (75 tok/s) at 14 threads, 2.88 s at 8,
+5.57 s at the default 2. Two port bugs found and fixed on the way: the shared `C` scratch was sized `T*rowc` while conv `in_proj` writes `3*d` cols/row (heap overrun,
+`munmap_chunk()` crash, caught under gdb), and `Lfm3D1Engine::init` never called `Pool::get().init(n_threads)` (all timings flat at the 2-thread default regardless of
+`--threads` — a 4.5x hidden loss).
+
+**Vision parity (2026-11-18, CLOSED to answer level).** The lfm3vl vision tower is wired into the decision path (`mm_encoder.cpp`): patchifier (flat im2col + GEMM, two
+temporal kernels summed) -> RMS -> 14 blocks (conv/attn per lfm3vl.cpp recipe) -> `mm.input_norm` LayerNorm (eps 1e-6) per patch token -> 2x2 merge -> mm.0 -> GELU-ERF
+-> mm.2. Bisected stage-by-stage against llama.cpp reference dumps (mtmd sched eval-callback dumps, 361 named intermediates). Three structural bugs fixed on the way:
+(1) **vision mrope**: ggml's mrope cache starts theta at the position VALUE and decays by `theta_scale = freq_base^(-2/nd)` per pair step — the freq_base never
+multiplies the angle; sections restart theta at 1.0 at each section boundary. Multiplying by 1e6 directly was wrong (rope dump rms 1.19 -> 0.004 after fix).
+(2) **qk per-head RMS must include eps** (`1/sqrt(ss/hd + eps)`, ggml rms_norm semantics).
+(3) **attention output stride**: the GQA attention call passed `ldo = dkv = 512` for a 1024-wide output — token rows overlapped (head 8-15 of token t landed on heads
+0-7 of token t+2); rel diff ~100% at every layer. Fixing `ldo = d` collapsed everything to noise level (kqv rel 0.69%).
+Attention semantics verified with a Python oracle against llama's exact rope inputs: maxdiff 4.6e-6 (scale 0.125, GQA h/2, full bidirectional softmax).
+End-to-end (`/tmp/test_gate.png` 640x480, 1200 patches, 3 questions, text-only regression still PASS 0.8178 vs 0.8190): all three answers now MATCH llama.cpp
+(alarm noul, urgency score 3.0, zone choice "a") with max |dP| **0.038**. The residual is llama.cpp's q6_K x q8_K integer-dot kernel (int8 activation quantization,
+~0.25% relative on Q/K/V) vs ferro's exact-f32 dequant, amplified through 11 attention layers (proj rows rel 3.3%, layer 13 rel 4.1%). Same decision outputs; cost
+of exact-match would require replicating llama's int-activation kernels. Vision request: 3 questions / 1200 patch tokens = 10.8 s end-to-end (CPU vision tower).
+
+**Still not out of the box** (explicit 400s, not silent): the HF-API extraction types text/number/date/box (llama.cpp's decision server omits these too).
+
+### LiquidAI d1-2B on the iGPU — bidirectional decision forward, 2026-11-18 (this machine)
+
+The whole-prompt decision forward now runs on the iGPU, reusing the LFM3 prefill kernel set. The only new kernel
+piece: `lm_attn_pf_q128` gained a `bi` mode (arg appended; host wrapper `op_lm_attn_pf_q128(..., int bi)`) — the 6 global
+layers run every query row over keys [0, T-1] (no causal mask, no window); the 5 SWA layers keep causal + window 256
+with pos0=0/kvbase=0. Per forward (stateless): attn_norm resid_norm + tile GEMM -> conv branch (`op_lm_conv_q7` with
+src6 refs into a permanently zero 6-row state buffer, NO state update — the prompt is the whole world) or attention
+branch (wqkv GEMM, attn_gate GEMM into GA[T][64], `op_lm_qkv_post_kvq128` writing the whole prompt as int8 KV rows
+dst[t]=t, `op_lm_attn_pf_q128`, wo GEMM), sandwich post-norms via `op_rms_inplace`, FFN via gateup/silu_mul/down,
+one `gpu::finish()` per layer (i915 watchdog). Final row -> out_norm resid_norm + tied-embd GEMM + read.
+
+- Engine: `Lfm3D1Engine::Impl` weights resident 1964 MB reported; scratch X/D/C/G/GA + per-attn-layer int8 KV sized
+  `Tmax` rows (default 4096, `FERRO_D1_TMAX`); prompts longer than Tmax fall back to the CPU forward (host weights kept).
+  `FERRO_D1_GPU=0` forces CPU; `FERRO_D1_DBG` prints GPU-vs-CPU logits TV/argmax per question; `FERRO_D1_LDBG` dumps
+  per-block X checkpoints (`/tmp/d1_{cpu,gpu}_<layer>_{attn,ffn}.bin`). `DecisionService::on_gpu()` now reports the d1
+  engine, so `/health` shows `d1.device: igpu` (it claimed cpu before).
+- **Correctness** (Q8_0, this machine): text card (3 q / 254 tok) TV_all 0.06-0.12, every label logit within +-0.06,
+  argmax identical on all questions, answers MATCH CPU exactly (alarm 0.8134 vs 0.8178 f32; urgency 3; zone b).
+  Vision request (1160 tok, 3 q): answers match the llama.cpp-verified reference (alarm 0.1978 vs 0.1987; urgency 3;
+  zone a). Long state (2 q / ~750 tok): TV_all 0.058-0.081, argmax identical. `make test` (kernels/decision/media) ALL PASS.
+- **Speed** (iGPU vs CPU, both 14 threads): text card 3 q / 254 tok **784 ms vs 2886 ms = 3.7x** (324 vs 88 tok/s;
+  the CPU default-2-thread run is 7.2 s). Vision request **5.19 s vs 10.65 s = 2.05x** end-to-end (the lfm3vl vision
+  tower stays CPU in both; the forwards themselves are the difference). Long state T~754 **13.9 s vs 22.6 s = 1.6x** —
+  the bidirectional global attention is O(T^2) per prompt, so the GPU advantage narrows as the prompt grows (108 vs
+  66 tok/s there vs 324 vs 88 on the 85-token prompts).
+- Serve: `serve --d1 ... --port 8097` + `/v1/systemone` text card: worker pass busy 0.84 s / 3 questions, answers
+  identical to the CLI. (The d1 init branch still skips the eager mmproj load; it is found next to the model on first
+  image use — unchanged pre-existing behavior.)
+
+Three port slips caught and fixed during bring-up (all engine-side, no repo bug): `Impl::ok` was never set so the
+first GPU run silently fell back to CPU; the attention branch was missing its wqkv GEMM (C kept stale data ->
+TV ~11, first divergence at layer 2, the first global layer, found with the per-block dumps); the host staging
+vectors (pos/dst/src6) were not resized -> segfault. The per-block checkpoint diff is the fastest way to bisect
+future d1 GPU parity hunts: conv layers land clean (~0.003) immediately, the first broken attention block jumps
+~1.0+ at its layer index.

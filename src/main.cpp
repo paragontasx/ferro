@@ -348,7 +348,7 @@ int main(int argc, char** argv) {
         // dispatch on the model kind: embedding (gemma-embedding2) vs decision (lfm2 d1)
         GgufFile peek; std::string perr;
         if (!peek.open_file(model.c_str(), &perr)) { fprintf(stderr, "cannot open %s: %s\n", model.c_str(), perr.c_str()); return 1; }
-        const bool decision = is_lfm2_decision(peek);
+        const bool decision = is_lfm2_decision(peek) || is_lfm3_d1(peek);
         peek.close();
         if (cmd == "decide" || decision) {
             if (!decision) { fprintf(stderr, "%s is not a decision model (use embed/bench)\n", model.c_str()); return 2; }

@@ -23,9 +23,18 @@ struct block_q4_0 {
 };
 static_assert(sizeof(block_q4_0) == 18, "q4_0 must be 18 bytes");
 
+constexpr int QK_K = 256;
+struct block_q6_K {
+    uint8_t ql[QK_K / 2];   // low 4 bits of 128 + 128 (pairs of 32-element groups)
+    uint8_t qh[QK_K / 4];   // high 2 bits per 32-element group
+    int8_t  scales[16];     // per 16-element sub-block
+    int16_t d;              // fp16 bits
+};
+static_assert(sizeof(block_q6_K) == 210, "q6_K must be 210 bytes");
+
 // ggml type ids we support
 enum GgType : uint32_t {
-    T_F32 = 0, T_F16 = 1, T_BF16 = 30, T_Q4_0 = 2, T_Q8_0 = 8,
+    T_F32 = 0, T_F16 = 1, T_BF16 = 30, T_Q4_0 = 2, T_Q8_0 = 8, T_Q6_K = 14,
 };
 
 inline float fp16_to_f32(uint16_t h) {

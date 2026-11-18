@@ -296,16 +296,24 @@ void gelu_mul_block(const float* gu, int T, int cols, float* y) {
 }
 
 // ---------- rope ----------
-void RopeTable::build(double freq_base, int r, int max_pos, double attn_factor) {
+void RopeTable::build(double freq_base, int r, int max_pos, double attn_factor, const float* ff, int rot_dims) {
+    // ggml-exact: theta accumulates in float steps (theta *= theta_scale), each pair divides by its freq factor (theta/ff).
+    // LFM3's partial RoPE arrives as ff = [1.0 x n_rot_pairs, 1e30 ...]: the huge factor makes theta/ff ~ 0, i.e. identity
+    // (cos 1, sin 0), exactly what ggml_rope_cache_init computes for those pairs.
+    // rot_dims (ggml's n_dims) sets the frequency spacing base^(-2i/rot_dims): for partial RoPE it is 2*n_rot_pairs, NOT head_dim.
     rot = r;
     int half = rot / 2;
+    const int rdim = rot_dims > 0 ? rot_dims : rot;
+    const float tscale = (float)std::pow((float)freq_base, -2.0f / rdim);
     cosb.resize((size_t)max_pos * half);
     sinb.resize((size_t)max_pos * half);
     for (int p = 0; p < max_pos; ++p) {
+        float theta = (float)p;
         for (int i = 0; i < half; ++i) {
-            double th = p / std::pow(freq_base, (2.0 * i) / rot);
-            cosb[(size_t)p * half + i] = (float)(attn_factor * std::cos(th));
-            sinb[(size_t)p * half + i] = (float)(attn_factor * std::sin(th));
+            const float a = theta / (ff ? ff[i] : 1.0f);
+            cosb[(size_t)p * half + i] = (float)attn_factor * cosf(a);
+            sinb[(size_t)p * half + i] = (float)attn_factor * sinf(a);
+            theta *= tscale;
         }
     }
 }

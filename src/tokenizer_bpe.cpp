@@ -55,6 +55,7 @@ bool BpeTokenizer::load(const GgufFile& g, std::string* err) {
 
     mask_id_ = (int)g.get_int("tokenizer.ggml.mask_token_id", -1);
     bos_id_  = (int)g.get_int("tokenizer.ggml.bos_token_id", -1);
+    add_bos_ = g.get_bool("tokenizer.ggml.add_bos_token", true);
     return true;
 }
 

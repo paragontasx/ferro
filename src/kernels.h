@@ -86,7 +86,7 @@ void gelu_mul_block_inter(const float* G, int T, int FF, float* Y);
 struct RopeTable {
     int rot = 0;                       // rotated dims per head (even)
     std::vector<float> cosb, sinb;     // [max_pos][rot/2]
-    void build(double freq_base, int rot, int max_pos, double attn_factor = 1.0);
+    void build(double freq_base, int rot, int max_pos, double attn_factor = 1.0, const float* ff = nullptr, int rot_dims = 0);
 };
 void rope_apply(float* x, int T, int heads, int head_dim, const RopeTable& rt, const int* pos, int ld = 0);
 

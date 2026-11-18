@@ -8,9 +8,11 @@
 #include <string>
 #include <vector>
 #include "decision.h"
+#include "decision_lfm3.h"
 #include "media.h"
 #include "mm_encoder.h"
 #include "model_lfm2.h"
+#include "model_lfm3_d1.h"
 #include "tokenizer_bpe.h"
 
 namespace ferro {
@@ -22,6 +24,7 @@ struct DecisionPrepared {
     std::vector<DecisionSeq> seqs;            // all questions, request order
     std::vector<ReqMedia> rmedia;
     std::vector<int> req_media;               // request -> index into rmedia (-1 = text only)
+    std::vector<std::vector<Lfm3D1Built>> lq; // lfm3-d1 (d1-2B): the built questions per request (aligned with reqs)
     size_t n_tok = 0, n_media_tok = 0;        // text + media positions (for batching budgets / logs)
     int n_images = 0;                         // images actually encoded (after crops)
     double prep_ms = 0;
@@ -36,14 +39,14 @@ public:
     // media encoders + one scoring pass over all given requests; scores[i] = per question of job i. false + err on an engine error.
     bool infer(const std::vector<DecisionPrepared*>& jobs, std::vector<std::vector<std::vector<float>>>& scores, std::string* err);
     Json format(const DecisionPrepared& p, const std::vector<std::vector<float>>& scores) const;   // array if p.batch
-    std::string name() const { return eng_.gguf().get_str("general.name"); }
-    bool on_gpu() const { return eng_.on_gpu(); }
+    std::string name() const { return (lfm3d1_ ? d1_.gguf() : eng_.gguf()).get_str("general.name"); }
+    bool on_gpu() const { return lfm3d1_ ? d1_.on_gpu() : eng_.on_gpu(); }
     bool has_mm() const { return mm_loaded_; }
     const std::string& mmproj_path() const { return mmproj_; }
     bool has_vision() const { return mm_loaded_ && mm_.has_vision(); }
     bool has_audio() const { return mm_loaded_ && mm_.has_audio(); }
     DecisionEngine& engine() { return eng_; }
-    const GgufFile& gguf() const { return eng_.gguf(); }
+    const GgufFile& gguf() const { return lfm3d1_ ? d1_.gguf() : eng_.gguf(); }
     const DecisionPrompter& prompter() const { return dp_; }
 
 private:
@@ -52,6 +55,9 @@ private:
     BpeTokenizer tok_;
     DecisionPrompter dp_;
     MmProj mm_;
+    bool lfm3d1_ = false;                    // d1-2B (LFM3-d1): the stateless whole-prompt path replaces the engine above
+    Lfm3D1Engine d1_;
+    Lfm3D1Ctx d1c_;
     std::string model_, mmproj_;
     bool mm_loaded_ = false, mm_tried_ = false;
     std::mutex mm_mu_;

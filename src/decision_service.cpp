@@ -1,9 +1,11 @@
 // decision_service.cpp - see decision_service.h
 #include "decision_service.h"
 
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
 #include <stdexcept>
 
 namespace ferro {
@@ -14,6 +16,20 @@ static double secs_since(clk::time_point t) { return std::chrono::duration<doubl
 bool DecisionService::init(const std::string& model, const std::string& mmproj_path, int threads, std::string* err, bool eager_mm) {
     const auto t0 = clk::now();
     model_ = model;
+    {                                                              // d1-2B (LFM3-d1) is its own beast: stateless whole-prompt forward, no LFM2 engine
+        GgufFile probe;
+        std::string perr;
+        if (probe.open_file(model.c_str(), &perr) && is_lfm3_d1(probe)) {
+            probe.close();
+            if (!d1_.init(model, threads, err)) return false;
+            if (!tok_.load(d1_.gguf(), err)) { if (err) *err = "tokenizer: " + *err; return false; }
+            lfm3d1_load(d1c_, d1_.gguf(), tok_, err);
+            lfm3d1_ = true;
+            fprintf(stderr, "[ferro] decision model %s (lfm3-d1) loaded in %.2fs threads=%d device=%s\n", name().c_str(), secs_since(t0), threads, d1_.on_gpu() ? "igpu" : "cpu");
+            (void)eager_mm;
+            return true;
+        }
+    }
     if (!eng_.init(model, threads, err)) return false;
     if (!tok_.load(eng_.gguf(), err)) { if (err) *err = "tokenizer: " + *err; return false; }
     if (!dp_.init(eng_.gguf(), &tok_, err)) { if (err) *err = "decision: " + *err; return false; }
@@ -48,6 +64,74 @@ DecisionPrepared DecisionService::prepare(const Json& body) {
     const auto tp0 = clk::now();
     DecisionPrepared P;
     P.batch = body.is_array();
+    if (lfm3d1_) {                                                 // d1-2B: one stateless whole-prompt pass per question
+        std::vector<const Json*> reqs;
+        if (P.batch) {
+            if (body.arr.empty()) throw std::invalid_argument("the request array is empty");
+            for (auto& r : body.arr) reqs.push_back(&r);
+        } else reqs.push_back(&body);
+        for (const Json* r : reqs) {
+            // files / images ("images" is an alias of "files", as in llama.cpp decision_load_image); each entry
+            // is a data-URL image (or a {url|data} object); one <|vision_start|>...<|vision_end|> run per entry
+            std::vector<std::string> urls;
+            for (const char* key : { "files", "images" }) {
+                if (const Json* fs = r->find(key)) {
+                    if (!fs->is_array()) throw std::invalid_argument("\"" + std::string(key) + "\" must be an array of data URLs");
+                    for (auto& f : fs->arr) {
+                        std::string u;
+                        if (f.t == Json::String) u = f.s;
+                        else if (const Json* j = f.find("url")) { if (!j->is_string()) throw std::invalid_argument(std::string(key) + ": url must be a string"); u = j->s; }
+                        else if (const Json* j = f.find("data")) { if (!j->is_string()) throw std::invalid_argument(std::string(key) + ": data must be a string"); u = j->s; }
+                        else throw std::invalid_argument(std::string(key) + ": entries must be data URLs (strings)");
+                        urls.push_back(std::move(u));
+                    }
+                    break;
+                }
+            }
+            const bool has_media = !urls.empty();
+            if (has_media) {
+                if (urls.size() > DecisionPrompter::MAX_MEDIA_FILES) throw std::invalid_argument("too many images, the maximum is " + std::to_string(DecisionPrompter::MAX_MEDIA_FILES));
+                ensure_mm(nullptr);
+                if (!mm_.has_vision()) throw std::invalid_argument("this mmproj has no vision encoder");
+            }
+            DecisionPrepared::ReqMedia rm;
+            std::vector<int> per_entry;
+            if (has_media) {
+                for (size_t i = 0; i < urls.size(); ++i) {
+                    auto bytes = media_bytes_from_url(urls[i]);
+                    MediaItem it = decode_media(bytes, 16000);
+                    if (it.is_audio) throw std::invalid_argument("the d1-2B vision path accepts images only (an audio clip arrived)");
+                    auto v = lfm3vl_preprocess_image(it.rgb.data(), it.nx, it.ny, mm_.vision_params());
+                    per_entry.push_back(lfm3vl_vision_tokens(v, mm_.vision_params()));
+                    rm.n_tok += per_entry.back();
+                    ++rm.n_files;
+                    rm.vin.push_back(std::move(v));
+                }
+                P.n_images += (int)urls.size();
+            }
+            auto built = lfm3d1_build(d1c_, *r, per_entry);
+            DecisionRequest dq;
+            if (const Json* s = r->find("state")) dq.state = *s;
+            for (auto& b : built) {
+                DecisionQuestion dqn;
+                dqn.id = b.id;
+                dqn.type = b.type;
+                dq.questions.push_back(std::move(dqn));
+                DecisionSeq s;
+                s.tokens = b.tokens;
+                s.type = b.type;
+                s.media = -1;
+                P.n_tok += b.tokens.size();
+                P.seqs.push_back(std::move(s));
+            }
+            P.lq.push_back(std::move(built));
+            P.req_media.push_back(has_media ? (int)P.rmedia.size() : -1);
+            if (has_media) P.rmedia.push_back(std::move(rm));
+            P.reqs.push_back(std::move(dq));
+        }
+        P.prep_ms = secs_since(tp0);
+        return P;
+    }
     if (P.batch) {
         if (body.arr.empty()) throw std::invalid_argument("the request array is empty");
         for (auto& r : body.arr) P.reqs.push_back(dp_.parse(r));
@@ -120,6 +204,37 @@ DecisionPrepared DecisionService::prepare(const Json& body) {
 }
 
 bool DecisionService::infer(const std::vector<DecisionPrepared*>& jobs, std::vector<std::vector<std::vector<float>>>& scores, std::string* err) {
+    scores.assign(jobs.size(), {});
+    if (lfm3d1_) {                                                 // each question is its own stateless forward (the prompts share no cache)
+        for (size_t ji = 0; ji < jobs.size(); ++ji) {
+            DecisionPrepared* P = jobs[ji];
+            // encode the images of each request once (vision rows are shared by its questions)
+            std::vector<std::vector<float>> rows(P->rmedia.size());
+            for (size_t i = 0; i < P->rmedia.size(); ++i)
+                rows[i] = mm_.encode_vision(P->rmedia[i].vin);
+            size_t k = 0;
+            for (size_t ri = 0; ri < P->lq.size(); ++ri)
+                for (size_t qi = 0; qi < P->lq[ri].size(); ++qi, ++k) {
+                    const auto& b = P->lq[ri][qi];
+                    std::vector<float> sc;
+                    const int mi = P->req_media[ri];
+                    if (mi < 0) {
+                        if (!d1_.score(b.tokens, b.groups, sc, err)) return false;
+                    } else {
+                        const auto& embd = rows[mi];
+                        const int d = d1_.model().n_embd;
+                        if ((int)embd.size() != P->rmedia[mi].n_tok * d) { if (err) *err = "vision encoder produced " + std::to_string(embd.size() / d) + " rows, expected " + std::to_string(P->rmedia[mi].n_tok); return false; }
+                        std::vector<int> mpos;
+                        for (auto& run : b.media_runs)
+                            for (int j = 0; j < run.second; ++j) mpos.push_back(run.first + j);
+                        if (mpos.size() != P->rmedia[mi].n_tok) { if (err) *err = "prompt media rows (" + std::to_string(mpos.size()) + ") do not match the encoded images (" + std::to_string(P->rmedia[mi].n_tok) + ")"; return false; }
+                        if (!d1_.score(b.tokens, b.groups, sc, err, embd.data(), mpos)) return false;
+                    }
+                    scores[ji].push_back(std::move(sc));
+                }
+        }
+        return true;
+    }
     // encode every media block of every job once, then one packed forward over all question sequences
     std::vector<std::vector<float>> membd;
     size_t n_media = 0; for (auto* j : jobs) n_media += j->rmedia.size();
@@ -177,6 +292,43 @@ bool DecisionService::infer(const std::vector<DecisionPrepared*>& jobs, std::vec
 }
 
 Json DecisionService::format(const DecisionPrepared& P, const std::vector<std::vector<float>>& scores) const {
+    if (lfm3d1_) {                                                 // the /v1/systemone shape for d1-2B (llama.cpp format_answer)
+        static std::atomic<uint64_t> ctr{ 0 };
+        auto hexrand = [] {
+            uint64_t x = (uint64_t)std::chrono::system_clock::now().time_since_epoch().count() ^ (0x9E3779B97F4A7C15ull * (++ctr + 1));
+            x ^= x >> 33; x *= 0xff51afd7ed558ccdull; x ^= x >> 33;
+            char buf[17];
+            snprintf(buf, sizeof buf, "%016llx", (unsigned long long)x);
+            return std::string(buf);
+        };
+        auto resp = [&](size_t ri) {
+            Json answers = Json::object();
+            uint64_t in_tok = 0;
+            size_t k = 0;
+            for (size_t rj = 0; rj < ri; ++rj) k += P.lq[rj].size();
+            for (size_t qi = 0; qi < P.lq[ri].size(); ++qi, ++k) {
+                answers.set(P.lq[ri][qi].id, lfm3d1_answer(d1c_, P.lq[ri][qi], scores[k]));
+                int n_media = 0;
+                for (auto& run : P.lq[ri][qi].media_runs) n_media += run.second;
+                in_tok += P.lq[ri][qi].tokens.size() + n_media;
+            }
+            Json usage = Json::object();
+            usage.set("prompt_tokens", Json::integer((int64_t)in_tok));
+            usage.set("total_tokens", Json::integer((int64_t)in_tok));
+            Json out = Json::object();
+            out.set("id", Json::str("sys1-" + hexrand()));
+            out.set("object", Json::str("systemone.completion"));
+            out.set("created", Json::integer((int64_t)std::time(nullptr)));
+            out.set("model", Json::str(d1_.gguf().get_str("general.name")));
+            out.set("answers", answers);
+            out.set("usage", usage);
+            return out;
+        };
+        if (!P.batch) return resp(0);
+        Json arr = Json::array();
+        for (size_t ri = 0; ri < P.lq.size(); ++ri) arr.push(resp(ri));
+        return arr;
+    }
     Json all = Json::array();
     size_t k = 0;
     for (size_t ri = 0; ri < P.reqs.size(); ++ri) {

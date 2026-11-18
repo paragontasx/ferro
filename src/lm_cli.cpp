@@ -141,6 +141,20 @@ static int run_generate_gemma4(const GenArgs& a) {
     return 0;
 }
 
+// prompt-lookup drafting (the same rule the server uses): find the longest recent n-gram that occurs earlier in the history and return its continuation
+static std::vector<int> lookup_draft(const std::vector<int>& h, int kmax, int eos, int min_n) {
+    const int L = (int)h.size();
+    for (int n = std::min(4, L - 1); n >= min_n; --n) {
+        for (int p = L - n - 1; p >= 0; --p) {
+            bool eq = true; for (int k = 0; k < n; ++k) if (h[p + k] != h[L - n + k]) { eq = false; break; }
+            if (!eq) continue;
+            std::vector<int> d;
+            for (int k = p + n; k < L && (int)d.size() < kmax; ++k) { if (h[k] == eos) break; d.push_back(h[k]); }
+            if (!d.empty()) return d;
+        }
+    }
+    return {};
+}
 int run_generate(const GenArgs& a) {
     {   // arch dispatch: gemma4 has its own loader/forward
         GgufFile probe; std::string perr;
@@ -162,7 +176,7 @@ int run_generate(const GenArgs& a) {
         Json arr = json_parse(ss.str());
         std::vector<float> lg((size_t)eng.n_vocab());
         for (size_t i = 0; i < arr.arr.size(); ++i) {
-            std::vector<int> pi = tok.tokenize("<|startoftext|>" + arr.arr[i].s, true);
+            std::vector<int> pi = tok.tokenize((tok.add_bos() ? "<|startoftext|>" : "") + arr.arr[i].s, true);
             LmSeq sq; eng.reset(sq);
             auto t1 = clk::now();
             if (!eng.step({&sq}, {pi.data()}, {(int)pi.size()}, lg.data(), &err, true)) { fprintf(stderr, "prompt %zu failed: %s\n", i, err.c_str()); return 1; }
@@ -182,7 +196,7 @@ int run_generate(const GenArgs& a) {
             const Json* msgs = body.is_array() ? &body : body.find("messages");
             if (!msgs) throw std::invalid_argument("--messages file must be an array of messages or an object with \"messages\"");
             text = lfm_chat_render(*msgs, body.is_object() ? body.find("tools") : nullptr, copt);
-        } else if (a.raw) text = "<|startoftext|>" + a.prompt;
+        } else if (a.raw) text = (tok.add_bos() ? "<|startoftext|>" : "") + a.prompt;
         else {
             Json msgs = Json::array();
             if (!a.system.empty()) { Json m = Json::object(); m.set("role", Json::str("system")); m.set("content", Json::str(a.system)); msgs.push(m); }
@@ -270,7 +284,11 @@ int run_generate(const GenArgs& a) {
                 char nm[64]; snprintf(nm, sizeof nm, "window of 5 rows vs 5 decode steps"); if (accept == 5) fprintf(stderr, "[selfcheck] %-34s max|diff| %.4g\n", nm, mx);
                 if (!eng.commit({&b}, {0}, {accept})) { fprintf(stderr, "[selfcheck] commit failed\n"); return 1; }
                 double mx2 = 0;                                            // after committing `accept` rows, the next decode must equal the serial one
-                for (int i = accept; i < 5; ++i) { std::vector<float> o(V); eng.step({&b}, {&toks[i]}, {1}, o.data(), &err); mx2 = std::max(mx2, maxdiff(o.data(), serial[i].data())); }
+                for (int i = accept; i < 5; ++i) {
+                    std::vector<float> o(V); eng.step({&b}, {&toks[i]}, {1}, o.data(), &err);
+                    double d2 = maxdiff(o.data(), serial[i].data()); mx2 = std::max(mx2, d2);
+                    if (d2 > 0.01) fprintf(stderr, "[selfcheck]   commit %d, decode %d vs serial %d max|diff| %.4g\n", accept, i, i, d2);
+                }
                 snprintf(nm, sizeof nm, "commit %d of 5 rows, then decode on", accept); fprintf(stderr, "[selfcheck] %-34s max|diff| %.4g\n", nm, mx2);
                 eng.release(b);
             }
@@ -300,19 +318,49 @@ int run_generate(const GenArgs& a) {
     std::vector<int> hist = ids, gen;
     auto td = clk::now();
     int stop = 0;
-    for (int i = 0; i < a.n_predict; ++i) {
+    const int spec_draft = getenv("FERRO_LM_SPEC") ? atoi(getenv("FERRO_LM_SPEC")) : 0;   // prompt-lookup drafting (exact by construction): 0 = off
+    uint64_t spec_d = 0, spec_a = 0;
+    while ((int)gen.size() < a.n_predict) {
         const int nxt = sampler.sample(logits.data(), eng.n_vocab(), hist);
         if (nxt == eng.model().eos_id && !getenv("FERRO_LM_NOEOS")) { stop = 1; break; }     // FERRO_LM_NOEOS=1: timing experiments
         gen.push_back(nxt); hist.push_back(nxt);
         if (!a.quiet) { const std::string s = tok.decode_piece(nxt); fwrite(s.data(), 1, s.size(), stdout); fflush(stdout); }
-        if (seq.n_past + 1 >= eng.max_ctx()) { stop = 2; break; }
-        if (!eng.step({&seq}, {&nxt}, {1}, logits.data(), &err)) { fprintf(stderr, "\ndecode failed: %s\n", err.c_str()); return 1; }
+        std::vector<int> drafts;
+        if (spec_draft > 0 && eng.spec_ok() && (int)gen.size() < a.n_predict) {
+            const int room = std::min({spec_draft, a.n_predict - (int)gen.size(), eng.max_ctx() - seq.n_past - 2});
+            if (room > 0) drafts = lookup_draft(hist, room, eng.model().eos_id, 2);
+        }
+        if (drafts.empty()) {
+            if (seq.n_past + 1 >= eng.max_ctx()) { stop = 2; break; }
+            if (!eng.step({&seq}, {&nxt}, {1}, logits.data(), &err)) { fprintf(stderr, "\ndecode failed: %s\n", err.c_str()); return 1; }
+            continue;
+        }
+        std::vector<LmSeq*> seqs{&seq}; std::vector<std::vector<int>> rows{{nxt}}; rows.back().insert(rows.back().end(), drafts.begin(), drafts.end());
+        const int m = (int)rows[0].size();
+        std::vector<float> lg((size_t)m * eng.n_vocab());
+        if (!eng.verify(seqs, rows, lg.data(), &err)) { fprintf(stderr, "\nverify failed: %s\n", err.c_str()); return 1; }
+        int acc = 0; bool fin = false;
+        for (int r = 0; r < m; ++r) {
+            const int tk = sampler.sample(lg.data() + (size_t)r * eng.n_vocab(), eng.n_vocab(), hist);
+            if (tk == eng.model().eos_id && !getenv("FERRO_LM_NOEOS")) { stop = 1; fin = true; break; }
+            gen.push_back(tk); hist.push_back(tk);
+            if (!a.quiet) { const std::string s = tok.decode_piece(tk); fwrite(s.data(), 1, s.size(), stdout); fflush(stdout); }
+            acc = r + 1;
+            if (r + 1 < m && tk == rows[0][r + 1]) continue;                              // the draft was what the model would have said: its row is valid too
+            break;
+        }
+        if (!eng.commit({&seq}, {0}, {acc})) { fprintf(stderr, "\ncommit failed\n"); return 1; }
+        memcpy(logits.data(), lg.data() + (size_t)(acc - 1) * eng.n_vocab(), (size_t)eng.n_vocab() * 4);
+        spec_d += (uint64_t)m - 1; spec_a += (uint64_t)acc - 1;                       // drafted / accepted (excluding the last produced token)
+        if (fin || (int)gen.size() >= a.n_predict) break;
     }
     const double t_dec = secs(td);
     if (!a.quiet) printf("\n");
     if (a.print_ids) { fprintf(stderr, "generated ids (%zu):", gen.size()); for (int i : gen) fprintf(stderr, " %d", i); fprintf(stderr, "\n"); }
-    fprintf(stderr, "[lm] prefill %d tokens in %.3fs (%.1f tok/s) | decode %zu tokens in %.3fs (%.2f tok/s) | stop: %s\n", n0, t_pre, n0 / std::max(t_pre, 1e-9),
-            gen.size(), t_dec, gen.size() / std::max(t_dec, 1e-9), stop == 1 ? "eos" : stop == 2 ? "context" : "length");
+    char sp[80]; sp[0] = 0;
+    if (spec_draft > 0 && eng.spec_ok()) snprintf(sp, sizeof sp, " | spec drafted %llu accepted %llu (%.1f%%)", (unsigned long long)spec_d, (unsigned long long)spec_a, spec_d ? 100.0 * (double)spec_a / (double)spec_d : 0.0);
+    fprintf(stderr, "[lm] prefill %d tokens in %.3fs (%.1f tok/s) | decode %zu tokens in %.3fs (%.2f tok/s) | stop: %s%s\n", n0, t_pre, n0 / std::max(t_pre, 1e-9),
+            gen.size(), t_dec, gen.size() / std::max(t_dec, 1e-9), stop == 1 ? "eos" : stop == 2 ? "context" : "length", sp);
     return 0;
 }
 

@@ -25,6 +25,7 @@ public:
     int n_vocab() const { return (int)tokens_.size(); }
     int mask_id() const { return mask_id_; }
     int bos_id() const { return bos_id_; }
+    bool add_bos() const { return add_bos_; }   // tokenizer.ggml.add_bos_token: raw prompts get a leading BOS only when true (llama.cpp's rule)
 
 private:
     void bpe_word(const std::string& word, std::vector<int>& out) const;
@@ -37,6 +38,7 @@ private:
     std::vector<int> specials_;                         // CONTROL / USER_DEFINED, longest first
     std::vector<std::string> regex_;
     bool ignore_merges_ = true;
+    bool add_bos_ = true;                                 // tokenizer.ggml.add_bos_token (LFM3: false — the template carries the BOS instead)
     bool spm_ = false;                                  // gemma4: spaces escape to U+2581, raw UTF-8 (no byte encoding), U+2581 -> space on decode
     int mask_id_ = -1, bos_id_ = -1;
 };

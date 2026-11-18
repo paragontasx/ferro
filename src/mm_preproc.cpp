@@ -13,8 +13,10 @@
 namespace ferro {
 
 // ============================================================ images
-// Pillow-compatible separable resampling (bilinear), 22-bit fixed point
-static void resize_pillow(const uint8_t* src, int sw, int sh, uint8_t* dst, int dw, int dh, bool bicubic) {
+// Pillow-compatible separable resampling (bilinear), 22-bit fixed point.
+// torch16: torchvision's antialiased resize quantizes the weights to int16 first (as many fractional
+// bits as the largest weight allows), then scales back up to PRECISION_BITS (mtmd-image.cpp).
+static void resize_pillow(const uint8_t* src, int sw, int sh, uint8_t* dst, int dw, int dh, bool bicubic, bool torch16 = false) {
     const int PRECISION_BITS = 32 - 8 - 2;
     const double filter_support = bicubic ? 2.0 : 1.0;
     auto filt = [bicubic](double x) {
@@ -55,9 +57,15 @@ static void resize_pillow(const uint8_t* src, int sw, int sh, uint8_t* dst, int 
             bounds[xx * 2 + 1] = xmax;
         }
         weights.resize((size_t)outSize * ksize);
-        const double fxp = std::ldexp(1.0, PRECISION_BITS);
+        int precision = PRECISION_BITS;
+        if (torch16) {
+            const double wmax = *std::max_element(pre.begin(), pre.end());
+            for (precision = 0; precision < PRECISION_BITS; precision++)
+                if ((int)(0.5 + wmax * std::ldexp(1.0, precision + 1)) >= (1 << 15)) break;
+        }
+        const double fxp = std::ldexp(1.0, precision);
         for (size_t i = 0; i < (size_t)outSize * ksize; i++)
-            weights[i] = (int32_t)(pre[i] * fxp + (pre[i] < 0 ? -0.5 : 0.5));
+            weights[i] = ((int32_t)(pre[i] * fxp + (pre[i] < 0 ? -0.5 : 0.5))) << (PRECISION_BITS - precision);
         return ksize;
     };
     auto horiz = [&](const uint8_t* s, int in_nx, int in_ny, int out_nx, int ksize, const std::vector<int>& b, const std::vector<int32_t>& w) {
@@ -113,6 +121,28 @@ static void resize_pillow(const uint8_t* src, int sw, int sh, uint8_t* dst, int 
 
 void resize_pillow_bilinear(const uint8_t* src, int sw, int sh, uint8_t* dst, int dw, int dh) { resize_pillow(src, sw, sh, dst, dw, dh, false); }
 void resize_pillow_bicubic(const uint8_t* src, int sw, int sh, uint8_t* dst, int dw, int dh) { resize_pillow(src, sw, sh, dst, dw, dh, true); }
+void resize_pillow_bicubic_torch(const uint8_t* src, int sw, int sh, uint8_t* dst, int dw, int dh) { resize_pillow(src, sw, sh, dst, dw, dh, true, true); }
+
+// ============================================================ LFM3-VL (projector lfm3vl, d1-2B mmproj)
+// mtmd_image_preprocessor_lfm3vl: Qwen-style smart_resize to a multiple of patch*n_merge (32),
+// torchvision bicubic stretch (no letterbox), token budget 64..4096 (patch_area = 16*16*2*2).
+static void lfm3vl_smart_resize(int width, int height, int factor, int64_t min_pixels, int64_t max_pixels, int& nw, int& nh) {
+    const double h = height, w = width;
+    int h_bar = (int)std::nearbyint(h / factor) * factor;
+    int w_bar = (int)std::nearbyint(w / factor) * factor;
+    if ((int64_t)h_bar * w_bar > max_pixels) {
+        const double beta = std::sqrt(h * w / (double)max_pixels);
+        h_bar = (int)std::floor(h / beta / factor) * factor;
+        w_bar = (int)std::floor(w / beta / factor) * factor;
+    } else if ((int64_t)h_bar * w_bar < min_pixels) {
+        const double beta = std::sqrt((double)min_pixels / (h * w));
+        h_bar = (int)std::ceil(h * beta / factor) * factor;
+        w_bar = (int)std::ceil(w * beta / factor) * factor;
+    }
+    nw = std::max(factor, w_bar);
+    nh = std::max(factor, h_bar);
+}
+
 
 namespace {
 struct Size { int w = 0, h = 0; };
@@ -200,6 +230,25 @@ std::vector<uint8_t> resize(const uint8_t* rgb, int nx, int ny, int w, int h) {
     return out;
 }
 }  // namespace
+
+// LFM3-VL (projector lfm3vl, d1-2B mmproj): one image, Qwen smart_resize to a multiple of
+// patch*n_merge, torchvision bicubic stretch (no letterbox), normalize, planar CHW.
+VisionInput lfm3vl_preprocess_image(const uint8_t* rgb, int nx, int ny, const VisionPreParams& p) {
+    if (nx <= 0 || ny <= 0) throw std::invalid_argument("empty image");
+    const int factor = p.patch_size * p.n_merge;
+    int nw = 0, nh = 0;
+    lfm3vl_smart_resize(nx, ny, factor, p.min_pixels, p.max_pixels, nw, nh);
+    if (nw > 65536 || nh > 65536) throw std::invalid_argument("resized image too large for the vision encoder");
+    std::vector<uint8_t> rs((size_t)nw * nh * 3);
+    if (nw != nx || nh != ny) resize_pillow_bicubic_torch(rgb, nx, ny, rs.data(), nw, nh);
+    else std::copy(rgb, rgb + rs.size(), rs.data());
+    return to_input(rs, nw, nh, p);
+}
+
+int lfm3vl_vision_tokens(const VisionInput& v, const VisionPreParams& p) {
+    const int op = p.patch_size * p.n_merge;
+    return (v.nx / op) * (v.ny / op);                 // merge must be exact (resized to a multiple of op)
+}
 
 std::vector<VisionInput> d1omni_preprocess_image(const uint8_t* rgb, int nx, int ny, const VisionPreParams& p) {
     if (nx <= 0 || ny <= 0) throw std::invalid_argument("empty image");

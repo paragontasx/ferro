@@ -20,10 +20,14 @@ struct LmLayer {
     bool conv = false;
     std::vector<float> attn_norm, ffn_norm;
     WMat in_proj, out_proj;            // conv block: in_proj rows = 3*d (b | c | x)
-    std::vector<float> taps;           // [3][d]: tap k multiplies token t-2+k
+    std::vector<float> taps;           // [L][d]: tap k multiplies token t-L+1+k (L = 3 LFM2.x, 7 LFM3)
     WMat wqkv, wo;                     // attention block: wqkv rows = nq*hd + 2*nkv*hd
     std::vector<float> q_norm, k_norm; // [hd]
     WMat gateup, down;                 // gateup rows = 2*ff (gate | up)
+    // LFM3 additions
+    std::vector<float> post_attn_norm, post_ffn_norm;   // sandwich norms (norm the block output before the residual add)
+    WMat attn_gate;                    // [d][n_head] per-head sigmoid gate on the attention output
+    bool swa = false;                  // sliding-window attention block (LFM3)
 };
 
 struct LmModel {
@@ -37,15 +41,24 @@ struct LmModel {
     std::vector<LmLayer> L;
     RopeTable rope;
     int n_conv_layers = 0, n_attn_layers = 0;
-    bool load(const std::string& path, int max_ctx, std::string* err);
+    // LFM3 additions
+    int n_conv_state = 2;              // conv-state rows per conv layer: L-1 (2 for LFM2.x, 6 for LFM3)
+    int swa_window = 0;                // sliding window (tokens) for swa layers, 0 = none
+    double rope_base_swa = 0;          // rope freq base of the swa layers
+    std::vector<float> rope_freqs;     // per-pair rope freq factors of the full-attention layers ([hd/2]: 1.0 = rotate, 1e30 = identity)
+    RopeTable rope_swa;                // rope table for the swa layers (built only when swa_window > 0)
+    bool sandwich = false;             // post_attention_norm / post_ffw_norm present (LFM3)
+    bool has_gate = false;             // per-head attention gates (LFM3)
+    bool load(const std::string& path, int max_ctx, std::string* err, bool allow_decision = false);
 };
 bool is_lfm2_lm(const GgufFile& g);    // arch lfm2, causal, no decision head
+bool is_lfm3_lm(const GgufFile& g);    // arch lfm3, causal (sandwich norms, per-head gates, 7-tap conv, mixed SWA)
 
 // state of one generation stream
 struct LmSeq {
     int n_past = 0;                                  // tokens whose state is in the caches
     std::vector<std::vector<float>> k, v;            // [attention layer] host caches, n_past * n_kv * hd floats (CPU path)
-    std::vector<std::vector<float>> conv;            // [conv layer] 2 * d floats: bx of tokens t-2, t-1 (zeros at the start)
+    std::vector<std::vector<float>> conv;            // [conv layer] n_conv_state * d floats: bx of tokens t-n_conv_state .. t-1
     int gpu_slot = -1;                               // device-resident state slot (iGPU path), -1 = none
 };
 
@@ -53,7 +66,7 @@ struct LmSeq {
 // Produced by LmEngine::snapshot, consumed by LmEngine::restore (any slot, any number of times). Owns its device buffers.
 struct LmPrefix {
     int n = 0;
-    std::vector<void*> kv, kvs, cst;                  // per attention layer: n * kvw floats (int8 KV: n * kvw bytes + kvs: n * kvw/32 fp32 scales); per conv layer: 2 * d floats
+    std::vector<void*> kv, kvs, cst;                  // per attention layer: n * kvw floats (int8 KV: n * kvw bytes + kvs: n * kvw/32 fp32 scales); per conv layer: n_conv_state * d floats
     size_t bytes = 0;
     LmPrefix() = default;
     LmPrefix(const LmPrefix&) = delete; LmPrefix& operator=(const LmPrefix&) = delete;
@@ -120,6 +133,7 @@ private:
     bool forward_gpu(const std::vector<LmSeq*>& seqs, const std::vector<const int*>& toks, const std::vector<int>& n, float* logits, std::string* err,
                      bool force_prefill = false);
     void forward_cpu(const std::vector<LmSeq*>& seqs, const std::vector<const int*>& toks, const std::vector<int>& n, float* logits);
+    void forward_cpu_lfm3(const std::vector<LmSeq*>& seqs, const std::vector<const int*>& toks, const std::vector<int>& n, float* logits);
 };
 
 }  // namespace ferro

@@ -42,6 +42,12 @@ static void* g_lib = nullptr;
 #endif
 #define ATTN_MAXS 1024
 
+// runtime-tunable GEMM tile height (prefill sweep knob): kernels JIT with this value per process
+static int tt_main() {
+    static const int v = getenv("FERRO_GPU_TT") ? atoi(getenv("FERRO_GPU_TT")) : FERRO_GPU_TT;
+    return v;
+}
+
 static const char* kSrc = R"CL(
 #pragma OPENCL EXTENSION cl_khr_integer_dot_product : enable
 
@@ -1880,6 +1886,237 @@ __kernel void lm_conv_win_q(__global const float* C, __global const int* src1, _
   const float4 y = bx * vload4(lid, taps + 2 * d) + b1 * vload4(lid, taps + d) + b2 * vload4(lid, taps);
   quant_lane4(vload4(lid, r + d) * y, am, Xp, Xs, t, d);
 }
+
+// ================= LFM3: head_dim 128, 7-tap conv, sandwich post-norms, per-head output gate =================
+// row rmsnorm*w in place (sandwich post-norm: applied to a GEMM output D before the residual add)
+__kernel void rms_inplace(__global float* D, __global const float* w, int cols, float eps) {
+  __local float red[32];
+  const int t = get_group_id(0), lid = get_local_id(0);
+  __global float* dr = D + (size_t)t * cols;
+  float4 y = vload4(lid, dr);
+  vstore4(y * (1.0f / sqrt(wg_add(dot(y, y), red) / (float)cols + eps)) * vload4(lid, w), lid, dr);
+}
+// 7-tap causal conv gate (prefill): C = [b|c|x] rows; S[t*6+k] = row of token t-6+k (>=0) or global state row -1-(slot*6+k')
+__kernel void lm_conv_q7(__global const float* C, __global const int* S, __global const float* st, __global const float* taps,
+                         __global uint* Xp, __global float* Xs, int d) {
+  __local float am[512];
+  const int t = get_group_id(0), lid = get_local_id(0);
+  const __global float* r = C + (size_t)t * 3 * d;
+  float4 y = vload4(lid, r) * vload4(lid, r + 2 * d) * vload4(lid, taps + 6 * d);
+  for (int k = 0; k < 6; ++k) {
+    const int s = S[t * 6 + k];
+    float4 v;
+    if (s >= 0) { const __global float* p = C + (size_t)s * 3 * d; v = vload4(lid, p) * vload4(lid, p + 2 * d); }
+    else v = vload4(lid, st + (size_t)(-1 - s) * d);
+    y += v * vload4(lid, taps + (size_t)k * d);
+  }
+  quant_lane4(vload4(lid, r + d) * y, am, Xp, Xs, t, d);
+}
+// prefill conv state update: R[s*6+j] = row of token T-6+j of the slice (>=0) or the old state row -1-(T+j) of the slot
+__kernel void lm_conv_state7(__global const float* C, __global float* st, __global const int* slot, __global const int* R, int d) {
+  const int s = get_group_id(0), lid = get_local_id(0);
+  __global float* sb = st + (size_t)slot[s] * 6 * d;
+  float4 old[6];                                                    // the kept rows overlap the written rows: read the whole state first
+  #pragma unroll
+  for (int j = 0; j < 6; ++j) old[j] = vload4(lid, sb + (size_t)j * d);
+  for (int j = 0; j < 6; ++j) {
+    const int rj = R[s * 6 + j];
+    if (rj >= 0) { const __global float* p = C + (size_t)rj * 3 * d; vstore4(vload4(lid, p) * vload4(lid, p + 2 * d), lid, sb + (size_t)j * d); }
+    else vstore4(old[-1 - rj], lid, sb + (size_t)j * d);            // keep old row (T+j): state shifts up by cnt rows
+  }
+}
+// fused decode conv (row t = its own sequence, slot[t]): old state rows 0..5 hold b*x of the previous 6 tokens; y = sum st[j]*taps[j] + bx*taps[6];
+// the new state shifts up one row and appends bx. Each lane owns its 4 channels of all rows: no hazard in the work-group.
+__kernel void lm_conv_dec_q7(__global const float* C, __global float* st, __global const int* slot, __global const float* taps,
+                             __global uint* Xp, __global float* Xs, int d) {
+  __local float am[512];
+  const int t = get_group_id(0), lid = get_local_id(0);
+  const __global float* r = C + (size_t)t * 3 * d;
+  __global float* sb = st + (size_t)slot[t] * 6 * d;
+  const float4 bx = vload4(lid, r) * vload4(lid, r + 2 * d);
+  float4 s[6];
+  #pragma unroll
+  for (int j = 0; j < 6; ++j) s[j] = vload4(lid, sb + (size_t)j * d);
+  float4 y = bx * vload4(lid, taps + 6 * d);
+  #pragma unroll
+  for (int j = 0; j < 6; ++j) y += s[j] * vload4(lid, taps + (size_t)j * d);
+  #pragma unroll
+  for (int j = 0; j < 5; ++j) vstore4(s[j + 1], lid, sb + (size_t)j * d);
+  vstore4(bx, lid, sb + 5 * d);
+  quant_lane4(vload4(lid, r + d) * y, am, Xp, Xs, t, d);
+}
+// q/k RMSNorm + rope (in place on C) + quantized K/V rows into the int8 cache: head_dim 128 (4 scale blocks per head)
+__kernel void lm_qkv_post_kvq128(__global float* C, int rowc, int nq, int nkv, __global const float* qw, __global const float* kw,
+                                 __global const float* cosb, __global const float* sinb, __global const int* pos, float eps,
+                                 __global char* KVq, __global float* KVs, __global const int* dst, int kvw) {
+  __local float red[32];
+  __local float mx[32];
+  const int slot = get_group_id(0), t = get_group_id(1), lid = get_local_id(0);      // 16 lanes, lane owns float4s at 4l and 64+4l
+  __global float* v = C + (size_t)t * rowc + slot * 128;
+  float4 a = vload4(lid, v), b = vload4(lid, v + 64);
+  const bool isv = slot >= nq + nkv;
+  if (!isv) {
+    const float inv = 1.0f / sqrt(wg_add(dot(a, a) + dot(b, b), red) / 128.0f + eps);
+    __global const float* w = slot < nq ? qw : kw;
+    a = a * inv * vload4(lid, w);
+    b = b * inv * vload4(lid, w + 64);
+    const int p = pos[t];
+    const float4 c = vload4(lid, cosb + (size_t)p * 64), sn = vload4(lid, sinb + (size_t)p * 64);
+    const float4 na = a * c - b * sn, nb = b * c + a * sn;
+    vstore4(na, lid, v); vstore4(nb, lid, v + 64);
+    a = na; b = nb;
+  }
+  if (slot < nq) return;                                    // query heads are not cached
+  mx[(lid >> 3) * 8 + (lid & 7)] = fmax(fmax(fabs(a.x), fabs(a.y)), fmax(fabs(a.z), fabs(a.w)));
+  mx[(2 + (lid >> 3)) * 8 + (lid & 7)] = fmax(fmax(fabs(b.x), fabs(b.y)), fmax(fabs(b.z), fabs(b.w)));
+  barrier(CLK_LOCAL_MEM_FENCE);
+  float sq[4];
+  for (int q = 0; q < 4; ++q) { float m0 = 0.f; for (int i = 0; i < 8; ++i) m0 = fmax(m0, mx[q * 8 + i]); sq[q] = m0 / 127.f; }
+  const int hh = isv ? slot - nq - nkv : slot - nq;
+  __global char* o = KVq + (size_t)dst[t] * kvw + (isv ? (size_t)nkv * 128 : 0) + (size_t)hh * 128;
+  const float ia = sq[lid >> 3] > 0.f ? 1.f / sq[lid >> 3] : 0.f, ib = sq[2 + (lid >> 3)] > 0.f ? 1.f / sq[2 + (lid >> 3)] : 0.f;
+  vstore4(convert_char4_sat_rte(a * ia), lid, o);
+  vstore4(convert_char4_sat_rte(b * ib), 16 + lid, o);
+  if (lid == 0) {
+    __global float* sp = KVs + (size_t)dst[t] * (kvw / 32) + (isv ? (nkv * 128) / 32 : 0) + hh * 4;
+    sp[0] = sq[0]; sp[1] = sq[1]; sp[2] = sq[2]; sp[3] = sq[3];
+  }
+}
+// prefill causal attention, int8 KV cache, head_dim 128: WG per (head, 32-query tile) with 2 lanes per query (each owns a 64-dim half);
+// pair partial scores meet in SLM. Causal + SWA window (swa_w <= 0 = full); bi = 1: BIDIRECTIONAL over the whole prompt
+// (LFM3-d1 decision global layers: every query row sees keys [pos0, pos0+T-1]); no causal mask, no window.
+// Optional per-head sigmoid gate row GA[t][h] (int8-quantized output).
+__kernel void lm_attn_pf_q128(__global const float* C, int ldc, __global const char* KVq, __global const float* KVs, int ldkv, int voff,
+                              int kvbase, int nq, int nkv, int pos0, float scale, __global const float* GA, int gld, int swa_w,
+                              __global uint* Xp, __global float* Xs, int T, int bi) {
+  __local float Qs[64 * 68];
+  __local float Ks[KT5 * 128];
+  __local float Vs[KT5 * 128];
+  __local float pd[64 * KT5];
+  const int h = get_group_id(0), lid = get_local_id(0);
+  const int t0 = get_group_id(1) * QT5;
+  const int tq = t0 + (lid >> 1), hf = lid & 1, t = min(tq, T - 1);
+  const int kvh = h / (nq / nkv);
+  const __global float* qr = C + (size_t)t * ldc + h * 128 + hf * 64;
+  for (int i = 0; i < 16; ++i) vstore4(vload4(i, qr) * (scale * 1.4426950408889634f), i, Qs + lid * 68);
+  float4 acc[16];
+  for (int i = 0; i < 16; ++i) acc[i] = (float4)(0.f);
+  float m = -1e30f, l = 0.f;
+  const int thi = bi ? pos0 + T - 1 : pos0 + min(t0 + QT5 - 1, T - 1);
+  const int myhi = pos0 + tq;
+  const int kstart = (bi || swa_w <= 0) ? 0 : max(0, pos0 + t0 - swa_w + 1);
+  for (int k0 = kstart; k0 <= thi; k0 += KT5) {
+    const int kn = min(KT5, thi - k0 + 1);
+    barrier(CLK_LOCAL_MEM_FENCE);
+    const __global char* kvrow0 = KVq + (size_t)(kvbase + k0) * ldkv + kvh * 128;
+    const __global float* kvs0 = KVs + (size_t)(kvbase + k0) * (ldkv / 32) + kvh * 4;
+    for (int i = lid; i < kn * 32; i += 64) {
+      const int r = i >> 5, c4 = i & 31;
+      const __global char* row = kvrow0 + r * ldkv;
+      const __global float* sr = kvs0 + r * (ldkv / 32);
+      vstore4(convert_float4(vload4(c4, row)) * sr[c4 >> 3], c4, Ks + r * 128);
+      vstore4(convert_float4(vload4(c4, row + voff)) * sr[voff / 32 + (c4 >> 3)], c4, Vs + r * 128);
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int j = 0; j < kn; ++j) {
+      float4 s4 = (float4)(0.f);
+      #pragma unroll 8
+      for (int i = 0; i < 16; ++i) s4 = mad(vload4(i, Qs + lid * 68), vload4(i, Ks + j * 128 + hf * 64), s4);
+      pd[lid * KT5 + j] = s4.x + s4.y + s4.z + s4.w;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int j = 0; j < kn; ++j) {
+      const int key = k0 + j;
+      if (!bi && (key > myhi || (swa_w > 0 && key < myhi - swa_w + 1))) continue;
+      const float sj = pd[lid * KT5 + j] + pd[(lid ^ 1) * KT5 + j];
+      if (sj > m) {
+        const float a = native_exp2(m - sj);
+        for (int i = 0; i < 16; ++i) acc[i] *= a;
+        l *= a; m = sj;
+      }
+      const float p = native_exp2(sj - m);
+      l += p;
+      for (int i = 0; i < 16; ++i) acc[i] = mad((float4)(p), vload4(i, Vs + j * 128 + hf * 64), acc[i]);
+    }
+  }
+  if (tq >= T) return;
+  const float gate = GA ? 1.0f / (1.0f + native_exp2(-GA[(size_t)tq * gld + h] * 1.4426950408889634f)) : 1.0f;
+  const float inv = (l > 0.f ? 1.0f / l : 0.f) * gate;
+  const int cols = nq * 128;
+  for (int b = 0; b < 2; ++b) {
+    float amax = 0.f;
+    for (int i = 0; i < 8; ++i) { const float4 a = fabs(acc[b * 8 + i] * inv); amax = fmax(amax, fmax(fmax(a.x, a.y), fmax(a.z, a.w))); }
+    const float dq = amax / 127.f, id = dq > 0.f ? 1.f / dq : 0.f;
+    for (int i = 0; i < 8; ++i)
+      Xp[(size_t)tq * (cols / 4) + h * 32 + hf * 16 + b * 8 + i] = as_uint(convert_char4_sat_rte(acc[b * 8 + i] * inv * id));
+    Xs[(size_t)tq * (cols / 32) + h * 4 + hf * 2 + b] = dq;
+  }
+}
+// decode causal attention, int8 KV, head_dim 128: WG = 128 lanes per (head, row), lane e accumulates output dim e;
+// keys [max(0, len-swa_w), len). Per-head sigmoid gate applied before int8 quantization of the wo input.
+__kernel void lm_attn_dec_q128(__global const float* C, int ldc, __global const char* KVq, __global const float* KVs, int ldkv, int voff,
+                               __global const int* bases, __global const int* lens, int nq, int nkv, float scale,
+                               __global const float* GA, int gld, int swa_w, __global uint* Xp, __global float* Xs) {
+  __local float sc[DCH];
+  __local float qs[128];
+  __local float rd[128];
+  __local char q8[128];
+  const int h = get_group_id(0), b = get_group_id(1), lid = get_local_id(0);
+  const int kvh = h / (nq / nkv), len = lens[b], base = bases[b];
+  const int wstart = swa_w > 0 ? max(0, len - swa_w) : 0;
+  qs[lid] = C[(size_t)b * ldc + h * 128 + lid] * (scale * 1.4426950408889634f);
+  barrier(CLK_LOCAL_MEM_FENCE);
+  float m = -1e30f, l = 0.f, acc = 0.f;
+  for (int c0 = wstart; c0 < len; c0 += DCH) {
+    const int n = min(DCH, len - c0);
+    float lmax = -1e30f;
+    for (int j = lid; j < n; j += 128) {
+      const size_t ri = (size_t)(base + c0 + j);
+      const __global char* row = KVq + ri * ldkv + kvh * 128;
+      const __global float* srow = KVs + ri * (ldkv / 32) + kvh * 4;
+      float4 sa = (float4)(0.f), sb = sa, s2 = sa, s3 = sa;
+      for (int i = 0; i < 8; ++i) {
+        sa = mad(vload4(i, qs), convert_float4(vload4(i, row)), sa);
+        sb = mad(vload4(i + 8, qs), convert_float4(vload4(i + 8, row)), sb);
+        s2 = mad(vload4(i + 16, qs), convert_float4(vload4(i + 16, row)), s2);
+        s3 = mad(vload4(i + 24, qs), convert_float4(vload4(i + 24, row)), s3);
+      }
+      const float s = (sa.x + sa.y + sa.z + sa.w) * srow[0] + (sb.x + sb.y + sb.z + sb.w) * srow[1]
+                    + (s2.x + s2.y + s2.z + s2.w) * srow[2] + (s3.x + s3.y + s3.z + s3.w) * srow[3];
+      sc[j] = s; lmax = fmax(lmax, s);
+    }
+    rd[lid] = lmax;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    float cm = rd[0];
+    for (int i = 1; i < 128; ++i) cm = fmax(cm, rd[i]);
+    barrier(CLK_LOCAL_MEM_FENCE);
+    const float nm = fmax(m, cm);
+    const float a = native_exp2(m - nm);
+    acc *= a; l *= a; m = nm;
+    float ls = 0.f;
+    for (int j = lid; j < n; j += 128) { const float p = native_exp2(sc[j] - m); sc[j] = p; ls += p; }
+    rd[lid] = ls;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    float tot = 0.f;
+    for (int i = 0; i < 128; ++i) tot += rd[i];
+    l += tot;
+    for (int j = 0; j < n; ++j) { const size_t ri = (size_t)(base + c0 + j); acc = mad(sc[j] * KVs[ri * (ldkv / 32) + voff / 32 + kvh * 4 + (lid >> 5)], (float)KVq[ri * ldkv + voff + kvh * 128 + lid], acc); }
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  float o = l > 0.f ? acc / l : 0.f;
+  if (GA) o *= 1.0f / (1.0f + native_exp2(-GA[(size_t)b * gld + h] * 1.4426950408889634f));
+  rd[lid] = fabs(o);
+  barrier(CLK_LOCAL_MEM_FENCE);
+  const int b0 = lid & ~31;
+  float amax = 0.f;
+  for (int i = 0; i < 32; ++i) amax = fmax(amax, rd[b0 + i]);
+  const float dq = amax / 127.f, id = dq > 0.f ? 1.f / dq : 0.f;
+  q8[lid] = convert_char_sat_rte(o * id);
+  barrier(CLK_LOCAL_MEM_FENCE);
+  const int cols = nq * 128;
+  if (lid < 32) Xp[(size_t)b * (cols / 4) + h * 32 + lid] = ((__local uint*)q8)[lid];
+  if ((lid & 31) == 0) Xs[(size_t)b * (cols / 32) + h * 4 + (lid >> 5)] = dq;
+}
 )CL";
 
 // ---------------------------------------------------------------- state
@@ -1910,6 +2147,7 @@ static cl_kernel k_quant = nullptr, k_gemm = nullptr, k_gemm_sw = nullptr, k_rms
                  k_rnq = nullptr, k_hinq = nullptr, k_convq = nullptr, k_siluq = nullptr, k_bactq = nullptr,
                  k_badd = nullptr, k_score = nullptr, k_attq4 = nullptr, k_attq5 = nullptr, k_quantq = nullptr, k_lngq = nullptr, k_dqk = nullptr, k_dsm = nullptr, k_dpv = nullptr, k_qkvg4 = nullptr, k_dqkh = nullptr, k_dpvh = nullptr, k_dsmw = nullptr, k_anq = nullptr, k_aact = nullptr, k_ares = nullptr, k_aconv = nullptr, k_aattn = nullptr, k_lmconv = nullptr, k_lmcst = nullptr, k_lmkv = nullptr, k_lmpf = nullptr, k_lmdec = nullptr, k_lmcdec = nullptr, k_lmqkv = nullptr;
 static cl_kernel k_lmpfq = nullptr, k_lmdecq = nullptr, k_lmqkvq = nullptr, k_lmcwin = nullptr;   // int8-KV variants
+static cl_kernel k_rmsi = nullptr, k_lmconv7 = nullptr, k_lmcst7 = nullptr, k_lmcdec7 = nullptr, k_lmqkvq128 = nullptr, k_lmpfq128 = nullptr, k_lmdecq128 = nullptr;   // LFM3 (hd 128, 7-tap conv)
 static cl_program g_prog_ds = nullptr;                    // split-K decode attention (own program: a build failure keeps the per-head kernels)
 static cl_kernel k_lmds = nullptr, k_lmdsq = nullptr, k_lmdm = nullptr;
 static cl_kernel k_lmkvf = nullptr, k_lmpff = nullptr, k_lmdsf = nullptr;   // fp16 KV variants (same program)
@@ -1971,7 +2209,7 @@ bool init(bool verbose) {
     // The classic -cl-intel-256-GRF spelling is REJECTED by this build: use -ze-opt-large-register-file.
     static const char* grfopt = getenv("FERRO_GPU_GRF") ? " -ze-opt-large-register-file" : "";
     snprintf(opts, sizeof opts, "-cl-std=CL3.0 -DTT=%d -DKB=%d -DMAXS=%d -cl-mad-enable%s",
-             FERRO_GPU_TT, FERRO_GPU_KB, ATTN_MAXS, grfopt);
+             tt_main(), FERRO_GPU_KB, ATTN_MAXS, grfopt);
     if (cl.clBuildProgram(g_prog, 1, &dev, opts, nullptr, nullptr) != CL_SUCCESS) {
         if (verbose) {
             size_t n = 0; cl.clGetProgramBuildInfo(g_prog, dev, CL_PROGRAM_BUILD_LOG, 0, nullptr, &n);
@@ -1985,14 +2223,14 @@ bool init(bool verbose) {
         {&k_attn, "attention"}, {&k_gmul, "gelu_mul"}, {&k_gmulv, "gelu_mulvec"}, {&k_add, "add_scale"},
         {&k_rowf, "row_fused"}, {&k_qkvp, "qkv_post"}, {&k_attq, "attention_q"}, {&k_gmq, "gelu_mul_q"},
         {&k_gmvq, "gelu_mulvec_q"}, {&k_attq2, "attention_q2"}, {&k_gmq2, "gelu_mul_q2"}, {&k_gmvq2, "gelu_mulvec_q2"},
-        {&k_qkvg4, "qkv_post_g4"}, {&k_dsmw, "dattn_stats_w"}, {&k_anq, "a_norm_quant"}, {&k_aact, "a_act_quant"}, {&k_ares, "a_resid"}, {&k_aconv, "a_conv_mid"}, {&k_aattn, "a_attn"}, {&k_lmconv, "lm_conv_q"}, {&k_lmcst, "lm_conv_state"}, {&k_lmkv, "lm_kv_write"}, {&k_lmpf, "lm_attn_pf"}, {&k_lmdec, "lm_attn_dec"}, {&k_lmcdec, "lm_conv_dec_q"}, {&k_lmqkv, "lm_qkv_post_kv"}, {&k_lmcwin, "lm_conv_win_q"}, {&k_lmpfq, "lm_attn_pf_q"}, {&k_lmdecq, "lm_attn_dec_q"}, {&k_lmqkvq, "lm_qkv_post_kvq"}, {&k_dqkh, "dattn_qk_h"}, {&k_dpvh, "dattn_pv_h"}, {&k_rowf3, "row_fused3"}, {&k_qkvp3, "qkv_post3"}, {&k_attq3, "attention_q3"}, {&k_gmq3, "gelu_mul_q3"},
+        {&k_qkvg4, "qkv_post_g4"}, {&k_dsmw, "dattn_stats_w"}, {&k_anq, "a_norm_quant"}, {&k_aact, "a_act_quant"}, {&k_ares, "a_resid"}, {&k_aconv, "a_conv_mid"}, {&k_aattn, "a_attn"}, {&k_lmconv, "lm_conv_q"}, {&k_lmcst, "lm_conv_state"}, {&k_lmkv, "lm_kv_write"}, {&k_lmpf, "lm_attn_pf"}, {&k_lmdec, "lm_attn_dec"}, {&k_lmcdec, "lm_conv_dec_q"}, {&k_lmqkv, "lm_qkv_post_kv"}, {&k_lmcwin, "lm_conv_win_q"}, {&k_lmpfq, "lm_attn_pf_q"}, {&k_lmdecq, "lm_attn_dec_q"}, {&k_lmqkvq, "lm_qkv_post_kvq"}, {&k_rmsi, "rms_inplace"}, {&k_lmconv7, "lm_conv_q7"}, {&k_lmcst7, "lm_conv_state7"}, {&k_lmcdec7, "lm_conv_dec_q7"}, {&k_lmqkvq128, "lm_qkv_post_kvq128"}, {&k_lmpfq128, "lm_attn_pf_q128"}, {&k_lmdecq128, "lm_attn_dec_q128"}, {&k_dqkh, "dattn_qk_h"}, {&k_dpvh, "dattn_pv_h"}, {&k_rowf3, "row_fused3"}, {&k_qkvp3, "qkv_post3"}, {&k_attq3, "attention_q3"}, {&k_gmq3, "gelu_mul_q3"},
         {&k_gmvq3, "gelu_mulvec_q3"}, {&k_rnq, "resid_norm_q3"}, {&k_hinq, "head_in_q3"}, {&k_convq, "conv_gate_q3"},
         {&k_siluq, "silu_mul_q8"}, {&k_bactq, "bias_act_q8"}, {&k_badd, "bias_add"}, {&k_score, "score_out"}, {&k_attq4, "attention_q4"}, {&k_attq5, "attention_q5"}, {&k_quantq, "quant_q3"}, {&k_lngq, "ln_gather_q3"}, {&k_dqk, "dattn_qk"}, {&k_dsm, "dattn_stats"}, {&k_dpv, "dattn_pv"}};
     for (auto& k : ks) { *k.k = cl.clCreateKernel(g_prog, k.n, &err); CK(err); }
     build_split_attn(verbose);                            // optional: when it fails, decode attention stays on the per-head kernels
     g_ok = true;
     if (verbose) fprintf(stderr, "[gpu] %s ready (int8 DP4A GEMM TT=%d KB=%d, on-device layer loop)\n",
-                         g_name.c_str(), FERRO_GPU_TT, FERRO_GPU_KB);
+                         g_name.c_str(), tt_main(), FERRO_GPU_KB);
     return true;
 }
 #undef CK
@@ -2089,7 +2327,7 @@ static bool ensure_kb8() {
     g_prog8 = cl.clCreateProgramWithSource(g_ctx, 1, &kSrc, nullptr, &err);
     if (err != CL_SUCCESS) return false;
     char opts[256];
-    snprintf(opts, sizeof opts, "-cl-std=CL3.0 -DTT=%d -DKB=8 -DMAXS=%d -cl-mad-enable", FERRO_GPU_TT, ATTN_MAXS);
+    snprintf(opts, sizeof opts, "-cl-std=CL3.0 -DTT=%d -DKB=8 -DMAXS=%d -cl-mad-enable", tt_main(), ATTN_MAXS);
     if (cl.clBuildProgram(g_prog8, 1, &g_dev, opts, nullptr, nullptr) != CL_SUCCESS) return false;
     k_gemm8 = cl.clCreateKernel(g_prog8, "q8gemm", &err);
     if (err != CL_SUCCESS) { k_gemm8 = nullptr; return false; }
@@ -2148,7 +2386,7 @@ bool op_gemm(int slot, Buf X, int T, Buf Y) {
     if (!launch(k_quant, 2, gq, nullptr)) return false;
     cl_kernel kg = s.kb == FERRO_GPU_KB ? k_gemm : k_gemm8;
     set_args(kg, (Buf)s.wp, (Buf)s.ws, (Buf)g_Xp, (Buf)g_Xs, Y, (cl_int)rows, (cl_int)cols, (cl_int)T);
-    size_t gg[2] = {(size_t)rows / 4, (size_t)((T + FERRO_GPU_TT - 1) / FERRO_GPU_TT)};
+    size_t gg[2] = {(size_t)rows / 4, (size_t)((T + tt_main() - 1) / tt_main())};
     size_t lg[2] = {s.lws, 1};
     return launch(kg, 2, gg, lg);
 }
@@ -2157,7 +2395,7 @@ bool op_gemm(int slot, Buf X, int T, Buf Y) {
 static bool use_swizzle(const Slot& s, int T) {
     static const int mode = getenv("FERRO_GPU_SWIZZLE") ? atoi(getenv("FERRO_GPU_SWIZZLE")) : -1;   // -1 auto
     if (mode >= 0) return mode != 0;
-    return (size_t)s.rows * s.cols >= ((size_t)1 << 20) && (T + FERRO_GPU_TT - 1) / FERRO_GPU_TT >= 8;
+    return (size_t)s.rows * s.cols >= ((size_t)1 << 20) && (T + tt_main() - 1) / tt_main() >= 8;
 }
 
 void set_row_policy(int p) { g_row_policy = p; }
@@ -2183,7 +2421,7 @@ bool op_gemm_q(int slot, int T, Buf Y) {
     }
     const bool tile_only = g_row_policy == 2;
     cl_kernel k = use_swizzle(s, T) ? (k8 ? k_gemm_sw8 : k_gemm_sw) : (k8 ? k_gemm8 : k_gemm);
-    int tt = FERRO_GPU_TT;
+    int tt = tt_main();
     if (T <= 4 && !k8 && !tile_only && !use_swizzle(s, T)) {
         const int si = small_idx(T);
         if (ensure_small(si)) {
@@ -2998,6 +3236,49 @@ bool op_lm_qkv_post_kvq(Buf C, int rowc, int T, int nq, int nkv, int hd, Buf qw,
     set_args(k_lmqkvq, C, (cl_int)rowc, (cl_int)nq, (cl_int)nkv, (cl_int)hd, qw, kw, cosb, sinb, pos, (cl_int)hlf, eps, KVq, KVs, dst, (cl_int)kvw);
     size_t g[2] = {(size_t)(nq + 2 * nkv) * LS, (size_t)T}, l[2] = {LS, 1};
     return launch(k_lmqkvq, 2, g, l);
+}
+// ---- LFM3 host wrappers (hd 128, 7-tap conv, sandwich post-norms, gated attention) ----
+bool op_rms_inplace(Buf D, Buf w, int T, int cols, float eps) {
+    if (cols % 32 || cols / 4 > 512) return false;
+    set_args(k_rmsi, D, w, (cl_int)cols, eps);
+    size_t g[1] = {(size_t)T * (cols / 4)}, l[1] = {(size_t)cols / 4};
+    return launch(k_rmsi, 1, g, l);
+}
+bool op_lm_conv_q7(Buf C, Buf S, Buf st, Buf taps, int T, int d) {
+    if (d % 32 || d / 4 > 512) return false;
+    set_args(k_lmconv7, C, S, st, taps, (Buf)g_Xp, (Buf)g_Xs, (cl_int)d);
+    size_t g[1] = {(size_t)T * (d / 4)}, l[1] = {(size_t)d / 4};
+    return launch(k_lmconv7, 1, g, l);
+}
+bool op_lm_conv_state7(Buf C, Buf st, Buf slot, Buf R, int ns, int d) {
+    if (d % 32 || d / 4 > 512) return false;
+    set_args(k_lmcst7, C, st, slot, R, (cl_int)d);
+    size_t g[1] = {(size_t)ns * (d / 4)}, l[1] = {(size_t)d / 4};
+    return launch(k_lmcst7, 1, g, l);
+}
+bool op_lm_conv_dec_q7(Buf C, Buf st, Buf slot, Buf taps, int T, int d) {
+    if (d % 32 || d / 4 > 512) return false;
+    set_args(k_lmcdec7, C, st, slot, taps, (Buf)g_Xp, (Buf)g_Xs, (cl_int)d);
+    size_t g[1] = {(size_t)T * (d / 4)}, l[1] = {(size_t)d / 4};
+    return launch(k_lmcdec7, 1, g, l);
+}
+bool op_lm_qkv_post_kvq128(Buf C, int rowc, int T, int nq, int nkv, Buf qw, Buf kw, Buf cosb, Buf sinb, Buf pos, float eps, Buf KVq, Buf KVs, Buf dst, int kvw) {
+    if (kvw % 32 || kvw < 2 * nkv * 128) return false;
+    set_args(k_lmqkvq128, C, (cl_int)rowc, (cl_int)nq, (cl_int)nkv, qw, kw, cosb, sinb, pos, eps, KVq, KVs, dst, (cl_int)kvw);
+    size_t g[2] = {(size_t)(nq + 2 * nkv) * 16, (size_t)T}, l[2] = {16, 1};
+    return launch(k_lmqkvq128, 2, g, l);
+}
+bool op_lm_attn_pf_q128(Buf C, int ldc, Buf KVq, Buf KVs, int ldkv, int voff, int kvbase, int nq, int nkv, int pos0, float scale, Buf GA, int gld, int swa_w, int T, int bi) {
+    set_args(k_lmpfq128, C, (cl_int)ldc, KVq, KVs, (cl_int)ldkv, (cl_int)voff, (cl_int)kvbase, (cl_int)nq, (cl_int)nkv, (cl_int)pos0, scale, GA,
+             (cl_int)gld, (cl_int)swa_w, (Buf)g_Xp, (Buf)g_Xs, (cl_int)T, (cl_int)bi);
+    size_t g[2] = {(size_t)nq * 64, (size_t)((T + 31) / 32)}, l[2] = {64, 1};
+    return launch(k_lmpfq128, 2, g, l);
+}
+bool op_lm_attn_dec_q128(Buf C, int ldc, Buf KVq, Buf KVs, int ldkv, int voff, Buf bases, Buf lens, int nq, int nkv, float scale, Buf GA, int gld, int swa_w, int B) {
+    set_args(k_lmdecq128, C, (cl_int)ldc, KVq, KVs, (cl_int)ldkv, (cl_int)voff, bases, lens, (cl_int)nq, (cl_int)nkv, scale, GA,
+             (cl_int)gld, (cl_int)swa_w, (Buf)g_Xp, (Buf)g_Xs);
+    size_t g[2] = {(size_t)nq * 128, (size_t)B}, l[2] = {128, 1};
+    return launch(k_lmdecq128, 2, g, l);
 }
 bool op_silu_mul_q(Buf G, int T, int FF) {
     if (FF % 32 || FF / 8 > 1024) return false;

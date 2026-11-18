@@ -36,8 +36,84 @@ std::vector<float> tf32(const GgufFile& g, const std::string& name) {
             float s = fp16_to_f32((uint16_t)b[k].d);
             for (int i = 0; i < QK8_0; ++i) v[k * QK8_0 + i] = b[k].qs[i] * s;
         }
+    } else if (t->type == T_Q6_K) {
+        // exact dequant (dequantize_row_q6_K): value = d * scales[e/16] * (6-bit q - 32), QK_K = 256
+        const block_q6_K* b = (const block_q6_K*)p;
+        for (size_t i = 0; i < n / QK_K; ++i) {
+            const float d = fp16_to_f32((uint16_t)b[i].d);
+            const uint8_t* ql = b[i].ql;
+            const uint8_t* qh = b[i].qh;
+            const int8_t* sc = b[i].scales;
+            float* y = v.data() + i * QK_K;
+            for (int n2 = 0; n2 < QK_K; n2 += 128) {
+                for (int l = 0; l < 32; ++l) {
+                    const int is = l / 16;
+                    const int q1 = (int)((ql[l + 0] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+                    const int q2 = (int)((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+                    const int q3 = (int)((ql[l + 0] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+                    const int q4 = (int)((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+                    y[l + 0]  = d * sc[is + 0] * q1;
+                    y[l + 32] = d * sc[is + 2] * q2;
+                    y[l + 64] = d * sc[is + 4] * q3;
+                    y[l + 96] = d * sc[is + 6] * q4;
+                }
+                y += 128; ql += 64; qh += 32; sc += 8;
+            }
+        }
     } else throw std::runtime_error("mmproj: unsupported tensor type for " + name);
     return v;
+}
+// v.patch_embd.weight [kw, kh, ic, oc] (ggml conv layout, F16) -> GEMM weight [oc][ic*ps^2 + ky*ps + kx];
+// per oc the raw block holds kw + kh*ps + ic*ps^2 (same order as the columns), so it is a strided copy
+static std::vector<float> v3_patch_kernel(const GgufFile& g, const std::string& name, int d, int ps) {
+    const GGUFTensor* t = g.tensor(name);
+    if (!t) throw std::runtime_error("mmproj: missing tensor " + name);
+    if (t->dims.size() != 4 || t->dims[0] != (uint64_t)ps || t->dims[1] != (uint64_t)ps || t->dims[2] != 3 || t->dims[3] != (uint64_t)d)
+        throw std::runtime_error("mmproj: unexpected " + name + " shape");
+    std::vector<float> raw = tf32(g, name);
+    const size_t blk = (size_t)ps * ps * 3, cols = (size_t)ps * ps * 3;  // per-oc block = [kw,kh,ic] order
+    const size_t n_oc = raw.size() / blk;
+    std::vector<float> w(n_oc * cols);
+    for (size_t o = 0; o < n_oc; ++o) memcpy(w.data() + o * cols, raw.data() + o * blk, cols * 4);
+    return w;
+}
+// 2D vision rope (ggml_rope_multi VISION, indep_sects): pairs (ic, ic+nd) with nd = hd/2 rotated;
+// ic < nd/2 rotates by the patch-row y, the rest by the patch-col x, with theta restarted per section:
+// theta_t(ic) = base * theta_scale^ic, theta_h(ic) = base * theta_scale^(ic - nd/2) (float accumulation),
+// theta_scale = powf(base, -2/nd); the cache is per token (positions are raster patch coords per image)
+static void v3_rope(float* X, int T, int heads, int hd, float freq_base, const int* seg,
+                    const std::vector<int>& off, const std::vector<int>& pw, int ld) {
+    const int nd = hd / 2;                             // n_dims passed to the rope call
+    const int sect = nd / 2;                           // mrope_sections[0]
+    const float theta_scale = std::pow(freq_base, -2.0f / (float)nd);
+    // ggml mrope cache: theta starts at the POSITION VALUE (no freq_base multiplication!) and
+    // decays by theta_scale per pair step; freq_base only enters through theta_scale.
+    std::vector<float> tht((size_t)nd);                // theta per pair (float accumulation, section restart)
+    float theta_t = 1.0f, theta_h = 1.0f;
+    for (int ic = 0; ic < nd; ++ic) {
+        if (ic == 0) theta_t = 1.0f;
+        else if (ic == sect) theta_h = 1.0f;
+        tht[(size_t)ic] = ic < sect ? theta_t : theta_h;
+        theta_t *= theta_scale; theta_h *= theta_scale;
+    }
+    Pool::get().parallel_for(T, [&](int lo, int hi) {
+        for (int t = lo; t < hi; ++t) {
+            const int s = seg[t];
+            const int lt = t - off[s];
+            const float y = (float)(lt / pw[s]), x = (float)(lt % pw[s]);
+            float* row = X + (size_t)t * ld;
+            for (int h = 0; h < heads; ++h) {
+                float* p = row + (size_t)h * hd;
+                for (int ic = 0; ic < nd; ++ic) {
+                    const float ang = (ic < sect ? y : x) * tht[(size_t)ic];
+                    const float c = std::cos(ang), si = std::sin(ang);
+                    const float a = p[ic], b = p[ic + nd];
+                    p[ic] = a * c - b * si;
+                    p[ic + nd] = a * si + b * c;
+                }
+            }
+        }
+    });
 }
 static inline uint16_t f32_to_f16_bits(float x);
 Lin lin(const GgufFile& g, const std::string& w, const std::string& b) {
@@ -148,6 +224,22 @@ struct MmProj::Impl {
     std::vector<ALayer> al;
     std::vector<float> mm0w, mm0b, mm4w, mm4b;
     Lin mma1, mma3, mma5, mma6;
+    // ---- lfm3vl vision (projector lfm3vl, d1-2B mmproj): LFM3-style blocks + 2-layer MLP projector
+    bool is_v3 = false;
+    int v3_d = 1024, v3_layers = 14, v3_heads = 16, v3_kv = 8, v3_hd = 64, v3_ps = 16, v3_merge = 2, v3_ffn = 2560;
+    float v3_eps = 1e-5f;
+    struct V3Layer {
+        bool conv = false;
+        std::vector<float> ln1w, ln2w;                    // RMS norm weights (encoder eps)
+        Lin in_proj, out_proj; std::vector<float> dw;     // conv: in [d][3d], out [d][d], dw [d*9] (e*9 + ky*3 + kx)
+        Lin q, k, v, o; std::vector<float> qn, kn;        // attn: per-head RMS q/k norms [hd]
+        Lin gate, up, down;                               // every layer has the FFN: silu(gate) * up -> down
+    };
+    std::vector<V3Layer> v3;
+    std::vector<float> v3_patch0, v3_patch1;              // [d][768] patch kernels (col = c*256 + ky*16 + kx)
+    std::vector<float> v3_emb_norm;                       // RMS norm after the patchifier
+    std::vector<float> v3_ln_w, v3_ln_b;                  // projector input LayerNorm (eps 1e-6, per patch token, before the merge)
+    Lin v3_mm0, v3_mm2;                                   // mm.0 -> gelu(erf) -> mm.2
     // ---- iGPU vision (weights resident, whole encoder on-device)
     bool vgpu = false;
     WMat patch_q;                                    // patch embedding, Q8 (int8 DP4A path)
@@ -165,6 +257,66 @@ bool MmProj::load(const std::string& path, std::string* err) {
         impl_ = std::make_shared<Impl>();
         Impl& I = *impl_;
         const std::string vproj = g_.get_str("clip.vision.projector_type"), aproj = g_.get_str("clip.audio.projector_type");
+        if (g_.get_bool("clip.has_vision_encoder") && vproj == "lfm3vl") {
+            I.is_v3 = true;
+            I.v3_d = (int)g_.get_int("clip.vision.embedding_length");
+            I.v3_layers = (int)g_.get_int("clip.vision.block_count");
+            I.v3_heads = (int)g_.get_int("clip.vision.attention.head_count");
+            I.v3_kv = (int)g_.get_int("clip.vision.attention.head_count_kv");
+            I.v3_hd = I.v3_d / I.v3_heads;
+            I.v3_ps = (int)g_.get_int("clip.vision.patch_size");
+            I.v3_merge = (int)g_.get_int("clip.vision.spatial_merge_size");
+            I.v3_ffn = (int)g_.get_int("clip.vision.feed_forward_length");
+            I.v3_eps = (float)g_.get_f64("clip.vision.attention.layer_norm_epsilon", 1e-5);
+            if (!g_.get_bool("clip.use_silu", false)) throw std::runtime_error("mmproj: lfm3vl expects clip.use_silu");
+            if (I.v3_merge != 2) throw std::runtime_error("mmproj: lfm3vl supports a 2x2 merge only");
+            const std::string algo = g_.get_str("clip.vision.image_resize_algo", "bicubic");
+            if (algo != "bicubic") throw std::runtime_error("mmproj: unsupported image resize algo for lfm3vl: " + algo);
+            auto mean = g_.get_f64arr("clip.vision.image_mean"), stdv = g_.get_f64arr("clip.vision.image_std");
+            for (int c = 0; c < 3; ++c) { vp_.mean[c] = (float)mean.at(c); vp_.stdv[c] = (float)stdv.at(c); }
+            vp_.patch_size = I.v3_ps; vp_.n_merge = I.v3_merge;
+            const int patch_area = I.v3_ps * I.v3_ps * I.v3_merge * I.v3_merge;
+            const int min_tok = (int)(g_.get_int("clip.vision.image_min_pixels", patch_area) / patch_area);
+            const int max_tok = std::min(4096, (int)(g_.get_int("clip.vision.image_max_pixels", 4096 * patch_area) / patch_area));
+            if (min_tok <= 0 || max_tok < min_tok) throw std::runtime_error("mmproj: invalid image min/max pixels");
+            vp_.min_pixels = (int64_t)min_tok * patch_area;
+            vp_.max_pixels = (int64_t)max_tok * patch_area;
+            // patchifier: the GGUF stores the kernel already in ggml conv layout [kw, kh, ic, oc] (F16);
+            // as a GEMM weight: rows = oc, cols = ic*ps*ps + ky*ps + kx (each oc block of 4096 floats holds
+            // its 768 columns first — same index as the conv, so the reshape is a strided copy per oc)
+            I.v3_patch0 = v3_patch_kernel(g_, "v.patch_embd.weight", I.v3_d, I.v3_ps);
+            if (g_.tensor("v.patch_embd.weight.1")) I.v3_patch1 = v3_patch_kernel(g_, "v.patch_embd.weight.1", I.v3_d, I.v3_ps);
+            I.v3_emb_norm = tf32(g_, "v.embedding_norm.weight");
+            I.v3_ln_w = tf32(g_, "mm.input_norm.weight");
+            I.v3_ln_b = tf32(g_, "mm.input_norm.bias");
+            I.v3_mm0 = lin(g_, "mm.0.weight", "mm.0.bias");
+            I.v3_mm2 = lin(g_, "mm.2.weight", "mm.2.bias");
+            I.v3.resize(I.v3_layers);
+            for (int i = 0; i < I.v3_layers; ++i) {
+                const std::string b = "v.blk." + std::to_string(i) + ".";
+                Impl::V3Layer& L = I.v3[i];
+                L.conv = g_.tensor(b + "conv2d_in_proj.weight") != nullptr;
+                if (L.conv) {
+                    L.in_proj = lin(g_, b + "conv2d_in_proj.weight");
+                    L.out_proj = lin(g_, b + "conv2d_out_proj.weight");
+                    L.dw = tf32(g_, b + "conv2d_spatial.weight");   // f32, [oc*9 + ky*3 + kx]
+                } else {
+                    L.q = lin(g_, b + "attn_q.weight");
+                    L.k = lin(g_, b + "attn_k.weight");
+                    L.v = lin(g_, b + "attn_v.weight");
+                    L.o = lin(g_, b + "attn_out.weight");
+                    L.qn = tf32(g_, b + "attn_q_norm.weight");
+                    L.kn = tf32(g_, b + "attn_k_norm.weight");
+                }
+                L.ln1w = tf32(g_, b + "ln1.weight");
+                L.ln2w = tf32(g_, b + "ln2.weight");
+                L.gate = lin(g_, b + "ffn_gate.weight");
+                L.up = lin(g_, b + "ffn_up.weight");
+                L.down = lin(g_, b + "ffn_down.weight");
+            }
+            n_out_ = I.v3_mm2.rows;
+            v_ok_ = true;
+        }
         if (g_.get_bool("clip.has_vision_encoder") && vproj == "d1omni_v") {
             I.v_d = (int)g_.get_int("clip.vision.embedding_length");
             I.v_layers = (int)g_.get_int("clip.vision.block_count");
@@ -413,9 +565,242 @@ static bool encode_vision_gpu(MmProj::Impl& I, const std::vector<VisionInput>& i
     return ok;
 }
 
+// lfm3vl vision encoder (d1-2B mmproj): patchifier 16x16/s16 (two temporal kernels summed) -> RMS norm
+// -> blocks (conv: gated short convs silu+ln1; attn: bidirectional attention, per-head RMS q/k norm,
+// 2D vision rope, kq_scale = 1/sqrt(hd)), each block ends with ln2 + FFN silu(gate)*up -> down; no post
+// norm -> mm.input_norm LayerNorm per patch token -> 2x2 patch merge -> mm.0 -> gelu(erf) -> mm.2
+static void v3_dump(const char* tag, const float* X, size_t n) {
+    const char* dir = getenv("FERRO_V3_DUMP");
+    if (!dir) return;
+    char path[600];
+    snprintf(path, sizeof(path), "%s/%s.bin", dir, tag);
+    FILE* f = fopen(path, "wb");
+    if (f) { fwrite(X, 4, n, f); fclose(f); }
+}
+
+static void v3_stat(const char* tag, const float* X, int T, int d) {
+    { int zr = 0, fz = -1; for (int t = 0; t < T; ++t) { float s = 0; for (int e = 0; e < d; ++e) s += std::fabs(X[(size_t)t*d+e]); if (s == 0) { ++zr; if (fz < 0) fz = t; } }
+      fprintf(stderr, "[v3z] %s: zero rows %d first %d\n", tag, zr, fz); }
+    double mx = 0; int bad = 0;
+    for (size_t i = 0; i < (size_t)T * d; ++i) { float v = X[i]; if (!std::isfinite(v)) { ++bad; continue; } double a = std::fabs(v); if (a > mx) mx = a; }
+    fprintf(stderr, "[v3s] %s: max %.4f nan %d\n", tag, mx, bad);
+}
+
+static std::vector<float> encode_lfm3vl(MmProj::Impl& I, const std::vector<VisionInput>& in) {
+    const int d = I.v3_d, nh = I.v3_heads, nkv = I.v3_kv, hd = I.v3_hd, ps = I.v3_ps, mg = I.v3_merge;
+    const int ffn_d = I.v3_ffn;
+    const float eps = I.v3_eps;
+    const float scale = 1.0f / std::sqrt((float)hd);      // kq_scale = 1/sqrt(d_head)
+    const float rope_theta = 1e6f;                        // hardcoded for lfm3vl in llama.cpp mtmd-model.cpp
+    std::vector<int> off, wps, hps;
+    int T = 0;
+    for (const auto& v : in) {
+        if (v.nx % (ps * mg) || v.ny % (ps * mg)) throw std::runtime_error("vision input not a multiple of the patch+merge size");
+        off.push_back(T); wps.push_back(v.nx / ps); hps.push_back(v.ny / ps);
+        T += (v.nx / ps) * (v.ny / ps);
+    }
+    std::vector<int> seg(T);
+    for (size_t i = 0; i < in.size(); ++i) for (int t = 0; t < wps[i] * hps[i]; ++t) seg[off[i] + t] = (int)i;
+    // patchifier: flat im2col [T][3*ps*ps] (col = c*ps^2 + ky*ps + kx, same order as the conv weight
+    // columns), then ONE GEMM per temporal kernel summed — no nested parallel_for (a gemm called from
+    // inside a pool worker no-ops, zeroing its rows)
+    const int kk = 3 * ps * ps;
+    std::vector<float> X((size_t)T * d, 0.0f);
+    {
+        std::vector<float> CL((size_t)T * kk);
+        Pool::get().parallel_for(T, [&](int lo, int hi) {
+            for (int pi = lo; pi < hi; ++pi) {
+                int si = 0; while (si + 1 < (int)in.size() && off[si + 1] <= pi) ++si;
+                const int w = wps[si], plane = (size_t)in[si].nx * in[si].ny;
+                const int by = ((pi - off[si]) / w) * ps, bx = ((pi - off[si]) % w) * ps;
+                const float* chw = in[si].chw.data();
+                float* cl = CL.data() + (size_t)pi * kk;
+                for (int c = 0; c < 3; ++c)
+                    for (int ky = 0; ky < ps; ++ky) {
+                        const float* src = chw + c * plane + (size_t)(by + ky) * in[si].nx + bx;
+                        memcpy(cl + c * ps * ps + ky * ps, src, ps * 4);
+                    }
+            }
+        });
+        gemm_f32(I.v3_patch0.data(), d, kk, CL.data(), T, X.data(), d);
+        if (!I.v3_patch1.empty()) {
+            std::vector<float> G1((size_t)T * d);
+            gemm_f32(I.v3_patch1.data(), d, kk, CL.data(), T, G1.data(), d);
+            add_inplace(X.data(), G1.data(), (size_t)T * d);
+        }
+    }
+    static const bool v3dbg2 = getenv("FERRO_V3_DEBUG") != nullptr;
+    v3_dump("patchifier_out", X.data(), (size_t)T * d);
+    if (v3dbg2) fprintf(stderr, "[v3] patchified T=%d\n", T); if (v3dbg2) v3_stat("patchified", X.data(), T, d);
+    rmsnorm_q(X.data(), T, d, I.v3_emb_norm.data(), eps, X.data());
+    v3_dump("embedding_norm", X.data(), (size_t)T * d);
+    // gated short conv: depthwise 3x3 over each image's patch grid; input rows [e*3] taps
+    // (conv2d channels), weight index e*9 + ky*3 + kx (oc-major); border taps read zero
+    auto conv_dw = [&](const float* cw, const float* in_, float* out_) {
+        Pool::get().parallel_for(T, [&](int lo, int hi) {
+            for (int t = lo; t < hi; ++t) {
+                int si = 0; while (si + 1 < (int)in.size() && off[si + 1] <= t) ++si;
+                const int w = wps[si], h = hps[si], lt = t - off[si], py = lt / w, px = lt % w;
+                float* o = out_ + (size_t)t * d;
+                for (int e = 0; e < d; ++e) {
+                    float acc = 0.0f;
+                    for (int ky = 0; ky < 3; ++ky) {
+                        const int iy = py + ky - 1;
+                        if (iy < 0 || iy >= h) continue;
+                        for (int kx = 0; kx < 3; ++kx) {
+                            const int ix = px + kx - 1;
+                            if (ix < 0 || ix >= w) continue;
+                            acc += in_[((size_t)(off[si] + iy * w + ix) * d) + e] * cw[(size_t)e * 9 + ky * 3 + kx];
+                        }
+                    }
+                    o[e] = acc;
+                }
+            }
+        });
+    };
+    // per-head RMS q/k norm (ggml rms semantics: ss/hd, float accumulation, half closest to 0)
+    static bool dbg2 = getenv("FERRO_V3_DEBUG") != nullptr;
+    auto qk_head_rms = [&](float* X_, int ld, int heads, const float* w) {
+        Pool::get().parallel_for(T, [&](int lo, int hi) {
+            for (int t = lo; t < hi; ++t)
+                for (int h = 0; h < heads; ++h) {
+                    float* p = X_ + (size_t)t * ld + (size_t)h * hd;
+                    float ss = 0.0f;
+                    for (int i = 0; i < hd; ++i) ss += p[i] * p[i];
+                    const float s = 1.0f / std::sqrt(ss / (float)hd + eps);   // ggml rms_norm semantics
+                    for (int i = 0; i < hd; ++i) p[i] *= s * w[i];
+                }
+        });
+    };
+    
+    if (v3dbg2) fprintf(stderr, "[v3] emb_norm done\n"); if (v3dbg2) v3_stat("emb_norm", X.data(), T, d);
+    std::vector<float> H1((size_t)T * std::max(3 * d, ffn_d)), H2((size_t)T * d),
+                       C3((size_t)T * 3 * d), O((size_t)T * d), G((size_t)T * ffn_d), U((size_t)T * ffn_d);
+    for (int il = 0; il < I.v3_layers; ++il) {
+        const MmProj::Impl::V3Layer& L = I.v3[il];
+        if (v3dbg2 && il) v3_stat(("blk" + std::to_string(il - 1)).c_str(), X.data(), T, d);
+        if (L.conv) {
+            // pre-norm gated short conv (lfm3vl.cpp): ln1 -> in_proj [T][3d] -> gated = ch0*ch2 ->
+            // depthwise 3x3 over the patch grid (zero border) -> cur = ch1 * conv_out -> out_proj
+            rmsnorm_q(X.data(), T, d, L.ln1w.data(), eps, H1.data());
+            if (v3dbg2 && il == 0) v3_dump("ln1-0", H1.data(), (size_t)T * d);
+            float* proj = C3.data();
+            apply(L.in_proj, H1.data(), T, proj);
+            if (v3dbg2 && il == 0) v3_dump("conv_in_proj-0", proj, (size_t)T * 3 * d);
+            float* gated = H1.data();                              // reuse [T][d] for gated, then ch1*conv
+            Pool::get().parallel_for(T, [&](int lo, int hi) {
+                for (int t = lo; t < hi; ++t) {
+                    const float* p = proj + (size_t)t * 3 * d;
+                    float* g = gated + (size_t)t * d;
+                    for (int e = 0; e < d; ++e) g[e] = p[e] * p[2 * d + e];
+                }
+            });
+            if (v3dbg2 && il == 0) v3_dump("conv_gated-0", gated, (size_t)T * d);
+            conv_dw(L.dw.data(), gated, H2.data());
+            if (v3dbg2 && il == 0) v3_dump("conv_spatial-0", H2.data(), (size_t)T * d);
+            Pool::get().parallel_for(T, [&](int lo, int hi) {
+                for (int t = lo; t < hi; ++t) {
+                    const float* m = proj + (size_t)t * 3 * d + d;
+                    const float* c = H2.data() + (size_t)t * d;
+                    float* o = gated + (size_t)t * d;
+                    for (int e = 0; e < d; ++e) o[e] = m[e] * c[e];
+                }
+            });
+            if (v3dbg2 && il == 0) v3_dump("conv_mul-0", gated, (size_t)T * d);
+            apply(L.out_proj, gated, T, H2.data());
+            if (v3dbg2 && il == 0) v3_dump("conv_out_proj-0", H2.data(), (size_t)T * d);
+            add_inplace(X.data(), H2.data(), (size_t)T * d);
+            if (v3dbg2 && il == 0) v3_dump("ffn_inp-0", X.data(), (size_t)T * d);
+        } else {
+            rmsnorm_q(X.data(), T, d, L.ln1w.data(), eps, H1.data());
+            if (v3dbg2 && il == 2) v3_dump("ln1-2", H1.data(), (size_t)T * d);
+            // Q/K/V in contiguous segments of C3; GQA: k/v project to nkv heads (d_kv = nkv*hd),
+            // attn_k/attn_v tensors are [d, nkv*hd] (apply writes row-stride = rows)
+            const int dkv = hd * nkv;
+            float* Q = C3.data(), * K = C3.data() + (size_t)T * d, * V = K + (size_t)T * dkv;
+            apply(L.q, H1.data(), T, Q); apply(L.k, H1.data(), T, K); apply(L.v, H1.data(), T, V);
+            if (v3dbg2 && il == 2) { v3_dump("Qcur-2", Q, (size_t)T * d); v3_dump("Kcur-2", K, (size_t)T * dkv); v3_dump("Vcur-2", V, (size_t)T * dkv); }
+            qk_head_rms(Q, d, nh, L.qn.data());
+            qk_head_rms(K, dkv, nkv, L.kn.data());
+            v3_rope(Q, T, nh, hd, rope_theta, seg.data(), off, wps, d);
+            v3_rope(K, T, nkv, hd, rope_theta, seg.data(), off, wps, dkv);
+            if (v3dbg2 && il == 2) { v3_dump("Qcur_rope-2", Q, (size_t)T * d); v3_dump("Kcur_rope-2", K, (size_t)T * dkv); }
+            // llama.cpp -fa on: flash attention casts K/V to F16 (rounding each element) before the
+            // scores/weighted sum; round here to match the reference bit-for-bit-approximately
+            Pool::get().parallel_for(T, [&](int lo, int hi) {
+                for (int t = lo; t < hi; ++t) {
+                    float* k = K + (size_t)t * dkv; float* v = V + (size_t)t * dkv;
+                    for (int i = 0; i < dkv; ++i) { k[i] = f16_bits_to_f32(f32_to_f16_bits(k[i])); v[i] = f16_bits_to_f32(f32_to_f16_bits(v[i])); }
+                }
+            });
+            attention(Q, K, V, O.data(), T, nh, nkv, hd, scale, seg.data(), -1, d, dkv, d);   // ldo = d (output is [T][1024]; dkv here clobbered rows)
+            if (v3dbg2 && il == 2) v3_dump("kqv_out-2", O.data(), (size_t)T * d);
+            apply(L.o, O.data(), T, H2.data());
+            if (v3dbg2 && il == 2) v3_dump("attn_out-2", H2.data(), (size_t)T * d);
+            add_inplace(X.data(), H2.data(), (size_t)T * d);
+            if (v3dbg2 && il == 2) v3_dump("ffn_inp-2", X.data(), (size_t)T * d);
+        }
+        // shared tail: ln2 (pre-norm) + FFN silu(gate) * up -> down + residual
+        rmsnorm_q(X.data(), T, d, L.ln2w.data(), eps, H1.data());
+        if (v3dbg2 && il == 0) v3_dump("ffn_inp_normed-0", H1.data(), (size_t)T * d);
+        if (v3dbg2 && il == 2) v3_dump("ffn_inp_normed-2", H1.data(), (size_t)T * d);
+        apply(L.gate, H1.data(), T, G.data());
+        apply(L.up, H1.data(), T, U.data());
+        act(G.data(), (size_t)T * ffn_d, SILU);
+        Pool::get().parallel_for((int)(((size_t)T * ffn_d + 8191) / 8192), [&](int lo, int hi) {   // G *= U
+            for (size_t i = (size_t)lo * 8192, e = std::min((size_t)hi * 8192, (size_t)T * ffn_d); i < e; ++i) G[i] *= U[i];
+        });
+        if (v3dbg2 && il == 0) { v3_dump("ffn_gate-0", G.data(), (size_t)T * ffn_d); v3_dump("ffn_up-0", U.data(), (size_t)T * ffn_d); }
+        if (v3dbg2 && il == 2) { v3_dump("ffn_gate-2", G.data(), (size_t)T * ffn_d); v3_dump("ffn_up-2", U.data(), (size_t)T * ffn_d); }
+        apply(L.down, G.data(), T, H2.data());
+        if (v3dbg2 && il == 0) v3_dump("ffn_out-0", H2.data(), (size_t)T * d);
+        if (v3dbg2 && il == 2) v3_dump("ffn_out-2", H2.data(), (size_t)T * d);
+        add_inplace(X.data(), H2.data(), (size_t)T * d);
+        if (v3dbg2) { char nm[64]; snprintf(nm, sizeof(nm), "layer_out-%d", il); v3_dump(nm, X.data(), (size_t)T * d); }
+    }
+    
+    if (v3dbg2) fprintf(stderr, "[v3] blocks done\n"); if (v3dbg2) v3_stat("blocks", X.data(), T, d);
+    // no post-transformer norm for LFM3-VL; the projector input LayerNorm runs per patch token
+    // (eps 1e-6) BEFORE the 2x2 merge, as in lfm3vl.cpp
+    layernorm(X.data(), T, d, I.v3_ln_w.data(), I.v3_ln_b.data(), 1e-6f, X.data());
+    v3_dump("proj_input_norm", X.data(), (size_t)T * d);
+    
+    if (v3dbg2) fprintf(stderr, "[v3] proj LN done\n"); if (v3dbg2) v3_stat("projLN", X.data(), T, d);
+    // 2x2 pixel unshuffle: token (Y, X) <- patches (mg*Y+dy, mg*X+dx), features [dy][dx][d]
+    int Tm = 0;
+    std::vector<int> moff;
+    for (size_t i = 0; i < in.size(); ++i) { moff.push_back(Tm); Tm += ((wps[i] + mg - 1) / mg) * ((hps[i] + mg - 1) / mg); }
+    const int dm = d * mg * mg;
+    std::vector<float> M((size_t)Tm * dm, 0.0f);
+    for (size_t i = 0; i < in.size(); ++i) {
+        const int w2 = (wps[i] + mg - 1) / mg, h2 = (hps[i] + mg - 1) / mg;
+        for (int Y = 0; Y < h2; ++Y)
+            for (int Xc = 0; Xc < w2; ++Xc) {
+                float* m = M.data() + (size_t)(moff[i] + Y * w2 + Xc) * dm;
+                for (int dy = 0; dy < mg; ++dy)
+                    for (int dx = 0; dx < mg; ++dx) {
+                        const int py = Y * mg + dy, px = Xc * mg + dx;
+                        if (py >= hps[i] || px >= wps[i]) continue;
+                        memcpy(m + (dy * mg + dx) * d, X.data() + (size_t)(off[i] + py * wps[i] + px) * d, d * 4);
+                    }
+            }
+    }
+    
+    v3_dump("proj_interleaved", M.data(), (size_t)Tm * dm);
+    if (v3dbg2) fprintf(stderr, "[v3] merged Tm=%d\n", Tm); if (v3dbg2) v3_stat("merged", M.data(), Tm, dm);
+    std::vector<float> Hm((size_t)Tm * I.v3_mm0.rows);
+    apply(I.v3_mm0, M.data(), Tm, Hm.data());
+    act(Hm.data(), Hm.size(), GELU_ERF);
+    std::vector<float> out((size_t)Tm * I.v3_mm2.rows);
+    apply(I.v3_mm2, Hm.data(), Tm, out.data());
+    return out;
+}
+
 std::vector<float> MmProj::encode_vision(const std::vector<VisionInput>& in) {
+    static const bool v3dbg2 = getenv("FERRO_V3_DEBUG") != nullptr;
     if (!v_ok_) throw std::runtime_error("this mmproj has no vision encoder");
     Impl& I = *impl_;
+    if (I.is_v3) return encode_lfm3vl(I, in);
     const int d = I.v_d, ps = I.v_ps, kk = 3 * ps * ps, nh = I.v_heads, hd = d / nh, mg = I.v_merge;
     std::vector<int> off, wps, hps;
     int T = 0;
@@ -492,6 +877,8 @@ std::vector<float> MmProj::encode_vision(const std::vector<VisionInput>& in) {
         add_inplace(X.data(), H.data(), (size_t)T * d);
     }
     layernorm(X.data(), T, d, I.post_ln_w.data(), I.post_ln_b.data(), I.v_eps, X.data());
+    
+    if (v3dbg2) fprintf(stderr, "[v3] proj LN done\n"); if (v3dbg2) v3_stat("projLN", X.data(), T, d);
     // 2x2 pixel unshuffle: token (Y, X) <- patches (mg*Y+dy, mg*X+dx), features [dy][dx][d]
     int Tm = 0;
     std::vector<int> moff;

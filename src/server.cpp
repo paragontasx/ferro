@@ -1024,7 +1024,7 @@ static std::shared_ptr<GenJob> parse_gen_request(Server& S, const std::string& t
         const Json* p = b.find("prompt");
         if (p && p->is_array() && p->arr.size() == 1) p = &p->arr[0];
         if (!p || !p->is_string()) throw BadRequest("\"prompt\" must be a string");
-        rendered = "<|startoftext|>" + p->s;
+        rendered = (S.ltok.add_bos() ? "<|startoftext|>" : "") + p->s;
     }
     j->prompt = S.ltok.tokenize(rendered, true);
     if (j->prompt.empty()) throw BadRequest("empty prompt");
@@ -1425,7 +1425,7 @@ static void handle_conn(Server* Sp, int fd) {
                     if (m && m->is_array()) { try { rendered = lfm_chat_render(*m, b.find("tools"), S.chat_opt); } catch (const std::exception& e) { throw BadRequest(std::string("messages: ") + e.what()); } }
                     else {
                         const Json* p = b.find("prompt"); if (!p || !p->is_string()) throw BadRequest("give \"prompt\" (a string) or \"messages\"");
-                        const Json* sp = b.find("add_special_tokens"); const bool bos = !(sp && sp->t == Json::Bool && !sp->b);
+                        const Json* sp = b.find("add_special_tokens"); const bool bos = !(sp && sp->t == Json::Bool && !sp->b) && S.ltok.add_bos();
                         rendered = (bos ? "<|startoftext|>" : "") + p->s;
                     }
                     const std::vector<int> ids = S.ltok.tokenize(rendered, true);

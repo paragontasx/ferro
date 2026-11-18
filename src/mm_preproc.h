@@ -21,6 +21,12 @@ std::vector<VisionInput> d1omni_preprocess_image(const uint8_t* rgb, int nx, int
 // number of LM tokens the encoder emits for one input
 int vision_tokens(const VisionInput& v, const VisionPreParams& p);
 
+// LFM3-VL (projector lfm3vl, d1-2B mmproj): one image, Qwen smart_resize to a multiple of
+// patch*n_merge, torchvision bicubic stretch (no letterbox), normalize (x/255 - mean)/std, planar CHW.
+VisionInput lfm3vl_preprocess_image(const uint8_t* rgb, int nx, int ny, const VisionPreParams& p);
+// merge must be exact: the resize already lands on a multiple of patch*n_merge
+int lfm3vl_vision_tokens(const VisionInput& v, const VisionPreParams& p);
+
 struct Mel { int n_mel = 0, n_len = 0; std::vector<float> data; };   // data[mel * n_len + frame]
 bool d1omni_audio_mel(const float* pcm, size_t n, int n_mel, Mel& out);
 int audio_tokens(const Mel& m);   // ceil(ceil(ceil(frames/2)/2)/2)

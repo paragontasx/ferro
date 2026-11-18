@@ -49,24 +49,51 @@ static WMat lm_mat(const GgufFile& g, const std::string& name) {
     std::vector<float> f = lm_to_f32(g, *t);
     return pack_from_f32(f.data(), rows, cols, cols, keep_name(name));
 }
+// pad rows to a multiple of `rows_al` with zero rows (zero int8 + zero scales + zero bias term = zero output).
+// The iGPU tile GEMM requires rows % 64 == 0; LFM3's per-head gate has rows = n_head = 16.
+static WMat pad_rows(WMat W, int rows_al) {
+    const int nr = ((W.rows + rows_al - 1) / rows_al) * rows_al;
+    if (nr == W.rows) return W;
+    WMat P;
+    P.rows = nr; P.cols = W.cols; P.nb = W.nb; P.name = W.name;
+    P.wq.assign((size_t)nr * W.cols, 0);
+    P.ws.assign((size_t)nr * W.nb, 0.0f);
+    P.rs.assign((size_t)nr * W.nb, 0.0f);
+    if (!W.wf.empty()) P.wf.assign((size_t)nr * W.cols, 0.0f);
+    for (int r = 0; r < W.rows; ++r) {
+        memcpy(P.wq.data() + (size_t)r * W.cols, W.wq.data() + (size_t)r * W.cols, (size_t)W.cols);
+        memcpy(P.ws.data() + (size_t)r * W.nb, W.ws.data() + (size_t)r * W.nb, (size_t)W.nb * 4);
+        if (!W.rs.empty()) memcpy(P.rs.data() + (size_t)r * W.nb, W.rs.data() + (size_t)r * W.nb, (size_t)W.nb * 4);
+        if (!W.wf.empty()) memcpy(P.wf.data() + (size_t)r * W.cols, W.wf.data() + (size_t)r * W.cols, (size_t)W.cols * 4);
+    }
+    return P;
+}
 
 bool is_lfm2_lm(const GgufFile& g) {
     return g.arch == "lfm2" && g.get_int("lfm2.decision.block_count", 0) == 0 && g.get_bool("lfm2.attention.causal", true);
 }
+bool is_lfm3_lm(const GgufFile& g) {
+    return g.arch == "lfm3" && g.get_bool("lfm3.attention.causal", true);
+}
 
-bool LmModel::load(const std::string& path, int max_ctx, std::string* err) {
+bool LmModel::load(const std::string& path, int max_ctx, std::string* err, bool allow_decision) {
     try {
         if (!gguf.open_file(path.c_str(), err)) return false;
-        if (!is_lfm2_lm(gguf)) { *err = "not a causal LFM2 language model (arch lfm2 without a decision head expected)"; return false; }
-        const std::string P = "lfm2.";
+        const bool is_d1 = gguf.arch == "lfm3" && gguf.get_str("lfm3.decision.type") == "lfm3-d1";
+        const bool lfm3 = gguf.arch == "lfm3" && (!is_d1 || allow_decision);   // causal LFM3 only for --lm; the d1 checkpoint loads via Lfm3D1Engine (allow_decision)
+        if (!lfm3 && !is_lfm2_lm(gguf)) { *err = is_d1 ? "this is a decision model: load it with --d1 (or `decide`), not --lm" : "not a causal LFM2/LFM3 language model (arch lfm2 without a decision head, or arch lfm3 expected)"; return false; }
+        const std::string P = lfm3 ? "lfm3." : "lfm2.";
         n_layer = (int)gguf.get_int(P + "block_count");
         n_embd = (int)gguf.get_int(P + "embedding_length");
         n_head = (int)gguf.get_int(P + "attention.head_count");
         head_dim = n_embd / n_head;
+        if (const int64_t kl = gguf.get_int(P + "attention.key_length", head_dim)) head_dim = (int)kl;   // key_length overrides when present
         n_ctx_train = (int)gguf.get_int(P + "context_length", 32768);
         rms_eps = (float)gguf.get_f64(P + "attention.layer_norm_rms_epsilon", 1e-5);
         rope_base = gguf.get_f64(P + "rope.freq_base", 1e6);
-        if (gguf.get_int(P + "shortconv.l_cache", 3) != 3) { *err = "only the 3-tap short conv is supported"; return false; }
+        const int Lc = (int)gguf.get_int(P + "shortconv.l_cache", 3);
+        n_conv_state = Lc - 1;
+        if (n_conv_state != 2 && n_conv_state != 6) { *err = "only the 3-tap and 7-tap short conv is supported"; return false; }
         auto ffs = gguf.get_iarr(P + "feed_forward_length");
         auto kvs = gguf.get_iarr(P + "attention.head_count_kv");
         if ((int)kvs.size() != n_layer) { *err = "attention.head_count_kv must be a per-layer array"; return false; }
@@ -74,9 +101,20 @@ bool LmModel::load(const std::string& path, int max_ctx, std::string* err) {
         n_vocab = (int)gguf.get_strarr("tokenizer.ggml.tokens").size();
         bos_id = (int)gguf.get_int("tokenizer.ggml.bos_token_id", 1);
         eos_id = (int)gguf.get_int("tokenizer.ggml.eos_token_id", 7);
+        std::vector<int64_t> swa_pat;
+        if (lfm3) {
+            swa_window = (int)gguf.get_int(P + "attention.sliding_window", 0);
+            rope_base_swa = gguf.get_f64(P + "rope.freq_base_swa", 1e4);
+            swa_pat = gguf.get_iarr(P + "attention.sliding_window_pattern");
+            if ((int)swa_pat.size() != n_layer) { *err = "attention.sliding_window_pattern must be per-layer"; return false; }
+            // partial RoPE of the full-attention layers: rope_freqs.weight [hd/2], 1.0 = rotate, 1e30 = identity (ggml theta/ff)
+            rope_freqs = lm_vec(gguf, "rope_freqs.weight");
+            if (!rope_freqs.empty() && (int)rope_freqs.size() != head_dim / 2) { *err = "rope_freqs has an unexpected shape"; return false; }
+        } else if (gguf.get_int(P + "shortconv.l_cache", 3) != 3) { *err = "only the 3-tap short conv is supported"; return false; }
         tok_embd = lm_mat(gguf, "token_embd.weight");
         if (tok_embd.rows != n_vocab || tok_embd.cols != n_embd) { *err = "token_embd has an unexpected shape"; return false; }
-        out_norm = lm_vec(gguf, "token_embd_norm.weight");
+        out_norm = lm_vec(gguf, lfm3 ? "output_norm.weight" : "token_embd_norm.weight");
+        if (out_norm.size() != (size_t)n_embd) { *err = "output norm has an unexpected shape"; return false; }
         L.resize(n_layer);
         n_kv = 0;
         for (int i = 0; i < n_layer; ++i) {
@@ -85,13 +123,22 @@ bool LmModel::load(const std::string& path, int max_ctx, std::string* err) {
             l.attn_norm = lm_vec(gguf, b + "attn_norm.weight");
             l.ffn_norm = lm_vec(gguf, b + "ffn_norm.weight");
             l.conv = kvs[i] == 0;
+            if (lfm3) {
+                l.post_attn_norm = lm_vec(gguf, b + "post_attention_norm.weight");
+                l.post_ffn_norm = lm_vec(gguf, b + "post_ffw_norm.weight");
+                if (l.post_attn_norm.size() != (size_t)n_embd || l.post_ffn_norm.size() != (size_t)n_embd) {
+                    *err = "post norms missing or misshaped at layer " + std::to_string(i); return false;
+                }
+                l.swa = !l.conv && swa_pat[i] != 0;
+            }
+            sandwich = lfm3;
             if (l.conv) {
                 ++n_conv_layers;
                 l.in_proj = lm_mat(gguf, b + "shortconv.in_proj.weight");
                 l.out_proj = lm_mat(gguf, b + "shortconv.out_proj.weight");
-                std::vector<float> w = lm_vec(gguf, b + "shortconv.conv.weight");     // ggml [3][d] (ne0 = 3 fastest)
-                l.taps.resize(3 * (size_t)n_embd);
-                for (int c = 0; c < n_embd; ++c) for (int k = 0; k < 3; ++k) l.taps[(size_t)k * n_embd + c] = w[(size_t)c * 3 + k];
+                std::vector<float> w = lm_vec(gguf, b + "shortconv.conv.weight");     // ggml [L][d] (ne0 = L fastest)
+                l.taps.resize((size_t)Lc * n_embd);
+                for (int c = 0; c < n_embd; ++c) for (int k = 0; k < Lc; ++k) l.taps[(size_t)k * n_embd + c] = w[(size_t)c * Lc + k];
             } else {
                 ++n_attn_layers;
                 if (n_kv && n_kv != (int)kvs[i]) { *err = "per-layer KV head counts differ (unsupported)"; return false; }
@@ -101,13 +148,26 @@ bool LmModel::load(const std::string& path, int max_ctx, std::string* err) {
                 l.wo = lm_mat(gguf, b + "attn_output.weight");
                 l.q_norm = lm_vec(gguf, b + "attn_q_norm.weight");
                 l.k_norm = lm_vec(gguf, b + "attn_k_norm.weight");
+                if (lfm3) {
+                    l.attn_gate = pad_rows(lm_mat(gguf, b + "attn_gate.weight"), 64);   // [d][n_head] per-head output gate
+                    has_gate = true;
+                }
             }
             WMat gt = lm_mat(gguf, b + "ffn_gate.weight"), up = lm_mat(gguf, b + "ffn_up.weight");
             l.gateup = pack_concat({&gt, &up}, keep_name(b + "ffn_gateup"));
             l.down = lm_mat(gguf, b + "ffn_down.weight");
             if (l.down.cols != n_ff) { *err = "feed-forward size mismatch at layer " + std::to_string(i); return false; }
         }
-        rope.build(rope_base, head_dim, max_ctx + 8);
+        if (lfm3) {
+            // full-attention layers: base 1e6 with the partial-rope freq factors (pairs >= rope_angles are identity);
+            // swa layers: base 1e4, full rotation, no freq factors (llama.cpp loads rope_freqs only for non-swa layers).
+            // HF compute_default_rope_parameters: inv_freq = base^(-2i/dim) for the first rope_angles pairs, zeros after —
+            // the SPACING follows the full head dim (128), NOT 2*n_rot_pairs; ggml matches with n_dims=128 and theta/ff.
+            rope.build(rope_base, head_dim, max_ctx + 8, 1.0, rope_freqs.empty() ? nullptr : rope_freqs.data(), 0);
+            rope_swa.build(rope_base_swa, head_dim, max_ctx + 8, 1.0);
+        } else {
+            rope.build(rope_base, head_dim, max_ctx + 8);
+        }
     } catch (const std::exception& e) { *err = e.what(); return false; }
     return true;
 }
@@ -119,12 +179,13 @@ struct LmEngine::Impl {
         bool ok = false;
         int slots = 1, cap = 0, Tmax = 0, kv_dtype = 0;
         std::vector<gpu::Buf> an, fn, taps, qn, kn, kv, kvs, cst, cw;   // per layer (an/fn), per conv layer (taps, cst), per attention layer (qn, kn, kv)
-        gpu::Buf out_norm = nullptr, cosb = nullptr, sinb = nullptr, zero = nullptr;
+        std::vector<gpu::Buf> pan, pfn;                                  // LFM3 sandwich post-norms, per layer
+        gpu::Buf out_norm = nullptr, cosb = nullptr, sinb = nullptr, cosb2 = nullptr, sinb2 = nullptr, zero = nullptr, GA = nullptr;
         gpu::Buf X = nullptr, X2 = nullptr, D = nullptr, C = nullptr, G = nullptr, Xl = nullptr, Dl = nullptr, logits = nullptr;
-        gpu::Buf bpos = nullptr, bdst = nullptr, bsrc1 = nullptr, bsrc2 = nullptr, bslot = nullptr, br1 = nullptr, br2 = nullptr, bbase = nullptr, blen = nullptr;
+        gpu::Buf bpos = nullptr, bdst = nullptr, bsrc1 = nullptr, bsrc2 = nullptr, bslot = nullptr, br1 = nullptr, br2 = nullptr, bbase = nullptr, blen = nullptr, bsrc6 = nullptr, br6 = nullptr;
         std::vector<int> free_slots;
         std::vector<float> hostX;
-        std::vector<int> pos, dst, src1, src2, slot, r1, r2, base, len;      // staging (must outlive the enqueued writes)
+        std::vector<int> pos, dst, src1, src2, slot, r1, r2, base, len, src6, r6;      // staging (must outlive the enqueued writes)
         // Block-boundary capture (see capture_blocks): per gpu slot, one small buffer per conv layer holding b*x of the two
         // rows before every captured boundary. Slots inside one buffer are chosen by `slot`, so each layer needs its own.
         struct Cap { std::vector<gpu::Buf> st; gpu::Buf slot = nullptr, r1 = nullptr, r2 = nullptr;
@@ -147,16 +208,21 @@ static bool gpu_setup(LmEngine::Impl& in, LmModel& m, int max_ctx, int n_slots, 
     const size_t kvesz = kv_dtype_ == 1 ? 1 : kv_dtype_ == 2 ? 2 : 4;
     auto& g = in.g;
     const int d = m.n_embd, hd = m.head_dim, ff = m.n_ff, kvw = 2 * m.n_kv * hd, rowc = m.n_head * hd + kvw;
-    if (hd != 64 || d % 32 || d / 4 > 512 || ff % 32 || ff / 8 > 1024 || m.n_head % m.n_kv) return false;
+    const bool sw = m.sandwich, kvq = kv_dtype_ == 1;
+    const int ncs = sw ? m.n_conv_state : 2;
+    if (sw && (hd != 128 || !kvq || !m.has_gate)) { fprintf(stderr, "[lm] LFM3 iGPU path needs int8 KV (--kv-dtype int8 or FERRO_KV=int8) and head_dim 128 (got kv=%d hd=%d gate=%d) -> CPU\n", kv_dtype_, hd, (int)m.has_gate); return false; }
+    if (!sw && hd != 64) return false;
+    if (d % 32 || d / 4 > 512 || ff % 32 || ff / 8 > 1024 || m.n_head % m.n_kv) return false;
     bool ok = true;
     auto slot = [&](WMat& W) { W.gpu_slot = gpu::upload_q8(W); ok = ok && W.gpu_slot >= 0; };
-    for (auto& l : m.L) { if (l.conv) { slot(l.in_proj); slot(l.out_proj); } else { slot(l.wqkv); slot(l.wo); } slot(l.gateup); slot(l.down); }
+    for (auto& l : m.L) { if (l.conv) { slot(l.in_proj); slot(l.out_proj); } else { slot(l.wqkv); slot(l.wo); if (sw) slot(l.attn_gate); } slot(l.gateup); slot(l.down); }
     slot(m.tok_embd);
     if (!ok) return false;
     auto up = [&](const std::vector<float>& v) { gpu::Buf b = gpu::upload(v.data(), v.size() * 4); ok = ok && b; return b; };
     for (auto& l : m.L) {
         g.an.push_back(up(l.attn_norm)); g.fn.push_back(up(l.ffn_norm));
-        if (l.conv) { g.taps.push_back(up(l.taps)); g.cst.push_back(gpu::alloc((size_t)n_slots * 2 * d * 4)); ok = ok && g.cst.back();
+        if (sw) { g.pan.push_back(up(l.post_attn_norm)); g.pfn.push_back(up(l.post_ffn_norm)); }
+        if (l.conv) { g.taps.push_back(up(l.taps)); g.cst.push_back(gpu::alloc((size_t)n_slots * ncs * d * 4)); ok = ok && g.cst.back();
                            g.cw.push_back(gpu::alloc((size_t)kWinMax * 3 * d * 4)); ok = ok && g.cw.back(); }       // copy of the window's in_proj rows (speculative commit)
         else {
             g.qn.push_back(up(l.q_norm)); g.kn.push_back(up(l.k_norm));
@@ -166,7 +232,8 @@ static bool gpu_setup(LmEngine::Impl& in, LmModel& m, int max_ctx, int n_slots, 
         }
     }
     g.out_norm = up(m.out_norm); g.cosb = up(m.rope.cosb); g.sinb = up(m.rope.sinb);
-    std::vector<float> z(2 * (size_t)d, 0.0f);
+    if (sw) { g.cosb2 = up(m.rope_swa.cosb); g.sinb2 = up(m.rope_swa.sinb); }
+    std::vector<float> z(std::max(2, ncs) * (size_t)d, 0.0f);
     g.zero = up(z);
     gpu::warm_small_gemm(4);
     g.slots = n_slots; g.cap = max_ctx;
@@ -176,10 +243,12 @@ static bool gpu_setup(LmEngine::Impl& in, LmModel& m, int max_ctx, int n_slots, 
     g.X = gpu::alloc(R * d * 4); g.X2 = gpu::alloc((size_t)4 * d * 4); g.D = gpu::alloc(R * d * 4); g.C = gpu::alloc(R * std::max(3 * d, rowc) * 4);
     g.G = gpu::alloc(R * 2 * ff * 4); g.Xl = gpu::alloc((size_t)g.max_ns * d * 4); g.Dl = gpu::alloc((size_t)g.max_ns * d * 4);
     g.logits = gpu::alloc((size_t)g.max_ns * m.n_vocab * 4);
+    g.GA = gpu::alloc(R * 64 * 4);                               // LFM3 per-head attention-gate logits [T][64]
     const size_t mi = R * 4;
     g.bpos = gpu::alloc(mi); g.bdst = gpu::alloc(mi); g.bsrc1 = gpu::alloc(mi); g.bsrc2 = gpu::alloc(mi);
     g.bslot = gpu::alloc(mi); g.br1 = gpu::alloc(mi); g.br2 = gpu::alloc(mi); g.bbase = gpu::alloc(mi); g.blen = gpu::alloc(mi);
-    for (gpu::Buf b : {g.X, g.X2, g.D, g.C, g.G, g.Xl, g.Dl, g.logits, g.bpos, g.bdst, g.bsrc1, g.bsrc2, g.bslot, g.br1, g.br2, g.bbase, g.blen, g.zero}) ok = ok && b;
+    g.bsrc6 = gpu::alloc(6 * mi); g.br6 = gpu::alloc(6 * mi);
+    for (gpu::Buf b : {g.X, g.X2, g.D, g.C, g.G, g.Xl, g.Dl, g.logits, g.bpos, g.bdst, g.bsrc1, g.bsrc2, g.bslot, g.br1, g.br2, g.bbase, g.blen, g.zero, g.GA, g.bsrc6, g.br6}) ok = ok && b;
     if (!ok || !gpu::ensure_qscratch((int)R, std::max(ff, 2 * d))) return false;
     for (int i = n_slots - 1; i >= 0; --i) g.free_slots.push_back(i);
     in.g.hostX.resize(R * d);
@@ -239,8 +308,9 @@ static bool gpu_forward(LmEngine::Impl& in, const LmModel& m, const std::vector<
     const float scale = 1.0f / std::sqrt((float)hd);
     g.pos.resize(T); g.dst.resize(T); g.src1.resize(T); g.src2.resize(T);
     g.slot.resize(ns); g.r1.resize(ns); g.r2.resize(ns); g.base.resize(ns); g.len.resize(ns);
+    g.src6.resize((size_t)T * 6); g.r6.resize((size_t)ns * 6);
     int cap_sl = -1, cap_n = 0;                                            // boundaries captured by THIS call
-    if (g.cap_blk > 0 && pf && ns == 1) {
+    if (g.cap_blk > 0 && pf && ns == 1 && !m.sandwich) {
         const int sl = seqs[0]->gpu_slot, B = g.cap_blk;
         if (sl >= 0 && cap_ensure(in, m, sl)) {
             auto& cs = g.caps[(size_t)sl];
@@ -271,13 +341,24 @@ static bool gpu_forward(LmEngine::Impl& in, const LmModel& m, const std::vector<
             g.src1[t] = t >= 1 ? t - 1 : -1 - (sl * 2 + 1);
             g.src2[t] = t >= 2 ? t - 2 : (t == 1 ? -1 - (sl * 2 + 1) : -1 - (sl * 2 + 0));
         }
+        if (m.sandwich) {                                        // 7-tap conv: per-tap source rows and the new 6-row state
+            const int ncs = m.n_conv_state;
+            for (int t = 0; t < T; ++t) for (int k = 0; k < 6; ++k)
+                g.src6[(size_t)t * 6 + k] = (t - 6 + k >= 0) ? (t - 6 + k) : -1 - (sl * ncs + (t + k));
+            for (int j = 0; j < ncs; ++j)
+                g.r6[j] = (T - ncs + j >= 0) ? (T - ncs + j) : -1 - (T + j);
+        }
         g.slot[0] = sl; g.r1[0] = T - 1; g.r2[0] = T >= 2 ? T - 2 : -1;
     } else if (win_j) {                                          // speculative window: one decode-style row per token, several rows per sequence
+        int row0 = 0;
         for (int b = 0; b < T; ++b) {
+            if (b > 0 && seqs[b] != seqs[b - 1]) row0 = b;
             const int sl = seqs[b]->gpu_slot, j = (*win_j)[b], p = seqs[b]->n_past + j;
             g.pos[b] = p; g.dst[b] = sl * g.cap + p;
             g.src1[b] = j >= 1 ? b - 1 : -1 - (sl * 2 + 1);
             g.src2[b] = j >= 2 ? b - 2 : (j == 1 ? -1 - (sl * 2 + 1) : -1 - (sl * 2 + 0));
+            if (m.sandwich) for (int k = 0; k < 6; ++k)          // 7-tap conv: predecessors are win rows within C or the committed state
+                g.src6[(size_t)b * 6 + k] = (j - 6 + k >= 0) ? (row0 + j - 6 + k) : -1 - (sl * m.n_conv_state + (j + k));
             g.slot[b] = sl; g.r1[b] = b; g.r2[b] = -1; g.base[b] = sl * g.cap; g.len[b] = p + 1;
         }
     } else {
@@ -294,6 +375,8 @@ static bool gpu_forward(LmEngine::Impl& in, const LmModel& m, const std::vector<
               && gpu::write(g.bsrc1, g.src1.data(), (size_t)T * 4) && gpu::write(g.bsrc2, g.src2.data(), (size_t)T * 4)
               && gpu::write(g.bslot, g.slot.data(), (size_t)ns * 4) && gpu::write(g.br1, g.r1.data(), (size_t)ns * 4) && gpu::write(g.br2, g.r2.data(), (size_t)ns * 4);
     if (!pf) ok = ok && gpu::write(g.bbase, g.base.data(), (size_t)ns * 4) && gpu::write(g.blen, g.len.data(), (size_t)ns * 4);
+    if (ok && m.sandwich && (pf || win_j)) { ok = ok && gpu::write(g.bsrc6, g.src6.data(), (size_t)T * 6 * 4);
+        if (pf) ok = ok && gpu::write(g.br6, g.r6.data(), (size_t)ns * 6 * 4); }
     int dec_maxlen = 0;                                                    // longest key range of this decode step / window: sizes split-K attention
     if (!pf) for (int v : g.len) if (v > dec_maxlen) dec_maxlen = v;
     int ci = 0, ai = 0;
@@ -309,8 +392,8 @@ static bool gpu_forward(LmEngine::Impl& in, const LmModel& m, const std::vector<
     const bool p_first = fpro && (pro_mask & 1), p_gate = fpro && (pro_mask & 2), p_down = fpro && (pro_mask & 4), p_head = fpro && (pro_mask & 8);
     if (!pf && getenv("FERRO_VERBOSE")) { static int last = -1; const int sig = (p_first | p_gate << 1 | p_down << 2 | p_head << 3) * 8 + T; if (last != sig) { last = sig; fprintf(stderr, "[lm] decode T=%d: fused-prologue GEMV sites first=%d gateup=%d down=%d head=%d\n", T, p_first, p_gate, p_down, p_head); } }
     gpu::Buf xcur = g.X, xoth = g.X2; bool have_d = false;      // xcur: residual stream; have_d: g.D holds a not-yet-added branch output
-    auto first_gemm = [&](int slot, int il, gpu::Buf Y) {        // GEMV that opens a layer, together with the attn/conv input norm
-        if (p_first) {
+    auto first_gemm = [&](int slot, int il, gpu::Buf Y, bool fused) {   // GEMV that opens a layer, together with the attn/conv input norm
+        if (fused) {
             const bool r = gpu::op_gemv_pro(slot, T, Y, 1, xcur, have_d ? g.D : nullptr, g.an[il], have_d ? xoth : nullptr, 0, m.rms_eps);
             if (r && have_d) std::swap(xcur, xoth);
             have_d = false;
@@ -335,9 +418,17 @@ static bool gpu_forward(LmEngine::Impl& in, const LmModel& m, const std::vector<
     // when profiling, each op is timed from enqueue to completion (the previous op is already finished, so this is that op's own latency)
     for (int il = 0; ok && il < m.n_layer; ++il) {
         const LmLayer& l = m.L[il];
+        const bool pf_l = p_first && (!m.sandwich || l.conv);   // LFM3: the attention opening must stay unfused (the gate GEMM reads the quantized input)
         if (l.conv) {
-            ok = P("gemm", first_gemm(l.in_proj.gpu_slot, il, g.C));
-            if (ok && win_j) ok = P("conv", gpu::op_lm_conv_win_q(g.C, g.bsrc1, g.bsrc2, g.cst[ci], g.taps[ci], T, d)) && gpu::copy(g.cw[ci], 0, g.C, 0, (size_t)T * 3 * d * 4);
+            ok = P("gemm", first_gemm(l.in_proj.gpu_slot, il, g.C, pf_l));
+            if (m.sandwich) {                                       // (b|c|x) rows: 7-tap causal conv + state update; decode fuses the state shift
+                if (ok && win_j) ok = P("conv", gpu::op_lm_conv_q7(g.C, g.bsrc6, g.cst[ci], g.taps[ci], T, d))      // verify rows: no provisional state write
+                                       && gpu::copy(g.cw[ci], 0, g.C, 0, (size_t)T * 3 * d * 4);
+                else if (ok && pf) ok = P("conv", gpu::op_lm_conv_q7(g.C, g.bsrc6, g.cst[ci], g.taps[ci], T, d))
+                                  && P("conv_state", gpu::op_lm_conv_state7(g.C, g.cst[ci], g.bslot, g.br6, ns, d));
+                else if (ok) ok = P("conv", gpu::op_lm_conv_dec_q7(g.C, g.cst[ci], g.bslot, g.taps[ci], T, d));
+            }
+            else if (ok && win_j) ok = P("conv", gpu::op_lm_conv_win_q(g.C, g.bsrc1, g.bsrc2, g.cst[ci], g.taps[ci], T, d)) && gpu::copy(g.cw[ci], 0, g.C, 0, (size_t)T * 3 * d * 4);
             else if (ok && fuse && !pf) ok = P("conv", gpu::op_lm_conv_dec_q(g.C, g.cst[ci], g.bslot, g.taps[ci], T, d));          // decode: gate + state in one launch
             else if (ok) ok = P("conv", gpu::op_lm_conv_q(g.C, g.bsrc1, g.bsrc2, g.cst[ci], g.taps[ci], T, d))
                               && P("conv_state", gpu::op_lm_conv_state(g.C, g.cst[ci], g.bslot, g.br1, g.br2, ns, d));
@@ -345,28 +436,35 @@ static bool gpu_forward(LmEngine::Impl& in, const LmModel& m, const std::vector<
                 ok = P("conv_cap", gpu::op_lm_conv_state(g.C, g.caps[(size_t)cap_sl].st[ci], g.caps[(size_t)cap_sl].slot,
                                                          g.caps[(size_t)cap_sl].r1, g.caps[(size_t)cap_sl].r2, cap_n, d));
             ok = ok && P("gemm", gpu::op_gemm_q(l.out_proj.gpu_slot, T, g.D));
+            if (ok && m.sandwich) ok = P("post_attn", gpu::op_rms_inplace(g.D, g.pan[il], T, d, m.rms_eps));   // sandwich: norm the block output before the residual add
             ++ci;
         } else {
-            ok = P("gemm", first_gemm(l.wqkv.gpu_slot, il, g.C));
-            if (ok && kvq) ok = P("qkv_post", gpu::op_lm_qkv_post_kvq(g.C, rowc, T, nq, nkv, hd, g.qn[ai], g.kn[ai], g.cosb, g.sinb, g.bpos, hd / 2, m.rms_eps, g.kv[ai], g.kvs[ai], g.bdst, kvw));
+            ok = P("gemm", first_gemm(l.wqkv.gpu_slot, il, g.C, pf_l));
+            if (ok && m.sandwich) ok = P("gate", gpu::op_gemm_q(l.attn_gate.gpu_slot, T, g.GA));   // per-head gate logits: same quantized layer input as wqkv
+            if (ok && kvq && m.sandwich) ok = P("qkv_post", gpu::op_lm_qkv_post_kvq128(g.C, rowc, T, nq, nkv, g.qn[ai], g.kn[ai], l.swa ? g.cosb2 : g.cosb, l.swa ? g.sinb2 : g.sinb, g.bpos, m.rms_eps, g.kv[ai], g.kvs[ai], g.bdst, kvw));
+            else if (ok && kvq) ok = P("qkv_post", gpu::op_lm_qkv_post_kvq(g.C, rowc, T, nq, nkv, hd, g.qn[ai], g.kn[ai], g.cosb, g.sinb, g.bpos, hd / 2, m.rms_eps, g.kv[ai], g.kvs[ai], g.bdst, kvw));
             else if (ok && kvf) ok = P("qkv_post", gpu::op_lm_qkv_post_kv_f(g.C, rowc, T, nq, nkv, hd, g.qn[ai], g.kn[ai], g.cosb, g.sinb, g.bpos, hd / 2, m.rms_eps, g.kv[ai], g.bdst, kvw));
             else if (ok && fuse) ok = P("qkv_post", gpu::op_lm_qkv_post_kv(g.C, rowc, T, nq, nkv, hd, g.qn[ai], g.kn[ai], g.cosb, g.sinb, g.bpos, hd / 2, m.rms_eps, g.kv[ai], g.bdst, kvw));
             else if (ok) ok = P("qkv_post", gpu::op_qkv_post(g.C, rowc, T, nq, nkv, hd, g.qn[ai], g.kn[ai], g.cosb, g.sinb, g.bpos, hd / 2, m.rms_eps, false))
                               && P("kv_write", gpu::op_lm_kv_write(g.C, rowc, qsz, g.kv[ai], g.bdst, T, kvw));
             ok = ok
-                 && P("attn", kvq ? (pf ? gpu::op_lm_attn_pf_q(g.C, rowc, g.kv[ai], g.kvs[ai], kvw, ksz, seqs[0]->gpu_slot * g.cap, nq, nkv, pos0, scale, T)
+                 && P("attn", m.sandwich ? (pf ? gpu::op_lm_attn_pf_q128(g.C, rowc, g.kv[ai], g.kvs[ai], kvw, ksz, seqs[0]->gpu_slot * g.cap, nq, nkv, pos0, scale, g.GA, 64, l.swa ? m.swa_window : 0, T, 0)
+                                               : gpu::op_lm_attn_dec_q128(g.C, rowc, g.kv[ai], g.kvs[ai], kvw, ksz, g.bbase, g.blen, nq, nkv, scale, g.GA, 64, l.swa ? m.swa_window : 0, T))
+                          : kvq ? (pf ? gpu::op_lm_attn_pf_q(g.C, rowc, g.kv[ai], g.kvs[ai], kvw, ksz, seqs[0]->gpu_slot * g.cap, nq, nkv, pos0, scale, T)
                                         : gpu::op_lm_attn_dec_q(g.C, rowc, g.kv[ai], g.kvs[ai], kvw, ksz, g.bbase, g.blen, nq, nkv, scale, T, dec_maxlen))
                                   : kvf ? (pf ? gpu::op_lm_attn_pf_f(g.C, rowc, g.kv[ai], kvw, ksz, seqs[0]->gpu_slot * g.cap, nq, nkv, pos0, scale, T)
                                              : gpu::op_lm_attn_dec_f(g.C, rowc, g.kv[ai], kvw, ksz, g.bbase, g.blen, nq, nkv, scale, T, dec_maxlen))
                                         : (pf ? gpu::op_lm_attn_pf(g.C, rowc, g.kv[ai], kvw, ksz, seqs[0]->gpu_slot * g.cap, nq, nkv, pos0, scale, T)
                                               : gpu::op_lm_attn_dec(g.C, rowc, g.kv[ai], kvw, ksz, g.bbase, g.blen, nq, nkv, scale, T, dec_maxlen)))
                  && P("gemm", gpu::op_gemm_q(l.wo.gpu_slot, T, g.D));
+            if (ok && m.sandwich) ok = P("post_attn", gpu::op_rms_inplace(g.D, g.pan[il], T, d, m.rms_eps));   // sandwich: norm the block output before the residual add
             ++ai;
         }
         if (p_gate) { ok = ok && P("gemm", gpu::op_gemv_pro(l.gateup.gpu_slot, T, g.G, 1, xcur, g.D, g.fn[il], xoth, 0, m.rms_eps)); std::swap(xcur, xoth); }
         else ok = ok && P("resid_norm", gpu::op_resid_norm_q(xcur, g.D, nullptr, g.fn[il], nullptr, false, T, d, m.rms_eps)) && P("gemm", gpu::op_gemm_q(l.gateup.gpu_slot, T, g.G));
         if (p_down) ok = ok && P("gemm", gpu::op_gemv_pro(l.down.gpu_slot, T, g.D, 2, g.G, nullptr, nullptr, nullptr, ff, 0.f));
         else ok = ok && P("silu_mul", gpu::op_silu_mul_q(g.G, T, ff)) && P("gemm", gpu::op_gemm_q(l.down.gpu_slot, T, g.D));
+        if (ok && m.sandwich) ok = P("post_ffn", gpu::op_rms_inplace(g.D, g.pfn[il], T, d, m.rms_eps));   // sandwich: norm the FFN output before the residual add
         have_d = true;
         if (ok && pf) ok = gpu::finish();                                  // keep every submission short (i915 watchdog)
     }
@@ -393,7 +491,7 @@ bool LmEngine::on_gpu() const { return impl_ && impl_->g.ok; }
 bool LmEngine::spec_ok() const {          // verification rows must use the same kernels as serial decode: the default fused path only
     if (!on_gpu()) return false;
     const char* f = getenv("FERRO_LM_FUSE"); const int lv = f ? atoi(f) : 1;
-    return lv == 1;
+    return lv == 1;                       // LFM3: verify rows reuse the hd-128 decode kernels + the 7-tap conv window kernel
 }
 
 bool LmEngine::verify(const std::vector<LmSeq*>& seqs, const std::vector<std::vector<int>>& rows, float* logits, std::string* err) {
@@ -410,6 +508,18 @@ bool LmEngine::verify(const std::vector<LmSeq*>& seqs, const std::vector<std::ve
 
 bool LmEngine::commit(const std::vector<LmSeq*>& seqs, const std::vector<int>& row_off, const std::vector<int>& accepted) {
     auto& g = impl_->g; const int d = m_.n_embd, n = (int)seqs.size();
+    if (m_.sandwich) {                                                       // 7-tap conv state: rows come from the window (b|c|x) rows
+        std::vector<int> slot(n), r6((size_t)n * 6);
+        for (int i = 0; i < n; ++i) {
+            const int a = accepted[i]; slot[i] = seqs[i]->gpu_slot;
+            for (int j = 0; j < 6; ++j) r6[(size_t)i * 6 + j] = (a - 6 + j >= 0) ? (row_off[i] + a - 6 + j) : -1 - (a + j);
+        }
+        bool ok = gpu::write(g.bslot, slot.data(), (size_t)n * 4) && gpu::write(g.br6, r6.data(), (size_t)n * 6 * 4);
+        for (size_t ci = 0; ok && ci < g.cst.size(); ++ci) ok = gpu::op_lm_conv_state7(g.cw[ci], g.cst[ci], g.bslot, g.br6, n, d);
+        if (ok) ok = gpu::finish();                                          // host arrays must outlive the enqueued kernels
+        if (ok) for (int i = 0; i < n; ++i) seqs[i]->n_past += accepted[i];
+        return ok;
+    }
     std::vector<int> slot(n), r1(n), r2(n);
     for (int i = 0; i < n; ++i) { const int a = accepted[i]; slot[i] = seqs[i]->gpu_slot; r1[i] = row_off[i] + a - 1; r2[i] = a >= 2 ? row_off[i] + a - 2 : -1; }
     bool ok = gpu::write(g.bslot, slot.data(), (size_t)n * 4) && gpu::write(g.br1, r1.data(), (size_t)n * 4) && gpu::write(g.br2, r2.data(), (size_t)n * 4);
@@ -461,17 +571,18 @@ void LmEngine::reset(LmSeq& s) const {
             if (g.free_slots.empty()) { fprintf(stderr, "[lm] no free sequence slot\n"); return; }
             s.gpu_slot = g.free_slots.back(); g.free_slots.pop_back();
         }
-        for (gpu::Buf b : g.cst) gpu::copy(b, (size_t)s.gpu_slot * 2 * m_.n_embd * 4, g.zero, 0, (size_t)2 * m_.n_embd * 4);
+        for (gpu::Buf b : g.cst) gpu::copy(b, (size_t)s.gpu_slot * m_.n_conv_state * m_.n_embd * 4, g.zero, 0, (size_t)m_.n_conv_state * m_.n_embd * 4);
         return;
     }
     s.k.assign(m_.n_attn_layers, {}); s.v.assign(m_.n_attn_layers, {});
-    s.conv.assign(m_.n_conv_layers, std::vector<float>(2 * (size_t)m_.n_embd, 0.0f));
+    s.conv.assign(m_.n_conv_layers, std::vector<float>((size_t)m_.n_conv_state * m_.n_embd, 0.0f));
 }
 
 LmPrefix::~LmPrefix() { for (void* b : kv) if (b) gpu::release(b); for (void* b : kvs) if (b) gpu::release(b); for (void* b : cst) if (b) gpu::release(b); }
 
 bool LmEngine::capture_blocks(int blk) {
     if (!impl_ || !impl_->g.ok || blk <= 0 || max_ctx_ <= 0) return false;
+    if (m_.sandwich) return false;                                          // LFM3 v1: block-boundary capture is 3-tap only
     impl_->g.cap_blk = blk;
     impl_->g.cap_maxb = max_ctx_ / blk + 2;
     return true;
@@ -505,13 +616,13 @@ BlockGeom LmEngine::block_geom() const {
     const size_t kvw = (size_t)2 * m_.n_kv * m_.head_dim;
     BlockGeom g; g.n_layers = (uint32_t)m_.n_attn_layers; g.n_conv = (uint32_t)m_.n_conv_layers;
     g.row_bytes = (uint32_t)(kvw * kvesz()); g.scale_row_bytes = (uint32_t)(kv_dtype_ == 1 ? (kvw / 32) * 4 : 0);
-    g.conv_layer_bytes = (uint32_t)((size_t)2 * m_.n_embd * 4);
+    g.conv_layer_bytes = (uint32_t)((size_t)m_.n_conv_state * m_.n_embd * 4);
     return g;
 }
 
 size_t LmEngine::prefix_bytes(int n_tokens) const {
     const size_t kvw = (size_t)2 * m_.n_kv * m_.head_dim, per_row = kvw * kvesz() + (kv_dtype_ == 1 ? kvw / 32 * 4 : 0);
-    return (size_t)n_tokens * per_row * m_.n_attn_layers + (size_t)2 * m_.n_embd * 4 * m_.n_conv_layers;
+    return (size_t)n_tokens * per_row * m_.n_attn_layers + (size_t)m_.n_conv_state * m_.n_embd * 4 * m_.n_conv_layers;
 }
 
 std::shared_ptr<LmPrefix> LmEngine::snapshot(const LmSeq& s) const {
@@ -534,10 +645,10 @@ std::shared_ptr<LmPrefix> LmEngine::snapshot(const LmSeq& s) const {
         }
     }
     for (size_t l = 0; l < g.cst.size(); ++l) {
-        gpu::Buf b = gpu::alloc(2 * d * 4);
+        gpu::Buf b = gpu::alloc((size_t)m_.n_conv_state * d * 4);
         if (!b) return nullptr;
         p->cst.push_back(b);
-        if (!gpu::copy(b, 0, g.cst[l], (size_t)s.gpu_slot * 2 * d * 4, 2 * d * 4)) return nullptr;
+        if (!gpu::copy(b, 0, g.cst[l], (size_t)s.gpu_slot * m_.n_conv_state * d * 4, (size_t)m_.n_conv_state * d * 4)) return nullptr;
     }
     p->bytes = prefix_bytes(s.n_past);
     return p;
@@ -550,7 +661,7 @@ bool LmEngine::export_prefix(const LmPrefix& p, std::vector<uint8_t>* out) const
     auto rd = [&](void* b, size_t n) { const bool ok = gpu::read(b, out->data() + off, n); off += n; return ok; };
     bool ok = true;
     for (size_t l = 0; ok && l < p.kv.size(); ++l) { ok = rd(p.kv[l], (size_t)p.n * kvw * esz); if (ok && kv_dtype_ == 1) ok = rd(p.kvs[l], (size_t)p.n * (kvw / 32) * 4); }
-    for (size_t l = 0; ok && l < p.cst.size(); ++l) ok = rd(p.cst[l], 2 * d * 4);
+    for (size_t l = 0; ok && l < p.cst.size(); ++l) ok = rd(p.cst[l], (size_t)m_.n_conv_state * d * 4);
     return ok && off == out->size();
 }
 
@@ -573,9 +684,9 @@ bool LmEngine::export_block(const LmSeq& s, int from, int to, std::vector<uint8_
         }
     }
     if (cst) {                                                         // the conv state as of s.n_past
-        cst->resize(2 * d * 4 * g.cst.size());
+        cst->resize((size_t)m_.n_conv_state * d * 4 * g.cst.size());
         size_t co = 0;
-        for (size_t l = 0; ok && l < g.cst.size(); ++l) { ok = gpu::read_at(g.cst[l], (size_t)s.gpu_slot * 2 * d * 4, cst->data() + co, 2 * d * 4); co += 2 * d * 4; }
+        for (size_t l = 0; ok && l < g.cst.size(); ++l) { ok = gpu::read_at(g.cst[l], (size_t)s.gpu_slot * m_.n_conv_state * d * 4, cst->data() + co, (size_t)m_.n_conv_state * d * 4); co += (size_t)m_.n_conv_state * d * 4; }
     }
     return ok && off == kv->size();
 }
@@ -590,7 +701,7 @@ std::shared_ptr<LmPrefix> LmEngine::import_prefix(int n_tokens, const uint8_t* d
         void* b = up((size_t)n_tokens * kvw * esz); if (!b) return nullptr; p->kv.push_back(b);
         if (kv_dtype_ == 1) { void* sb = up((size_t)n_tokens * (kvw / 32) * 4); if (!sb) return nullptr; p->kvs.push_back(sb); }
     }
-    for (size_t l = 0; l < g.cst.size(); ++l) { void* b = up(2 * d * 4); if (!b) return nullptr; p->cst.push_back(b); }
+    for (size_t l = 0; l < g.cst.size(); ++l) { void* b = up((size_t)m_.n_conv_state * d * 4); if (!b) return nullptr; p->cst.push_back(b); }
     p->bytes = prefix_bytes(n_tokens);
     return p;
 }
@@ -610,7 +721,7 @@ bool LmEngine::restore(LmSeq& s, const LmPrefix& p) const {
         ok = ok && gpu::copy(g.kv[l], (size_t)s.gpu_slot * g.cap * kvw * esz, p.kv[l], 0, (size_t)p.n * kvw * esz);
         if (kv_dtype_ == 1) ok = ok && gpu::copy(g.kvs[l], (size_t)s.gpu_slot * g.cap * (kvw / 32) * 4, p.kvs[l], 0, (size_t)p.n * (kvw / 32) * 4);
     }
-    for (size_t l = 0; l < g.cst.size(); ++l) ok = ok && gpu::copy(g.cst[l], (size_t)s.gpu_slot * 2 * d * 4, p.cst[l], 0, 2 * d * 4);
+    for (size_t l = 0; l < g.cst.size(); ++l) ok = ok && gpu::copy(g.cst[l], (size_t)s.gpu_slot * m_.n_conv_state * d * 4, p.cst[l], 0, (size_t)m_.n_conv_state * d * 4);
     if (ok) s.n_past = p.n;
     return ok;
 }
@@ -628,8 +739,9 @@ bool LmEngine::step(const std::vector<LmSeq*>& seqs, const std::vector<const int
         if (forward_gpu(seqs, toks, n, logits, err, force_prefill)) { for (size_t i = 0; i < seqs.size(); ++i) seqs[i]->n_past += n[i]; return true; }
         return false;
     }
-    for (LmSeq* s : seqs) if ((int)s->conv.size() != m_.n_conv_layers) reset(*s);
-    forward_cpu(seqs, toks, n, logits);
+    for (LmSeq* s : seqs) if ((int)s->conv.size() != m_.n_conv_layers || (int)s->conv[0].size() != (size_t)m_.n_conv_state * m_.n_embd) reset(*s);
+    if (m_.sandwich) forward_cpu_lfm3(seqs, toks, n, logits);
+    else forward_cpu(seqs, toks, n, logits);
     for (size_t i = 0; i < seqs.size(); ++i) seqs[i]->n_past += n[i];
     return true;
 }
@@ -768,6 +880,155 @@ void LmEngine::forward_cpu(const std::vector<LmSeq*>& seqs, const std::vector<co
         gemm_q8_fma(l.gateup, Hn, T, nullptr, nullptr, G, 2 * ff);
         silu_mul(G, T, ff, F);
         gemm_q8_fma(l.down, F, T, nullptr, X, X2, d); std::swap(X, X2);
+    }
+    if (const char* dp = getenv("FERRO_LM_DUMP_HIDDEN")) {          // debug: post-output-norm hidden state of every row (what llama.cpp returns as embeddings)
+        std::vector<float> hn((size_t)T * d);
+        rmsnorm_q(X, T, d, m.out_norm.data(), m.rms_eps, hn.data());
+        FILE* f = fopen(dp, "wb"); if (f) { fwrite(hn.data(), 4, hn.size(), f); fclose(f); }
+    }
+    // logits of the last token of every sequence
+    in.last.resize((size_t)ns * d); in.lastn.resize((size_t)ns * d);
+    for (int s = 0; s < ns; ++s) memcpy(in.last.data() + (size_t)s * d, X + (size_t)(row0[s] + n[s] - 1) * d, d * 4);
+    rmsnorm_q(in.last.data(), ns, d, m.out_norm.data(), m.rms_eps, in.lastn.data());
+    gemm_q8_fma(m.tok_embd, in.lastn.data(), ns, nullptr, nullptr, logits, m.n_vocab);
+}
+
+// LFM3 CPU path: exact f32 reference. Recipe (llama.cpp src/models/lfm3.cpp, graph<false>):
+//   per block: h' = rmsnorm(h, attn_norm); block(h') [conv or attention];
+//              if sandwich: h' = rmsnorm(block_out, post_attn_norm);  h += h'          (post-norm BEFORE the residual add)
+//              h' = rmsnorm(h, ffn_norm); ffn(h'); if sandwich: ffn' = rmsnorm(ffn_out, post_ffn_norm);  h += ffn'
+//   conv: (b|c|x) = gemm(in_proj, h');  y = c * conv7(b*x);  out_proj(y)              7-tap causal, state = last 6 bx rows
+//   attn: (q|k|v) = gemm(wqkv, h'); qnorm/knorm per head; rope (full-attn: base 1e6 + partial-mask factors; swa: base 1e4, full);
+//         causal attention (swa: window of the last `swa_window` keys); gate = sigmoid(gemm(attn_gate, h')) per head;
+//         out *= gate per head; wo(out)
+void LmEngine::forward_cpu_lfm3(const std::vector<LmSeq*>& seqs, const std::vector<const int*>& toks, const std::vector<int>& n, float* logits) {
+    const LmModel& m = m_;
+    Impl& in = *impl_;
+    const int d = m.n_embd, hd = m.head_dim, nq = m.n_head, nkv = m.n_kv, ff = m.n_ff, Lc = m.n_conv_state + 1;
+    const int qsz = nq * hd, ksz = nkv * hd, rowc = qsz + 2 * ksz;
+    const int ns = (int)seqs.size();
+    int T = 0;
+    std::vector<int> row0(ns);
+    for (int i = 0; i < ns; ++i) { row0[i] = T; T += n[i]; }
+    in.ensure(T, d, ff, rowc);
+    std::vector<int> ids(T), pos(T);
+    for (int i = 0; i < ns; ++i) for (int j = 0; j < n[i]; ++j) { ids[row0[i] + j] = toks[i][j]; pos[row0[i] + j] = seqs[i]->n_past + j; }
+    float *X = in.X.data(), *X2 = in.X2.data(), *Hn = in.Hn.data(), *C = in.C.data(), *BX = in.BX.data(), *O = in.O.data();
+    float *G = in.G.data(), *F = in.F.data();
+    const float scale = 1.0f / std::sqrt((float)hd);
+    const int SW = m.swa_window;
+    gather_embd(m.tok_embd, ids.data(), T, 1.0f, X);
+    int ci = 0, ai = 0;
+    const int nl_lim = getenv("FERRO_LM_NLAYER") ? std::min(m.n_layer, atoi(getenv("FERRO_LM_NLAYER"))) : m.n_layer;
+    for (int il = 0; il < nl_lim; ++il) {
+        const LmLayer& l = m.L[il];
+        rmsnorm_q(X, T, d, l.attn_norm.data(), m.rms_eps, Hn);
+        if (l.conv) {
+            gemm_q8_fma(l.in_proj, Hn, T, nullptr, nullptr, C, 3 * d);                    // b | c | x
+            Pool::get().parallel_for(T, [&](int lo, int hi) {
+                for (int t = lo; t < hi; ++t) {
+                    const float* b = C + (size_t)t * 3 * d; const float* x = b + 2 * d; float* bx = BX + (size_t)t * d;
+                    for (int i = 0; i < d; ++i) bx[i] = b[i] * x[i];
+                }
+            });
+            const float* w = l.taps.data();
+            for (int s = 0; s < ns; ++s) {                                                // causal depthwise conv over the sequence + its state
+                float* st = seqs[s]->conv[ci].data();                                     // [(Lc-1)][d]: bx of tokens t-(Lc-1) .. t-1
+                const int r0 = row0[s], cnt = n[s];
+                Pool::get().parallel_for(cnt, [&](int lo, int hi) {
+                    for (int i = lo; i < hi; ++i) {
+                        const float* cx = C + (size_t)(r0 + i) * 3 * d + d;
+                        float* o = O + (size_t)(r0 + i) * d;
+                        for (int c = 0; c < d; ++c) {
+                            float acc = 0;
+                            for (int k = 0; k < Lc; ++k) {                                // tap k multiplies token t-(Lc-1)+k
+                                const int off = i - (Lc - 1) + k;
+                                const float* p = off >= 0 ? BX + (size_t)(r0 + off) * d : st + (size_t)((Lc - 1) + off) * d;
+                                acc += w[(size_t)k * d + c] * p[c];
+                            }
+                            o[c] = acc * cx[c];
+                        }
+                    }
+                });
+                // new state = the last Lc-1 bx rows (older rows of the old state fill the front when the slice is shorter)
+                std::vector<float> ns2((size_t)(Lc - 1) * d);
+                if (cnt >= Lc - 1) memcpy(ns2.data(), BX + (size_t)(r0 + cnt - (Lc - 1)) * d, (size_t)(Lc - 1) * d * 4);
+                else {
+                    memcpy(ns2.data(), st + (size_t)cnt * d, (size_t)((Lc - 1) - cnt) * d * 4);                            // keep the newest Lc-1-cnt state rows
+                    memcpy(ns2.data() + (size_t)((Lc - 1) - cnt) * d, BX + (size_t)r0 * d, (size_t)cnt * d * 4);
+                }
+                memcpy(st, ns2.data(), (size_t)(Lc - 1) * d * 4);
+            }
+            ++ci;
+            gemm_q8_fma(l.out_proj, O, T, nullptr, nullptr, X2, d);
+            rmsnorm_q(X2, T, d, l.post_attn_norm.data(), m.rms_eps, X2);                  // post-norm, in place
+            add_rows(X, X2, T * d, X2); std::swap(X, X2);
+        } else {
+            gemm_q8_fma(l.wqkv, Hn, T, nullptr, nullptr, C, rowc);
+            for (int h = 0; h < nq; ++h) rmsnorm_q(C + h * hd, T, hd, l.q_norm.data(), m.rms_eps, C + h * hd, rowc, rowc);
+            for (int h = 0; h < nkv; ++h) rmsnorm_q(C + qsz + h * hd, T, hd, l.k_norm.data(), m.rms_eps, C + qsz + h * hd, rowc, rowc);
+            const RopeTable& rt = l.swa ? m.rope_swa : m.rope;
+            rope_apply(C, T, nq, hd, rt, pos.data(), rowc);
+            rope_apply(C + qsz, T, nkv, hd, rt, pos.data(), rowc);
+            for (int s = 0; s < ns; ++s) {                                                // append K/V of the new tokens to the cache
+                std::vector<float>& K = seqs[s]->k[ai]; std::vector<float>& V = seqs[s]->v[ai];
+                const size_t old = K.size() / ksz;
+                K.resize((old + n[s]) * (size_t)ksz); V.resize((old + n[s]) * (size_t)ksz);
+                for (int j = 0; j < n[s]; ++j) {
+                    memcpy(K.data() + (old + j) * ksz, C + (size_t)(row0[s] + j) * rowc + qsz, ksz * 4);
+                    memcpy(V.data() + (old + j) * ksz, C + (size_t)(row0[s] + j) * rowc + qsz + ksz, ksz * 4);
+                }
+            }
+            const int grp = nq / nkv;
+            Pool::get().parallel_for(T * nq, [&](int a, int b) {
+                std::vector<float> sc;
+                for (int idx = a; idx < b; ++idx) {
+                    const int t = idx / nq, h = idx % nq, kh = h / grp;
+                    int s = 0; while (s + 1 < ns && row0[s + 1] <= t) ++s;
+                    const int kn = SW > 0 ? std::min(pos[t] + 1, SW) : pos[t] + 1;        // keys: window start .. own position
+                    const int kst = pos[t] + 1 - kn;
+                    const float* K = seqs[s]->k[ai].data(); const float* V = seqs[s]->v[ai].data();
+                    sc.resize((size_t)kn);
+                    const float* q = C + (size_t)t * rowc + h * hd;
+                    float mx = -1e30f;
+                    for (int j = 0; j < kn; ++j) {
+                        const float* kr = K + (size_t)(kst + j) * ksz + kh * hd; float acc = 0;
+                        for (int e = 0; e < hd; ++e) acc += q[e] * kr[e];
+                        sc[j] = acc * scale; mx = std::max(mx, sc[j]);
+                    }
+                    float sum = 0;
+                    for (int j = 0; j < kn; ++j) { sc[j] = std::exp(sc[j] - mx); sum += sc[j]; }
+                    const float inv = 1.0f / sum;
+                    float* o = O + (size_t)t * d + h * hd;
+                    for (int e = 0; e < hd; ++e) o[e] = 0;
+                    for (int j = 0; j < kn; ++j) { const float p = sc[j] * inv; const float* vr = V + (size_t)(kst + j) * ksz + kh * hd; for (int e = 0; e < hd; ++e) o[e] += p * vr[e]; }
+                }
+            });
+            if (m.has_gate) {                                                             // per-head sigmoid gate on the attention output
+                gemm_q8_fma(l.attn_gate, Hn, T, nullptr, nullptr, F, l.attn_gate.rows);   // F[t][rows]
+                Pool::get().parallel_for(T, [&](int lo, int hi) {
+                    for (int t = lo; t < hi; ++t) {
+                        const float* gt = F + (size_t)t * l.attn_gate.rows;
+                        float* o = O + (size_t)t * d;
+                        for (int h = 0; h < nq; ++h) {
+                            const float g = 1.0f / (1.0f + std::exp(-gt[h]));
+                            float* oh = o + (size_t)h * hd;
+                            for (int e = 0; e < hd; ++e) oh[e] *= g;
+                        }
+                    }
+                });
+            }
+            ++ai;
+            gemm_q8_fma(l.wo, O, T, nullptr, nullptr, X2, d);
+            rmsnorm_q(X2, T, d, l.post_attn_norm.data(), m.rms_eps, X2);
+            add_rows(X, X2, T * d, X2); std::swap(X, X2);
+        }
+        rmsnorm_q(X, T, d, l.ffn_norm.data(), m.rms_eps, Hn);
+        gemm_q8_fma(l.gateup, Hn, T, nullptr, nullptr, G, 2 * ff);
+        silu_mul(G, T, ff, F);
+        gemm_q8_fma(l.down, F, T, nullptr, nullptr, X2, d);
+        rmsnorm_q(X2, T, d, l.post_ffn_norm.data(), m.rms_eps, X2);
+        add_rows(X, X2, T * d, X2); std::swap(X, X2);
     }
     if (const char* dp = getenv("FERRO_LM_DUMP_HIDDEN")) {          // debug: post-output-norm hidden state of every row (what llama.cpp returns as embeddings)
         std::vector<float> hn((size_t)T * d);
