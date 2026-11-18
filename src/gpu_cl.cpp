@@ -777,6 +777,14 @@ __kernel void bias_act_q8(__global const float* G, __global const float* b, int 
   else if (act == 3) v = 0.5f * v * (1.0f + erf(v * 0.70710678118654752f));
   quant_lane8(v, am, Xp, Xs, t, cols, get_local_id(0));
 }
+// per-head sigmoid gate (head_dim 128) on f32 attention rows, then int8 quantization (the wo GEMM input).
+// WG per row, LS = cols/4: lane l owns elements 4l..4l+3, i.e. head l >> 5. G[t * gld + h] = gate logit.
+__kernel void gate_quant_h128(__global const float* X, __global const float* G, int gld, __global uint* Xp, __global float* Xs, int cols) {
+  __local float am[512];
+  const int t = get_group_id(0), lid = get_local_id(0);
+  const float g = 1.0f / (1.0f + native_exp2(-G[(size_t)t * gld + (lid >> 5)] * 1.4426950408889634f));
+  quant_lane4(vload4(lid, X + (size_t)t * cols) * g, am, Xp, Xs, t, cols);
+}
 // plain quantization of f32 rows. WG per row, LS = cols/4.
 __kernel void quant_q3(__global const float* X, __global uint* Xp, __global float* Xs, int cols) {
   __local float am[512];
@@ -2147,6 +2155,7 @@ static cl_kernel k_quant = nullptr, k_gemm = nullptr, k_gemm_sw = nullptr, k_rms
                  k_rnq = nullptr, k_hinq = nullptr, k_convq = nullptr, k_siluq = nullptr, k_bactq = nullptr,
                  k_badd = nullptr, k_score = nullptr, k_attq4 = nullptr, k_attq5 = nullptr, k_quantq = nullptr, k_lngq = nullptr, k_dqk = nullptr, k_dsm = nullptr, k_dpv = nullptr, k_qkvg4 = nullptr, k_dqkh = nullptr, k_dpvh = nullptr, k_dsmw = nullptr, k_anq = nullptr, k_aact = nullptr, k_ares = nullptr, k_aconv = nullptr, k_aattn = nullptr, k_lmconv = nullptr, k_lmcst = nullptr, k_lmkv = nullptr, k_lmpf = nullptr, k_lmdec = nullptr, k_lmcdec = nullptr, k_lmqkv = nullptr;
 static cl_kernel k_lmpfq = nullptr, k_lmdecq = nullptr, k_lmqkvq = nullptr, k_lmcwin = nullptr;   // int8-KV variants
+static cl_kernel k_gateq128 = nullptr;   // d1-2B dense attention: gate + quantize
 static cl_kernel k_rmsi = nullptr, k_lmconv7 = nullptr, k_lmcst7 = nullptr, k_lmcdec7 = nullptr, k_lmqkvq128 = nullptr, k_lmpfq128 = nullptr, k_lmdecq128 = nullptr;   // LFM3 (hd 128, 7-tap conv)
 static cl_program g_prog_ds = nullptr;                    // split-K decode attention (own program: a build failure keeps the per-head kernels)
 static cl_kernel k_lmds = nullptr, k_lmdsq = nullptr, k_lmdm = nullptr;
@@ -2223,7 +2232,7 @@ bool init(bool verbose) {
         {&k_attn, "attention"}, {&k_gmul, "gelu_mul"}, {&k_gmulv, "gelu_mulvec"}, {&k_add, "add_scale"},
         {&k_rowf, "row_fused"}, {&k_qkvp, "qkv_post"}, {&k_attq, "attention_q"}, {&k_gmq, "gelu_mul_q"},
         {&k_gmvq, "gelu_mulvec_q"}, {&k_attq2, "attention_q2"}, {&k_gmq2, "gelu_mul_q2"}, {&k_gmvq2, "gelu_mulvec_q2"},
-        {&k_qkvg4, "qkv_post_g4"}, {&k_dsmw, "dattn_stats_w"}, {&k_anq, "a_norm_quant"}, {&k_aact, "a_act_quant"}, {&k_ares, "a_resid"}, {&k_aconv, "a_conv_mid"}, {&k_aattn, "a_attn"}, {&k_lmconv, "lm_conv_q"}, {&k_lmcst, "lm_conv_state"}, {&k_lmkv, "lm_kv_write"}, {&k_lmpf, "lm_attn_pf"}, {&k_lmdec, "lm_attn_dec"}, {&k_lmcdec, "lm_conv_dec_q"}, {&k_lmqkv, "lm_qkv_post_kv"}, {&k_lmcwin, "lm_conv_win_q"}, {&k_lmpfq, "lm_attn_pf_q"}, {&k_lmdecq, "lm_attn_dec_q"}, {&k_lmqkvq, "lm_qkv_post_kvq"}, {&k_rmsi, "rms_inplace"}, {&k_lmconv7, "lm_conv_q7"}, {&k_lmcst7, "lm_conv_state7"}, {&k_lmcdec7, "lm_conv_dec_q7"}, {&k_lmqkvq128, "lm_qkv_post_kvq128"}, {&k_lmpfq128, "lm_attn_pf_q128"}, {&k_lmdecq128, "lm_attn_dec_q128"}, {&k_dqkh, "dattn_qk_h"}, {&k_dpvh, "dattn_pv_h"}, {&k_rowf3, "row_fused3"}, {&k_qkvp3, "qkv_post3"}, {&k_attq3, "attention_q3"}, {&k_gmq3, "gelu_mul_q3"},
+        {&k_qkvg4, "qkv_post_g4"}, {&k_dsmw, "dattn_stats_w"}, {&k_anq, "a_norm_quant"}, {&k_aact, "a_act_quant"}, {&k_ares, "a_resid"}, {&k_aconv, "a_conv_mid"}, {&k_aattn, "a_attn"}, {&k_lmconv, "lm_conv_q"}, {&k_lmcst, "lm_conv_state"}, {&k_lmkv, "lm_kv_write"}, {&k_lmpf, "lm_attn_pf"}, {&k_lmdec, "lm_attn_dec"}, {&k_lmcdec, "lm_conv_dec_q"}, {&k_lmqkv, "lm_qkv_post_kv"}, {&k_lmcwin, "lm_conv_win_q"}, {&k_lmpfq, "lm_attn_pf_q"}, {&k_lmdecq, "lm_attn_dec_q"}, {&k_lmqkvq, "lm_qkv_post_kvq"}, {&k_rmsi, "rms_inplace"}, {&k_lmconv7, "lm_conv_q7"}, {&k_lmcst7, "lm_conv_state7"}, {&k_lmcdec7, "lm_conv_dec_q7"}, {&k_lmqkvq128, "lm_qkv_post_kvq128"}, {&k_lmpfq128, "lm_attn_pf_q128"}, {&k_gateq128, "gate_quant_h128"}, {&k_lmdecq128, "lm_attn_dec_q128"}, {&k_dqkh, "dattn_qk_h"}, {&k_dpvh, "dattn_pv_h"}, {&k_rowf3, "row_fused3"}, {&k_qkvp3, "qkv_post3"}, {&k_attq3, "attention_q3"}, {&k_gmq3, "gelu_mul_q3"},
         {&k_gmvq3, "gelu_mulvec_q3"}, {&k_rnq, "resid_norm_q3"}, {&k_hinq, "head_in_q3"}, {&k_convq, "conv_gate_q3"},
         {&k_siluq, "silu_mul_q8"}, {&k_bactq, "bias_act_q8"}, {&k_badd, "bias_add"}, {&k_score, "score_out"}, {&k_attq4, "attention_q4"}, {&k_attq5, "attention_q5"}, {&k_quantq, "quant_q3"}, {&k_lngq, "ln_gather_q3"}, {&k_dqk, "dattn_qk"}, {&k_dsm, "dattn_stats"}, {&k_dpv, "dattn_pv"}};
     for (auto& k : ks) { *k.k = cl.clCreateKernel(g_prog, k.n, &err); CK(err); }
@@ -2527,12 +2536,13 @@ bool op_attn_split(Buf Q, int qld, Buf KV, int ldkv, int qoff, int koff, int vof
     return launch(k_dpvh, 2, g3, l3);
 }
 
-bool op_dense_attention_h(Buf C, int ldc, int qoff, int koff, int voff, int n, int nq, int nkv, int hd, float scale, Buf S, Buf O, int ldo, int window, size_t s_floats) {
+bool op_dense_attention_h(Buf C, int ldc, int qoff, int koff, int voff, int n, int nq, int nkv, int hd, float scale, Buf S, Buf O, int ldo, int window, size_t s_floats, int causal, int r0) {
+    qoff += r0 * ldc; koff += r0 * ldc; voff += r0 * ldc;            // segment [r0, r0 + n) of a packed batch: rows of C and O shift by r0
     if (hd % 64 || hd > 512 || nq % nkv) return false;
     const int grp = nq / nkv;
     // query tile: the score scratch holds nq * rows * n floats
     int rows = (int)std::min<size_t>((size_t)n, s_floats / ((size_t)nq * n));
-    rows = std::max(64, rows & ~63);                                 // whole 64-row tiles
+    if (rows < n) rows = std::max(64, rows & ~63);                   // tiled: whole 64-row tiles (a prompt that fits is ONE tile)
     if ((size_t)nq * rows * n > s_floats) return false;
     static Buf g_dst = nullptr; static size_t g_dstcap = 0;
     const size_t stb = (size_t)nq * rows * 8;
@@ -2545,15 +2555,16 @@ bool op_dense_attention_h(Buf C, int ldc, int qoff, int koff, int voff, int n, i
         auto ta0 = std::chrono::steady_clock::now();
         const int nr = std::min(rows, n - q0);
         const size_t qt = (size_t)(nr + 63) / 64, kt = (size_t)(n + 63) / 64;
-        set_args(k_dqkh, C, C, (cl_int)ldc, (cl_int)ldc, (cl_int)qoff, (cl_int)koff, (cl_int)n, (cl_int)hd, (cl_int)grp, S, (cl_int)q0, (cl_int)nr, (cl_int)window, (cl_int)0);
+        // dattn_qk_h indexes Q rows relative to the tile (op_attn_split passes chunk-relative Q): shift Q to row q0 here
+        set_args(k_dqkh, C, C, (cl_int)ldc, (cl_int)ldc, (cl_int)(qoff + q0 * ldc), (cl_int)koff, (cl_int)n, (cl_int)hd, (cl_int)grp, S, (cl_int)q0, (cl_int)nr, (cl_int)window, (cl_int)causal);
         size_t g1[3] = {kt * 16, qt * 16, (size_t)nq}, l1[3] = {16, 16, 1};
         if (!launch(k_dqkh, 3, g1, l1)) return false;
         lapa(0, ta0);
-        set_args(k_dsmw, S, (cl_int)n, scale, g_dst, (cl_int)window, (cl_int)q0, (cl_int)nr, (cl_int)0);
+        set_args(k_dsmw, S, (cl_int)n, scale, g_dst, (cl_int)window, (cl_int)q0, (cl_int)nr, (cl_int)causal);
         size_t g2[2] = {(size_t)nr * 256, (size_t)nq}, l2[2] = {256, 1};
         if (!launch(k_dsmw, 2, g2, l2)) return false;
         lapa(1, ta0);
-        set_args(k_dpvh, S, g_dst, scale, C, (cl_int)ldc, (cl_int)voff, (cl_int)n, (cl_int)hd, (cl_int)grp, O, (cl_int)ldo, (cl_int)window, (cl_int)q0, (cl_int)nr, (cl_int)0, (cl_int)q0);
+        set_args(k_dpvh, S, g_dst, scale, C, (cl_int)ldc, (cl_int)voff, (cl_int)n, (cl_int)hd, (cl_int)grp, O, (cl_int)ldo, (cl_int)window, (cl_int)q0, (cl_int)nr, (cl_int)causal, (cl_int)(q0 + r0));
         size_t g3[2] = {qt * 16, (size_t)nq * (hd / 64) * 16}, l3[2] = {16, 16};
         if (!launch(k_dpvh, 2, g3, l3)) return false;
         lapa(2, ta0);
@@ -3294,6 +3305,12 @@ bool op_bias_act_mode_q(Buf G, Buf b, int act, int T, int cols) {
     set_args(k_bactq, G, b, (cl_int)act, (Buf)g_Xp, (Buf)g_Xs, (cl_int)cols);
     size_t g[1] = {(size_t)T * (cols / 8)}, l[1] = {(size_t)cols / 8};
     return launch(k_bactq, 1, g, l);
+}
+bool op_gate_quant_h128(Buf X, Buf G, int gld, int T, int cols) {
+    if (cols % 128 || cols / 4 > 512) return false;
+    set_args(k_gateq128, X, G, (cl_int)gld, (Buf)g_Xp, (Buf)g_Xs, (cl_int)cols);
+    size_t g[1] = {(size_t)T * (cols / 4)}, l[1] = {(size_t)cols / 4};
+    return launch(k_gateq128, 1, g, l);
 }
 bool op_quant_q(Buf X, int T, int cols) {
     if (cols % 32 || cols / 4 > 512) return false;

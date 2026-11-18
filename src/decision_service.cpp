@@ -205,34 +205,39 @@ DecisionPrepared DecisionService::prepare(const Json& body) {
 
 bool DecisionService::infer(const std::vector<DecisionPrepared*>& jobs, std::vector<std::vector<std::vector<float>>>& scores, std::string* err) {
     scores.assign(jobs.size(), {});
-    if (lfm3d1_) {                                                 // each question is its own stateless forward (the prompts share no cache)
+    if (lfm3d1_) {                                                 // each question is its own stateless prompt; score_batch packs them into
+                                                                   // as few iGPU forwards as fit (segments stay independent)
+        std::vector<std::vector<std::vector<float>>> rows(jobs.size());     // vision rows per (job, media block), encoded once
+        std::vector<D1Item> items;
+        std::vector<size_t> job_of;
+        const int d = d1_.model().n_embd;
         for (size_t ji = 0; ji < jobs.size(); ++ji) {
             DecisionPrepared* P = jobs[ji];
-            // encode the images of each request once (vision rows are shared by its questions)
-            std::vector<std::vector<float>> rows(P->rmedia.size());
-            for (size_t i = 0; i < P->rmedia.size(); ++i)
-                rows[i] = mm_.encode_vision(P->rmedia[i].vin);
-            size_t k = 0;
+            rows[ji].resize(P->rmedia.size());
+            for (size_t i = 0; i < P->rmedia.size(); ++i) {
+                const auto tv0 = std::chrono::steady_clock::now();
+                rows[ji][i] = mm_.encode_vision(P->rmedia[i].vin);
+                if (getenv("FERRO_VERBOSE")) fprintf(stderr, "[d1] vision encode: %d rows in %.0f ms\n", P->rmedia[i].n_tok, secs_since(tv0) * 1e3);
+            }
             for (size_t ri = 0; ri < P->lq.size(); ++ri)
-                for (size_t qi = 0; qi < P->lq[ri].size(); ++qi, ++k) {
+                for (size_t qi = 0; qi < P->lq[ri].size(); ++qi) {
                     const auto& b = P->lq[ri][qi];
-                    std::vector<float> sc;
+                    D1Item it; it.toks = &b.tokens; it.labels = &b.groups;
                     const int mi = P->req_media[ri];
-                    if (mi < 0) {
-                        if (!d1_.score(b.tokens, b.groups, sc, err)) return false;
-                    } else {
-                        const auto& embd = rows[mi];
-                        const int d = d1_.model().n_embd;
+                    if (mi >= 0) {
+                        const auto& embd = rows[ji][mi];
                         if ((int)embd.size() != P->rmedia[mi].n_tok * d) { if (err) *err = "vision encoder produced " + std::to_string(embd.size() / d) + " rows, expected " + std::to_string(P->rmedia[mi].n_tok); return false; }
-                        std::vector<int> mpos;
                         for (auto& run : b.media_runs)
-                            for (int j = 0; j < run.second; ++j) mpos.push_back(run.first + j);
-                        if (mpos.size() != P->rmedia[mi].n_tok) { if (err) *err = "prompt media rows (" + std::to_string(mpos.size()) + ") do not match the encoded images (" + std::to_string(P->rmedia[mi].n_tok) + ")"; return false; }
-                        if (!d1_.score(b.tokens, b.groups, sc, err, embd.data(), mpos)) return false;
+                            for (int j = 0; j < run.second; ++j) it.media_pos.push_back(run.first + j);
+                        if (it.media_pos.size() != P->rmedia[mi].n_tok) { if (err) *err = "prompt media rows (" + std::to_string(it.media_pos.size()) + ") do not match the encoded images (" + std::to_string(P->rmedia[mi].n_tok) + ")"; return false; }
+                        it.media_rows = embd.data();
                     }
-                    scores[ji].push_back(std::move(sc));
+                    items.push_back(std::move(it)); job_of.push_back(ji);
                 }
         }
+        std::vector<std::vector<float>> sc;
+        if (!d1_.score_batch(items, sc, err)) return false;
+        for (size_t k = 0; k < items.size(); ++k) scores[job_of[k]].push_back(std::move(sc[k]));
         return true;
     }
     // encode every media block of every job once, then one packed forward over all question sequences

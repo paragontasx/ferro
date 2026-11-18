@@ -906,9 +906,9 @@ one `gpu::finish()` per layer (i915 watchdog). Final row -> out_norm resid_norm 
   zone a). Long state (2 q / ~750 tok): TV_all 0.058-0.081, argmax identical. `make test` (kernels/decision/media) ALL PASS.
 - **Speed** (iGPU vs CPU, both 14 threads): text card 3 q / 254 tok **784 ms vs 2886 ms = 3.7x** (324 vs 88 tok/s;
   the CPU default-2-thread run is 7.2 s). Vision request **5.19 s vs 10.65 s = 2.05x** end-to-end (the lfm3vl vision
-  tower stays CPU in both; the forwards themselves are the difference). Long state T~754 **13.9 s vs 22.6 s = 1.6x** —
-  the bidirectional global attention is O(T^2) per prompt, so the GPU advantage narrows as the prompt grows (108 vs
-  66 tok/s there vs 324 vs 88 on the 85-token prompts).
+  tower stays CPU in both; the forwards themselves are the difference). Long state T~754: **5.29 s vs 22.6 s = 4.3x**.
+  **CORRECTION (2026-11-18 evening):** this line originally said 13.9 s / 1.6x — that GPU run had `FERRO_D1_DBG=1`
+  set, which runs the CPU forward for comparison inside the timed region. Never time with the DBG hooks on.
 - Serve: `serve --d1 ... --port 8097` + `/v1/systemone` text card: worker pass busy 0.84 s / 3 questions, answers
   identical to the CLI. (The d1 init branch still skips the eager mmproj load; it is found next to the model on first
   image use — unchanged pre-existing behavior.)
@@ -919,3 +919,56 @@ TV ~11, first divergence at layer 2, the first global layer, found with the per-
 vectors (pos/dst/src6) were not resized -> segfault. The per-block checkpoint diff is the fastest way to bisect
 future d1 GPU parity hunts: conv layers land clean (~0.003) immediately, the first broken attention block jumps
 ~1.0+ at its layer index.
+
+### d1-2B iGPU: dense attention + packed prompts, 2026-11-18 evening (this machine) — 2.2-3.2x on top of the port
+
+Profiled with the new `FERRO_D1_PROF=1` (finish() after every op, wall time per op class). At T~750 the per-tile
+`lm_attn_pf_q128` was 63% of the forward (global 49%, SWA 14%) at ~20 GFLOP/s: one WG per (head, 32-query tile), Q held
+in SLM (2 SLM loads per FMA), 3 barriers per 8-key chunk, a serial per-key online softmax with a divergent rescale, and
+every query tile re-dequantizing the whole int8 KV. At T~80 the FFN GEMMs dominate (gateup+down 49%) at only ~1.3 TOPS
+because every question was its own small forward.
+
+1. **Dense attention** (`FERRO_D1_DENSE`, default 3 = both layer kinds; bit 1 global, bit 2 SWA; 0 = old kernel):
+   the existing `op_dense_attention_h` (GEMM-tiled QK^T 64x64 SLM tiles -> row-max stats -> PV GEMM) on the f32 Q/K/V
+   rows that `lm_qkv_post_kvq128` already leaves in C (normed + roped in place; V raw), then the new
+   `gate_quant_h128` kernel (per-head sigmoid gate x output -> int8 rows for the wo GEMM). The wrapper gained a
+   `causal` flag (the kernels already had it; SWA = causal + |i-j| < window) and an `r0` segment row offset.
+   Global attention at T~750: 5332 -> 351 ms (15x), SWA 1517 -> 161 ms (9.4x).
+2. **Packed prompts** (`Lfm3D1Engine::score_batch`, `FERRO_D1_PACK=N` caps prompts per forward, default 64): every
+   question of every job in a worker pass is packed into as few forwards as fit Tmax rows. GEMMs / norms / conv / FFN
+   run over all packed rows; segments stay independent via per-segment positions (pos = row - seg0), conv refs
+   before a segment start pointing at the all-zero state rows, and attention per segment (r0 offset). One batched
+   logits GEMM over the segments' last rows. Packing is bit-identical to one-prompt-per-forward (TV 0.2059 both
+   ways on the T=754 prompt) — no cross-segment leak.
+
+**REPO BUG FIXED — `op_dense_attention_h` query tiling** (affected EmbeddingGemma-2's dense text path for single
+segments >= 96 tokens, and the gemma4 vision encoder): `rows = max(64, rows & ~63)` split ANY length that is not a
+multiple of 64 into several query tiles even when the whole score matrix fit, and `dattn_qk_h` indexes Q rows
+tile-relative (by design, for `op_attn_split`'s chunk-relative Q) while this wrapper passed the absolute C — every
+tile after the first attended with the WRONG query rows. Fix: one tile when it fits, and Q shifted to row q0
+(`qoff + q0 * ldc`). EG2 single-sequence embeddings vs the CPU path: 121 tok cos **0.94322 -> 0.99992**, 172 tok
+**0.94109 -> 0.99992** (lane-per-key path: 0.99984 / 0.99988, so dense is now the most accurate GPU path).
+
+Parity (FERRO_D1_DBG, each packed segment vs its own CPU f32 forward): text card TV 0.055-0.098, long T=746/754
+0.059 / 0.206 (per-layer rel error identical to the old kernel's — 4.55e-2 vs 4.53e-2 at layer 23, no jump: an
+outlier draw on that prompt), vision 0.070-0.128; argmax identical everywhere; answers match CPU on text / long /
+vision. tickets16 (48 q): top answers 48/48 identical to the old path, max noul delta 0.013. `make test` PASS.
+
+Speed (iGPU, 14 threads; mean of reps 1-3):
+
+| request | before (per-tile attn) | + dense attn | + packing | CPU (14 t) | iGPU vs CPU |
+|---|---|---|---|---|---|
+| text card, 3 q / 254 tok | 803 ms | 640 ms | **373 ms** | 2912 ms | **7.8x** |
+| long state, 2 q / 1500 tok | 5286 ms | 2117 ms | **2046 ms** | 22.6 s | **11x** |
+| image, 3 q / 1160 tok | 4696 ms | 3204 ms | **3048 ms** | 10.66 s | **3.5x** |
+| tickets16, 48 q / 2903 tok | 11683 ms (248 tok/s) | 10441 ms | **3677 ms (790 tok/s)** | | |
+
+Serve (`serve --d1`, tickets16 over HTTP): one ticket (3 q) **0.28 s**; 16 tickets at concurrency 1 / 4 / 16:
+4.45 / 4.00 / 3.78 s wall = 10.8 / 12.0 / 12.7 questions/s (~760 q/min vs ~68 q/min on CPU); answers at
+concurrency 16 identical to concurrency 1.
+
+What is left: the long forward is now GEMM-bound — gateup + down are 56% at ~2.3-2.9 TOPS int8, close to what DP4A
+does on this XMX-less Arrow Lake-S iGPU. The image request is now half vision tower: `[d1] vision encode: 300 rows in
+~1.6 s` (FERRO_VERBOSE) of the 3.05 s — the lfm3vl tower still runs on the CPU; porting it to the iGPU (its GEMMs +
+the dense attention above) is the next big lever. Smaller: fold the sandwich post-norm (`rms_post`, ~3%) into the
+residual kernel.

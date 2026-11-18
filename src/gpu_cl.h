@@ -56,7 +56,7 @@ bool op_qkv_post(Buf C, int rowc, int T, int nq, int nkv, int hd, Buf qw, Buf kw
 // Gemma 4 vision (hd = 64): q/k RMSNorm(w) + 2-D RoPE (posx on dims [0,32), posy on [32,64), invf[16]); v RMSNorm (no weight)
 bool op_qkv_post_g4(Buf C, int rowc, int T, int nq, int nkv, int hd, Buf qw, Buf kw, Buf invf, Buf posx, Buf posy, float eps);
 // dense attention for one fully visible segment, any head dim multiple of 64 (<= 512), grouped-query; f32 out O[n][nq*hd]
-bool op_dense_attention_h(Buf C, int ldc, int qoff, int koff, int voff, int n, int nq, int nkv, int hd, float scale, Buf S, Buf O, int ldo, int window = -1, size_t s_floats = (size_t)1 << 62);   // S capacity in floats: queries are tiled to fit   // window > 0: keys with |i-j| >= window are masked (SWA)
+bool op_dense_attention_h(Buf C, int ldc, int qoff, int koff, int voff, int n, int nq, int nkv, int hd, float scale, Buf S, Buf O, int ldo, int window = -1, size_t s_floats = (size_t)1 << 62, int causal = 0, int r0 = 0);   // causal: keys <= query; r0: segment row offset in C/O   // S capacity in floats: queries are tiled to fit   // window > 0: keys with |i-j| >= window are masked (SWA)
 // One explicit query tile with the KV cache in a separate buffer: Q holds the chunk only (rows relative,
 // stride qld), K/V live in KV (row stride ldkv, K at koff, V at voff, rows = absolute positions). causal:
 // a query sees keys <= q0 + i; window > 0 is the SWA band. O gets the chunk's rows (stride ldo, relative).
@@ -120,6 +120,7 @@ bool op_bias_act_q(Buf G, Buf b, bool relu, int T, int cols);// (G + b) [relu] -
 bool op_bias_add(Buf Y, Buf b, int T, int rows);
 // act(G + b) -> int8 (act: 0 none, 1 relu, 2 gelu-tanh, 3 gelu-erf)
 bool op_bias_act_mode_q(Buf G, Buf b, int act, int T, int cols);
+bool op_gate_quant_h128(Buf X, Buf G, int gld, int T, int cols);   // O * sigmoid(G[t][h]) (hd 128) -> int8 scratch (d1-2B dense attention)
 bool op_quant_q(Buf X, int T, int cols);
 // dense attention over one fully-visible segment [r0, r0+n) of C (q|k|v at qoff/koff/voff, head dim 64):
 // S = scratch of nh*n*n floats; O receives the f32 output (row stride ldo)
