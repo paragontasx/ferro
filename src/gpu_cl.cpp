@@ -777,6 +777,46 @@ __kernel void bias_act_q8(__global const float* G, __global const float* b, int 
   else if (act == 3) v = 0.5f * v * (1.0f + erf(v * 0.70710678118654752f));
   quant_lane8(v, am, Xp, Xs, t, cols, get_local_id(0));
 }
+// ---- lfm3vl vision tower (d1-2B mmproj) ----
+// gated 3x3 depthwise conv over the patch grid, fused: g_n = C[n][e] * C[n][2d+e] for the 9 neighbours
+// (nb[t*9+k] = row, or -1 = zero border; k = ky*3+kx), y = C[t][d+e] * sum_k g_k * wT[k*d+e] -> int8 (the out_proj
+// input). C rows are the in_proj output [b | c | x] of 3d. WG per token, LS = d/4.
+__kernel void v3_dwconv_q(__global const float* C, __global const int* nb, __global const float* wT,
+                          __global uint* Xp, __global float* Xs, int d) {
+  __local float am[512];
+  const int t = get_group_id(0), lid = get_local_id(0);
+  float4 acc = (float4)(0.f);
+  for (int k = 0; k < 9; ++k) {
+    const int n = nb[t * 9 + k];
+    if (n < 0) continue;
+    const __global float* r = C + (size_t)n * 3 * d;
+    acc = mad(vload4(lid, r) * vload4(lid, r + 2 * d), vload4(lid, wT + (size_t)k * d), acc);
+  }
+  quant_lane4(acc * vload4(lid, C + (size_t)t * 3 * d + d), am, Xp, Xs, t, d);
+}
+// round to the nearest f16 value (RNE on the 10-bit mantissa; normal range — llama.cpp's flash attention casts K/V)
+inline float f16r(float x) { uint u = as_uint(x); u = (u + 0x0FFFu + ((u >> 13) & 1u)) & 0xFFFFE000u; return as_float(u); }
+// lfm3vl attention post-QKV, head_dim 64, in place on C rows [q | k | v] (row stride ld): per-head RMS norm on q and
+// k, 2D vision rope (pair (i, i+32); i < 16 rotates by the patch row py, the rest by the column px, angle = pos *
+// th[i]), then f16 rounding of K and V. WG per (slot, token), 32 lanes; slots: nq query, nkv key, nkv value heads.
+__kernel void v3_qk_rope64(__global float* C, int ld, int nq, int nkv, __global const float* qw, __global const float* kw,
+                           __global const float* th, __global const int* py, __global const int* px, float eps) {
+  __local float red[32];
+  const int slot = get_group_id(0), t = get_group_id(1), i = get_local_id(0);
+  __global float* p = C + (size_t)t * ld + slot * 64;
+  float a = p[i], b = p[i + 32];
+  if (slot < nq + nkv) {
+    const float inv = 1.0f / sqrt(wg_add(a * a + b * b, red) / 64.0f + eps);
+    __global const float* w = slot < nq ? qw : kw;
+    a *= inv * w[i]; b *= inv * w[i + 32];
+    const float ang = (float)(i < 16 ? py[t] : px[t]) * th[i];
+    float c; const float s = sincos(ang, &c);
+    const float na = a * c - b * s, nb2 = a * s + b * c;
+    a = na; b = nb2;
+  }
+  if (slot >= nq) { a = f16r(a); b = f16r(b); }
+  p[i] = a; p[i + 32] = b;
+}
 // per-head sigmoid gate (head_dim 128) on f32 attention rows, then int8 quantization (the wo GEMM input).
 // WG per row, LS = cols/4: lane l owns elements 4l..4l+3, i.e. head l >> 5. G[t * gld + h] = gate logit.
 __kernel void gate_quant_h128(__global const float* X, __global const float* G, int gld, __global uint* Xp, __global float* Xs, int cols) {
@@ -2155,6 +2195,7 @@ static cl_kernel k_quant = nullptr, k_gemm = nullptr, k_gemm_sw = nullptr, k_rms
                  k_rnq = nullptr, k_hinq = nullptr, k_convq = nullptr, k_siluq = nullptr, k_bactq = nullptr,
                  k_badd = nullptr, k_score = nullptr, k_attq4 = nullptr, k_attq5 = nullptr, k_quantq = nullptr, k_lngq = nullptr, k_dqk = nullptr, k_dsm = nullptr, k_dpv = nullptr, k_qkvg4 = nullptr, k_dqkh = nullptr, k_dpvh = nullptr, k_dsmw = nullptr, k_anq = nullptr, k_aact = nullptr, k_ares = nullptr, k_aconv = nullptr, k_aattn = nullptr, k_lmconv = nullptr, k_lmcst = nullptr, k_lmkv = nullptr, k_lmpf = nullptr, k_lmdec = nullptr, k_lmcdec = nullptr, k_lmqkv = nullptr;
 static cl_kernel k_lmpfq = nullptr, k_lmdecq = nullptr, k_lmqkvq = nullptr, k_lmcwin = nullptr;   // int8-KV variants
+static cl_kernel k_v3dw = nullptr, k_v3qk = nullptr;   // lfm3vl vision tower
 static cl_kernel k_gateq128 = nullptr;   // d1-2B dense attention: gate + quantize
 static cl_kernel k_rmsi = nullptr, k_lmconv7 = nullptr, k_lmcst7 = nullptr, k_lmcdec7 = nullptr, k_lmqkvq128 = nullptr, k_lmpfq128 = nullptr, k_lmdecq128 = nullptr;   // LFM3 (hd 128, 7-tap conv)
 static cl_program g_prog_ds = nullptr;                    // split-K decode attention (own program: a build failure keeps the per-head kernels)
@@ -2232,7 +2273,7 @@ bool init(bool verbose) {
         {&k_attn, "attention"}, {&k_gmul, "gelu_mul"}, {&k_gmulv, "gelu_mulvec"}, {&k_add, "add_scale"},
         {&k_rowf, "row_fused"}, {&k_qkvp, "qkv_post"}, {&k_attq, "attention_q"}, {&k_gmq, "gelu_mul_q"},
         {&k_gmvq, "gelu_mulvec_q"}, {&k_attq2, "attention_q2"}, {&k_gmq2, "gelu_mul_q2"}, {&k_gmvq2, "gelu_mulvec_q2"},
-        {&k_qkvg4, "qkv_post_g4"}, {&k_dsmw, "dattn_stats_w"}, {&k_anq, "a_norm_quant"}, {&k_aact, "a_act_quant"}, {&k_ares, "a_resid"}, {&k_aconv, "a_conv_mid"}, {&k_aattn, "a_attn"}, {&k_lmconv, "lm_conv_q"}, {&k_lmcst, "lm_conv_state"}, {&k_lmkv, "lm_kv_write"}, {&k_lmpf, "lm_attn_pf"}, {&k_lmdec, "lm_attn_dec"}, {&k_lmcdec, "lm_conv_dec_q"}, {&k_lmqkv, "lm_qkv_post_kv"}, {&k_lmcwin, "lm_conv_win_q"}, {&k_lmpfq, "lm_attn_pf_q"}, {&k_lmdecq, "lm_attn_dec_q"}, {&k_lmqkvq, "lm_qkv_post_kvq"}, {&k_rmsi, "rms_inplace"}, {&k_lmconv7, "lm_conv_q7"}, {&k_lmcst7, "lm_conv_state7"}, {&k_lmcdec7, "lm_conv_dec_q7"}, {&k_lmqkvq128, "lm_qkv_post_kvq128"}, {&k_lmpfq128, "lm_attn_pf_q128"}, {&k_gateq128, "gate_quant_h128"}, {&k_lmdecq128, "lm_attn_dec_q128"}, {&k_dqkh, "dattn_qk_h"}, {&k_dpvh, "dattn_pv_h"}, {&k_rowf3, "row_fused3"}, {&k_qkvp3, "qkv_post3"}, {&k_attq3, "attention_q3"}, {&k_gmq3, "gelu_mul_q3"},
+        {&k_qkvg4, "qkv_post_g4"}, {&k_dsmw, "dattn_stats_w"}, {&k_anq, "a_norm_quant"}, {&k_aact, "a_act_quant"}, {&k_ares, "a_resid"}, {&k_aconv, "a_conv_mid"}, {&k_aattn, "a_attn"}, {&k_lmconv, "lm_conv_q"}, {&k_lmcst, "lm_conv_state"}, {&k_lmkv, "lm_kv_write"}, {&k_lmpf, "lm_attn_pf"}, {&k_lmdec, "lm_attn_dec"}, {&k_lmcdec, "lm_conv_dec_q"}, {&k_lmqkv, "lm_qkv_post_kv"}, {&k_lmcwin, "lm_conv_win_q"}, {&k_lmpfq, "lm_attn_pf_q"}, {&k_lmdecq, "lm_attn_dec_q"}, {&k_lmqkvq, "lm_qkv_post_kvq"}, {&k_rmsi, "rms_inplace"}, {&k_lmconv7, "lm_conv_q7"}, {&k_lmcst7, "lm_conv_state7"}, {&k_lmcdec7, "lm_conv_dec_q7"}, {&k_lmqkvq128, "lm_qkv_post_kvq128"}, {&k_lmpfq128, "lm_attn_pf_q128"}, {&k_gateq128, "gate_quant_h128"}, {&k_v3dw, "v3_dwconv_q"}, {&k_v3qk, "v3_qk_rope64"}, {&k_lmdecq128, "lm_attn_dec_q128"}, {&k_dqkh, "dattn_qk_h"}, {&k_dpvh, "dattn_pv_h"}, {&k_rowf3, "row_fused3"}, {&k_qkvp3, "qkv_post3"}, {&k_attq3, "attention_q3"}, {&k_gmq3, "gelu_mul_q3"},
         {&k_gmvq3, "gelu_mulvec_q3"}, {&k_rnq, "resid_norm_q3"}, {&k_hinq, "head_in_q3"}, {&k_convq, "conv_gate_q3"},
         {&k_siluq, "silu_mul_q8"}, {&k_bactq, "bias_act_q8"}, {&k_badd, "bias_add"}, {&k_score, "score_out"}, {&k_attq4, "attention_q4"}, {&k_attq5, "attention_q5"}, {&k_quantq, "quant_q3"}, {&k_lngq, "ln_gather_q3"}, {&k_dqk, "dattn_qk"}, {&k_dsm, "dattn_stats"}, {&k_dpv, "dattn_pv"}};
     for (auto& k : ks) { *k.k = cl.clCreateKernel(g_prog, k.n, &err); CK(err); }
@@ -3305,6 +3346,17 @@ bool op_bias_act_mode_q(Buf G, Buf b, int act, int T, int cols) {
     set_args(k_bactq, G, b, (cl_int)act, (Buf)g_Xp, (Buf)g_Xs, (cl_int)cols);
     size_t g[1] = {(size_t)T * (cols / 8)}, l[1] = {(size_t)cols / 8};
     return launch(k_bactq, 1, g, l);
+}
+bool op_v3_dwconv_q(Buf C, Buf nb, Buf wT, int T, int d) {
+    if (d % 32 || d / 4 > 512) return false;
+    set_args(k_v3dw, C, nb, wT, (Buf)g_Xp, (Buf)g_Xs, (cl_int)d);
+    size_t g[1] = {(size_t)T * (d / 4)}, l[1] = {(size_t)d / 4};
+    return launch(k_v3dw, 1, g, l);
+}
+bool op_v3_qk_rope64(Buf C, int ld, int T, int nq, int nkv, Buf qw, Buf kw, Buf th, Buf py, Buf px, float eps) {
+    set_args(k_v3qk, C, (cl_int)ld, (cl_int)nq, (cl_int)nkv, qw, kw, th, py, px, eps);
+    size_t g[2] = {(size_t)(nq + 2 * nkv) * 32, (size_t)T}, l[2] = {32, 1};
+    return launch(k_v3qk, 2, g, l);
 }
 bool op_gate_quant_h128(Buf X, Buf G, int gld, int T, int cols) {
     if (cols % 128 || cols / 4 > 512) return false;

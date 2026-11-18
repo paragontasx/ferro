@@ -972,3 +972,44 @@ does on this XMX-less Arrow Lake-S iGPU. The image request is now half vision to
 ~1.6 s` (FERRO_VERBOSE) of the 3.05 s — the lfm3vl tower still runs on the CPU; porting it to the iGPU (its GEMMs +
 the dense attention above) is the next big lever. Smaller: fold the sandwich post-norm (`rms_post`, ~3%) into the
 residual kernel.
+
+### d1-2B lfm3vl vision tower on the iGPU, 2026-11-18 late (this machine) — image requests 3.05 -> 1.87 s
+
+After the packed decision forward, the CPU vision tower was ~1.6 s of a 3.05 s image request. The whole lfm3vl tower
+(14 blocks: 8 gated-conv, 6 GQA attention, all with a SwiGLU FFN) now runs on the iGPU with resident Q8 weights
+(+212 MB; d1-2B + tower = 2.18 GB):
+
+- patchifier: host im2col + **f32** GEMM with patch0+patch1 summed (both temporal kernels see the same frame) ->
+  upload -> `rms_inplace` (embedding norm). An int8 patchifier (int8 pixels x Q8 kernel) put 2.8% rel error into
+  the very first activation, which the last block amplified (below); f32 costs ~20 ms and makes that stage exact.
+- per block: `resid_norm_q` (ln1) -> conv: in_proj GEMM [T][3d] -> **new `v3_dwconv_q`** (gate b*x, 3x3 depthwise conv
+  over the patch grid via a host [T][9] neighbour table with -1 = zero border, x c, int8 quantize — one kernel) ->
+  out_proj GEMM; attention: q|k|v concatenated into one GEMM [T][2048] -> **new `v3_qk_rope64`** (per-head q/k RMS norm,
+  2D vision rope from per-token py/px + a 32-entry theta table, f16 rounding of K and V like llama.cpp's flash
+  attention) -> `op_dense_attention_h` per image (r0 = image offset) -> quant -> o GEMM; then ln2 `resid_norm_q` ->
+  gate|up concatenated GEMM -> `silu_mul_q` -> down GEMM.
+- tail: residual add -> `ln_gather_q` (projector input LayerNorm eps 1e-6 + 2x2 unshuffle + int8, the d1-omni
+  merge kernel) -> mm.0 GEMM -> `bias_act_mode_q` (erf GELU) -> mm.2 GEMM -> `bias_add` -> read.
+
+Parity (merged output tokens vs the CPU f32 tower; "llama-like" = the CPU path with FERRO_MM_QACT=1, i.e. int8
+activations before every Q8_0 matmul as llama.cpp does):
+
+| image | path | mean cos | worst token | rel L2 |
+|---|---|---|---|---|
+| gate (640x480) | llama-like int8 | 0.99886 | 0.977 | 0.040 |
+| gate | **iGPU** | 0.99862 | 0.925 | 0.043 |
+| cats.jpg | llama-like int8 | 0.99922 | 0.956 | 0.031 |
+| cats.jpg | **iGPU** | 0.99937 | 0.980 | 0.028 |
+
+Per-layer bisect (FERRO_V3_GDUMP vs FERRO_V3_DUMP): error accumulates smoothly to layer 12, then the LAST block (13,
+conv) writes huge deltas (median delta norm 63 vs a residual norm ~3) and a handful of tokens near the
+massive-activation threshold flip (median GPU/CPU delta ratio 1.0002; ~5 rows per image differ). Those rows carry the
+most upstream error, so the fix was less upstream noise (the f32 patchifier: worst token 0.77 -> 0.92/0.98).
+
+Decision answers (image request, 3 q): iGPU tower alarm 0.1954 / urgency 3 / zone a (0.868) vs CPU f32 0.1987 / 3 / a
+(0.858): max dP 0.010. vs llama.cpp the gaps (<= 0.035) equal the CPU path's own. `make test` PASS.
+
+Speed (14 threads, reps 1-3): vision encode **1.6 s -> 0.32-0.37 s** (4.9x; profiled: GEMMs 175 ms, q/k + attention
+140 ms, norms/act 40 ms, conv 8 ms); image request end-to-end **3048 -> 1867 ms** (CPU everything: 10.66 s -> **5.7x**);
+`serve`: 1.86 s per image request, answers identical to the CLI. The first encode after a kernel-source change pays a
+one-time OpenCL program rebuild (~1.5 s); cold encodes are 366 ms otherwise.

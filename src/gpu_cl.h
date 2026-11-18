@@ -120,6 +120,8 @@ bool op_bias_act_q(Buf G, Buf b, bool relu, int T, int cols);// (G + b) [relu] -
 bool op_bias_add(Buf Y, Buf b, int T, int rows);
 // act(G + b) -> int8 (act: 0 none, 1 relu, 2 gelu-tanh, 3 gelu-erf)
 bool op_bias_act_mode_q(Buf G, Buf b, int act, int T, int cols);
+bool op_v3_dwconv_q(Buf C, Buf nb, Buf wT, int T, int d);   // lfm3vl: gated 3x3 depthwise patch-grid conv on in_proj rows [b|c|x] -> int8; nb [T][9] rows or -1
+bool op_v3_qk_rope64(Buf C, int ld, int T, int nq, int nkv, Buf qw, Buf kw, Buf th, Buf py, Buf px, float eps);   // lfm3vl: q/k head RMS + 2D rope + f16 K/V, hd 64, in place
 bool op_gate_quant_h128(Buf X, Buf G, int gld, int T, int cols);   // O * sigmoid(G[t][h]) (hd 128) -> int8 scratch (d1-2B dense attention)
 bool op_quant_q(Buf X, int T, int cols);
 // dense attention over one fully-visible segment [r0, r0+n) of C (q|k|v at qoff/koff/voff, head dim 64):

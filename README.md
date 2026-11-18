@@ -72,12 +72,12 @@ Models are plain GGUFs (`--model kind` is auto-detected); get e.g. d1 from
   stateless whole-prompt forward, the same `/v1/systemone` protocol, `decide` + `serve --d1`, CPU and
   iGPU paths. The lfm3vl vision tower (`--mmproj`) is wired into the decision prompt (images -> patch
   tokens; audio not yet). Answers match llama.cpp: worst probability gap 0.006 (text) / 0.038 (vision).
-- **d1-2B's decision forward runs on the iGPU**, with dense GEMM-tiled attention (bidirectional on d1's
+- **d1-2B runs entirely on the iGPU** — vision tower and decision forward, with dense GEMM-tiled attention (bidirectional on d1's
   6 global layers, causal + window on its 5 SWA layers; conv runs from zero state) and **packed prompts**:
   every question of every request in a worker pass shares one forward of up to 4096 rows (segments stay
   independent). Text card (3 q / 254 tok): **373 ms vs 2912 ms CPU = 7.8x**; long state (2 q / 1500 tok)
-  **2.05 s vs 22.6 s = 11x**; a 1024x480 image request **3.05 s vs 10.66 s = 3.5x** (half of it is the
-  CPU vision tower); 16 tickets / 48 questions **3.68 s (790 tok/s)**. Serving: 0.28 s per 3-question
+  **2.05 s vs 22.6 s = 11x**; an image request **1.87 s vs 10.66 s = 5.7x** (the lfm3vl vision tower
+  runs on the iGPU too: 0.33 s vs 1.6 s); 16 tickets / 48 questions **3.68 s (790 tok/s)**. Serving: 0.28 s per 3-question
   ticket, 12.7 questions/s at concurrency 16. GPU logits match the CPU f32 path (TV <= 0.21, argmax
   identical); packing is bit-identical to one prompt per forward.
 - **Fixed: dense attention query tiling** (`op_dense_attention_h`): segments whose length was not a
@@ -194,8 +194,9 @@ window, and the 7-tap short conv runs from zero state.
 
 **Images:** pass `files` / `images` data URLs (as with d1-omni) and the mmproj
 `models/mmproj-d1-2B-Q8_0.gguf` (found next to the model). The lfm3vl vision tower patches the image
-into tokens (a 1024x480 photo -> 1200 patch tokens) and feeds the decision prompt. The vision tower
-runs on the CPU; the decision forward runs on the iGPU.
+(a 640x480 photo -> 1200 patches -> 300 tokens after the 2x2 merge) and feeds the decision prompt. Both
+the vision tower (resident Q8 weights, +212 MB) and the decision forward run on the iGPU
+(`FERRO_MM_GPU=0` keeps the tower on the CPU).
 
 All questions of all requests in a batch (or a server worker pass) are **packed** into as few iGPU
 forwards as fit 4096 rows; attention runs per prompt (dense GEMM-tiled QK^T / softmax / PV), everything
@@ -207,7 +208,7 @@ Numbers (Core Ultra 5 235HX iGPU vs the CPU path, both at 14 threads; details in
 |---|---|---|---|
 | text card, 3 q / 254 tok | **373 ms** | 2912 ms | 7.8x |
 | long state, 2 q / 1500 tok | **2.05 s** | 22.6 s | 11x |
-| 1024x480 image, 3 q / 1160 tok | **3.05 s** | 10.66 s | 3.5x (vision tower ~1.6 s, CPU) |
+| 640x480 image, 3 q / 1160 tok | **1.87 s** | 10.66 s | 5.7x (vision tower 0.33 s) |
 | 16 tickets, 48 q / 2903 tok | **3.68 s** (790 tok/s) | | |
 
 `serve --d1`: 0.28 s per 3-question ticket alone; 12.7 questions/s with 16 concurrent tickets.
@@ -569,5 +570,6 @@ paths, for A/B) · `FERRO_DECISION_BATCH=N` (tokens per d1 forward, default 4096
 `FERRO_D1_GPU=0` (force the d1-2B CPU decision forward) · `FERRO_D1_TMAX=N` (d1 device Tmax, default
 4096; longer prompts fall back to CPU) · `FERRO_D1_PACK=N` (d1-2B prompts per packed forward, default 64) ·
 `FERRO_D1_DENSE=0|1|2|3` (d1-2B dense attention: none / global / SWA / both) · `FERRO_D1_PROF=1` (d1-2B
-per-op-class timing) · `FERRO_D1_DBG=1` / `FERRO_D1_LDBG=1` (d1 GPU-vs-CPU parity hooks: logit diff /
+per-op-class timing) · `FERRO_V3_GDUMP=dir` (lfm3vl iGPU tower stage dumps, same names as the CPU path's
+`FERRO_V3_DUMP` + `FERRO_V3_DEBUG`) · `FERRO_D1_DBG=1` / `FERRO_D1_LDBG=1` (d1 GPU-vs-CPU parity hooks: logit diff /
 per-block checkpoint dumps; not for timing)

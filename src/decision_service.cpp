@@ -53,7 +53,7 @@ bool DecisionService::ensure_mm(std::string* err) {
     std::string merr;
     const auto tl = clk::now();
     if (!mm_.load(mmproj_, &merr)) throw std::runtime_error("mmproj " + mmproj_ + ": " + merr);
-    if (eng_.on_gpu()) mm_.upload_gpu();
+    if (lfm3d1_ ? d1_.on_gpu() : eng_.on_gpu()) mm_.upload_gpu();   // vision tower on the iGPU (CPU fallback kept)
     mm_loaded_ = true;
     fprintf(stderr, "[ferro] mmproj %s loaded in %.2fs (vision %s, audio %s)\n", mmproj_.c_str(), secs_since(tl), mm_.has_vision() ? "yes" : "no", mm_.has_audio() ? "yes" : "no");
     (void)err;

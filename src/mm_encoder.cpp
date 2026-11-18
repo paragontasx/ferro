@@ -81,8 +81,7 @@ static std::vector<float> v3_patch_kernel(const GgufFile& g, const std::string& 
 // ic < nd/2 rotates by the patch-row y, the rest by the patch-col x, with theta restarted per section:
 // theta_t(ic) = base * theta_scale^ic, theta_h(ic) = base * theta_scale^(ic - nd/2) (float accumulation),
 // theta_scale = powf(base, -2/nd); the cache is per token (positions are raster patch coords per image)
-static void v3_rope(float* X, int T, int heads, int hd, float freq_base, const int* seg,
-                    const std::vector<int>& off, const std::vector<int>& pw, int ld) {
+static std::vector<float> v3_rope_theta(int hd, float freq_base) {
     const int nd = hd / 2;                             // n_dims passed to the rope call
     const int sect = nd / 2;                           // mrope_sections[0]
     const float theta_scale = std::pow(freq_base, -2.0f / (float)nd);
@@ -96,6 +95,12 @@ static void v3_rope(float* X, int T, int heads, int hd, float freq_base, const i
         tht[(size_t)ic] = ic < sect ? theta_t : theta_h;
         theta_t *= theta_scale; theta_h *= theta_scale;
     }
+    return tht;
+}
+static void v3_rope(float* X, int T, int heads, int hd, float freq_base, const int* seg,
+                    const std::vector<int>& off, const std::vector<int>& pw, int ld) {
+    const int nd = hd / 2, sect = nd / 2;
+    const std::vector<float> tht = v3_rope_theta(hd, freq_base);
     Pool::get().parallel_for(T, [&](int lo, int hi) {
         for (int t = lo; t < hi; ++t) {
             const int s = seg[t];
@@ -240,6 +245,14 @@ struct MmProj::Impl {
     std::vector<float> v3_emb_norm;                       // RMS norm after the patchifier
     std::vector<float> v3_ln_w, v3_ln_b;                  // projector input LayerNorm (eps 1e-6, per patch token, before the merge)
     Lin v3_mm0, v3_mm2;                                   // mm.0 -> gelu(erf) -> mm.2
+    // iGPU lfm3vl tower (weights resident; FERRO_MM_GPU=0 keeps the CPU path)
+    bool v3gpu = false;
+    std::vector<float> v3_patch_sum;                      // patch0 + patch1 (both temporal kernels see the same frame); f32 host GEMM
+    struct V3G { gpu::Buf ln1w = nullptr, ln2w = nullptr, dwT = nullptr, qn = nullptr, kn = nullptr; WMat qkv, gu; };
+    std::vector<V3G> v3g;
+    gpu::Buf v3_embn = nullptr, v3_lnw = nullptr, v3_lnb = nullptr, v3_mm0b = nullptr, v3_mm2b = nullptr, v3_th = nullptr;
+    gpu::Buf v3X = nullptr, v3C = nullptr, v3D = nullptr, v3G = nullptr, v3S = nullptr, v3nb = nullptr, v3py = nullptr, v3px = nullptr, v3src = nullptr;
+    size_t v3cap = 0, v3capm = 0;
     // ---- iGPU vision (weights resident, whole encoder on-device)
     bool vgpu = false;
     WMat patch_q;                                    // patch embedding, Q8 (int8 DP4A path)
@@ -410,8 +423,10 @@ bool MmProj::load(const std::string& path, std::string* err) {
     return true;
 }
 
+static void upload_lfm3vl_gpu(MmProj::Impl& I);
 void MmProj::upload_gpu() {
     Impl& I = *impl_;
+    if (I.is_v3) { upload_lfm3vl_gpu(I); return; }
     auto slot = [](Lin& L) { if (!L.q.empty() && L.q.gpu_slot < 0) L.q.gpu_slot = gpu::upload_q8(L.q); };
     for (auto& L : I.vl) { slot(L.qkv); slot(L.o); slot(L.up); slot(L.down); }
     if (v_ok_) { slot(I.mm1); slot(I.mm2); }
@@ -586,7 +601,186 @@ static void v3_stat(const char* tag, const float* X, int T, int d) {
     fprintf(stderr, "[v3s] %s: max %.4f nan %d\n", tag, mx, bad);
 }
 
+static void upload_lfm3vl_gpu(MmProj::Impl& I) {
+    const char* mg_env = getenv("FERRO_MM_GPU");
+    if (mg_env && atoi(mg_env) == 0) return;
+    const int d = I.v3_d;
+    if (I.v3_hd != 64 || d % 128 || d / 4 > 512 || I.v3_ffn % 32 || I.v3_ffn / 8 > 1024 || I.v3_merge != 2) return;
+    bool ok = true;
+    auto slot = [&](WMat& W) { if (W.gpu_slot < 0) W.gpu_slot = gpu::upload_q8(W); ok = ok && W.gpu_slot >= 0; };
+    auto up = [&](const std::vector<float>& v) { gpu::Buf b = gpu::upload(v.data(), v.size() * 4); ok = ok && b; return b; };
+    auto need_q = [&](const Lin& L) { ok = ok && !L.q.empty(); };
+    for (auto& L : I.v3) {
+        if (L.conv) { need_q(L.in_proj); need_q(L.out_proj); } else { need_q(L.q); need_q(L.k); need_q(L.v); need_q(L.o); }
+        need_q(L.gate); need_q(L.up); need_q(L.down);
+    }
+    need_q(I.v3_mm0); need_q(I.v3_mm2);
+    if (!ok) { if (getenv("FERRO_VERBOSE")) fprintf(stderr, "[mm] lfm3vl iGPU tower needs Q8_0 weights -> CPU\n"); return; }
+    // patch kernels: both temporal kernels multiply the same frame, so one GEMM with the summed weight
+    std::vector<float> pw(I.v3_patch0);
+    if (!I.v3_patch1.empty()) for (size_t i = 0; i < pw.size(); ++i) pw[i] += I.v3_patch1[i];
+    I.v3_patch_sum = std::move(pw);   // the patchifier stays an f32 GEMM: int8 pixels + Q8 kernel cost 2.8% rel error up front
+    I.v3g.resize(I.v3.size());
+    for (size_t i = 0; ok && i < I.v3.size(); ++i) {
+        auto& L = I.v3[i]; auto& g = I.v3g[i];
+        g.ln1w = up(L.ln1w); g.ln2w = up(L.ln2w);
+        if (L.conv) {
+            slot(L.in_proj.q); slot(L.out_proj.q);
+            std::vector<float> wT((size_t)9 * d);                         // [e*9 + k] -> [k*d + e] (float4 lanes)
+            for (int e = 0; e < d; ++e) for (int k = 0; k < 9; ++k) wT[(size_t)k * d + e] = L.dw[(size_t)e * 9 + k];
+            g.dwT = up(wT);
+        } else {
+            g.qkv = pack_concat({&L.q.q, &L.k.q, &L.v.q}, keepn("v.blk." + std::to_string(i) + ".attn_qkv"));
+            slot(g.qkv); slot(L.o.q);
+            g.qn = up(L.qn); g.kn = up(L.kn);
+        }
+        g.gu = pack_concat({&L.gate.q, &L.up.q}, keepn("v.blk." + std::to_string(i) + ".ffn_gate_up"));
+        slot(g.gu); slot(L.down.q);
+    }
+    slot(I.v3_mm0.q); slot(I.v3_mm2.q);
+    I.v3_embn = up(I.v3_emb_norm); I.v3_lnw = up(I.v3_ln_w); I.v3_lnb = up(I.v3_ln_b);
+    I.v3_mm0b = up(I.v3_mm0.b); I.v3_mm2b = up(I.v3_mm2.b);
+    I.v3_th = up(v3_rope_theta(I.v3_hd, 1e6f));
+    I.v3gpu = ok;
+    if (getenv("FERRO_VERBOSE")) fprintf(stderr, "[mm] lfm3vl vision tower %s (%.0f MB resident total)\n", ok ? "on the iGPU" : "upload FAILED -> CPU", gpu::resident_bytes() / 1e6);
+}
+
+// patchifier input: flat im2col [T][3*ps*ps] (col = c*ps^2 + ky*ps + kx, the conv weight column order)
+static void v3_im2col(const std::vector<VisionInput>& in, const std::vector<int>& off, const std::vector<int>& wps, int ps, int T, float* CL) {
+    const int kk = 3 * ps * ps;
+    Pool::get().parallel_for(T, [&](int lo, int hi) {
+        for (int pi = lo; pi < hi; ++pi) {
+            int si = 0; while (si + 1 < (int)in.size() && off[si + 1] <= pi) ++si;
+            const int w = wps[si], plane = (size_t)in[si].nx * in[si].ny;
+            const int by = ((pi - off[si]) / w) * ps, bx = ((pi - off[si]) % w) * ps;
+            const float* chw = in[si].chw.data();
+            float* cl = CL + (size_t)pi * kk;
+            for (int c = 0; c < 3; ++c)
+                for (int ky = 0; ky < ps; ++ky)
+                    memcpy(cl + c * ps * ps + ky * ps, chw + c * plane + (size_t)(by + ky) * in[si].nx + bx, ps * 4);
+        }
+    });
+}
+
+// the whole lfm3vl tower on the iGPU: int8 GEMMs (resident Q8), fused gated depthwise conv, q/k norm + 2D rope,
+// dense attention per image, SwiGLU, then LayerNorm + 2x2 unshuffle (ln_gather) and the projector.
+static bool encode_lfm3vl_gpu(MmProj::Impl& I, const std::vector<VisionInput>& in, std::vector<float>& out) {
+    const int d = I.v3_d, nh = I.v3_heads, nkv = I.v3_kv, hd = I.v3_hd, ps = I.v3_ps, mg = I.v3_merge, ffn = I.v3_ffn;
+    const int dkv = nkv * hd, ldq = d + 2 * dkv, kk = 3 * ps * ps;
+    const int dm = d * mg * mg, d0 = I.v3_mm0.rows, dout = I.v3_mm2.rows;
+    const float eps = I.v3_eps, scale = 1.0f / std::sqrt((float)hd);
+    std::vector<int> off, wps, hps;
+    int T = 0;
+    for (const auto& v : in) {
+        if (v.nx % (ps * mg) || v.ny % (ps * mg)) return false;
+        off.push_back(T); wps.push_back(v.nx / ps); hps.push_back(v.ny / ps);
+        T += (v.nx / ps) * (v.ny / ps);
+    }
+    if (T <= 0) return false;
+    // host tables: im2col, conv neighbours, rope positions, 2x2 merge sources
+    std::vector<float> CL((size_t)T * kk), PE((size_t)T * d);
+    v3_im2col(in, off, wps, ps, T, CL.data());
+    gemm_f32(I.v3_patch_sum.data(), d, kk, CL.data(), T, PE.data(), d);   // f32 patch embedding (~2 GFLOP at T = 1200)
+    std::vector<int> nb((size_t)T * 9), py(T), px(T);
+    for (size_t i = 0; i < in.size(); ++i) {
+        const int w = wps[i], h = hps[i];
+        for (int lt = 0; lt < w * h; ++lt) {
+            const int t = off[i] + lt, y = lt / w, x = lt % w;
+            py[t] = y; px[t] = x;
+            for (int ky = 0; ky < 3; ++ky) for (int kx = 0; kx < 3; ++kx) {
+                const int iy = y + ky - 1, ix = x + kx - 1;
+                nb[(size_t)t * 9 + ky * 3 + kx] = (iy < 0 || iy >= h || ix < 0 || ix >= w) ? -1 : off[i] + iy * w + ix;
+            }
+        }
+    }
+    int Tm = 0;
+    std::vector<int> src;
+    for (size_t i = 0; i < in.size(); ++i) {
+        const int w2 = wps[i] / mg, h2 = hps[i] / mg;
+        for (int Y = 0; Y < h2; ++Y) for (int X = 0; X < w2; ++X, ++Tm)
+            for (int dy = 0; dy < mg; ++dy) for (int dx = 0; dx < mg; ++dx)
+                src.push_back(off[i] + (Y * mg + dy) * wps[i] + X * mg + dx);
+    }
+    // device scratch (grown on demand)
+    if ((size_t)T > I.v3cap) {
+        for (gpu::Buf* b : {&I.v3X, &I.v3C, &I.v3D, &I.v3G, &I.v3nb, &I.v3py, &I.v3px, &I.v3src}) { gpu::release(*b); *b = nullptr; }
+        const size_t t = (size_t)T;
+        I.v3X = gpu::alloc(t * d * 4); I.v3C = gpu::alloc(t * std::max({3 * d, ldq, kk}) * 4);
+        I.v3D = gpu::alloc(t * std::max(d, dout) * 4); I.v3G = gpu::alloc(t * std::max(2 * ffn, d0) * 4);
+        I.v3nb = gpu::alloc(t * 9 * 4); I.v3py = gpu::alloc(t * 4); I.v3px = gpu::alloc(t * 4); I.v3src = gpu::alloc(t * 4);
+        for (gpu::Buf b : {I.v3X, I.v3C, I.v3D, I.v3G, I.v3nb, I.v3py, I.v3px, I.v3src}) if (!b) { I.v3cap = 0; return false; }
+        I.v3cap = t;
+    }
+    if (!I.v3S) {                                          // dense attention scores: 16M floats; bigger images tile the queries
+        I.v3capm = (size_t)16 << 20;
+        I.v3S = gpu::alloc(I.v3capm * 4);
+        if (!I.v3S) { I.v3capm = 0; return false; }
+    }
+    if (!gpu::ensure_qscratch(T, std::max({kk, d, ffn, 3 * d})) || !gpu::ensure_qscratch(Tm, std::max(dm, d0))) return false;
+    const gpu::Buf X = I.v3X, C = I.v3C, D = I.v3D, G = I.v3G;
+    static const bool prof = getenv("FERRO_TIME") != nullptr;
+    double tq[6] = {0};
+    auto T0 = std::chrono::steady_clock::now();
+    auto P_ = [&](int k, bool r) { if (prof && r) { r = gpu::finish(); auto t = std::chrono::steady_clock::now(); tq[k] += std::chrono::duration<double>(t - T0).count(); T0 = t; } return r; };
+    bool ok = gpu::write(X, PE.data(), PE.size() * 4) && gpu::write(I.v3nb, nb.data(), nb.size() * 4)
+              && gpu::write(I.v3py, py.data(), (size_t)T * 4) && gpu::write(I.v3px, px.data(), (size_t)T * 4)
+              && gpu::write(I.v3src, src.data(), src.size() * 4);
+    ok = ok && gpu::op_rms_inplace(X, I.v3_embn, T, d, eps);
+    ok = P_(5, ok);
+    // FERRO_V3_GDUMP=dir: GPU stage dumps with the CPU path's names (FERRO_V3_DUMP + FERRO_V3_DEBUG) for bisecting
+    static const char* gdump = getenv("FERRO_V3_GDUMP");
+    auto gd = [&](const char* tag, gpu::Buf b, size_t n) {
+        if (!gdump || !ok) return;
+        std::vector<float> h(n);
+        ok = gpu::finish() && gpu::read(b, h.data(), n * 4);
+        char path[600]; snprintf(path, sizeof path, "%s/%s.bin", gdump, tag);
+        if (FILE* f = fopen(path, "wb")) { fwrite(h.data(), 4, n, f); fclose(f); }
+    };
+    gd("embedding_norm", X, (size_t)T * d);
+    bool have_d = false;
+    for (int il = 0; ok && il < I.v3_layers; ++il) {
+        const auto& L = I.v3[il];
+        const auto& g = I.v3g[il];
+        ok = P_(0, gpu::op_resid_norm_q(X, have_d ? D : nullptr, nullptr, g.ln1w, nullptr, false, T, d, eps));
+        if (L.conv) {
+            ok = ok && P_(1, gpu::op_gemm_q(L.in_proj.q.gpu_slot, T, C))
+                    && P_(2, gpu::op_v3_dwconv_q(C, I.v3nb, g.dwT, T, d))
+                    && P_(1, gpu::op_gemm_q(L.out_proj.q.gpu_slot, T, D));
+        } else {
+            ok = ok && P_(1, gpu::op_gemm_q(g.qkv.gpu_slot, T, C))
+                    && P_(3, gpu::op_v3_qk_rope64(C, ldq, T, nh, nkv, g.qn, g.kn, I.v3_th, I.v3py, I.v3px, eps));
+            for (size_t i = 0; ok && i < in.size(); ++i)                     // attention is per image
+                ok = gpu::op_dense_attention_h(C, ldq, 0, d, d + dkv, wps[i] * hps[i], nh, nkv, hd, scale, I.v3S, D, d, -1,
+                                               I.v3capm, 0, off[i]);
+            ok = ok && P_(3, gpu::op_quant_q(D, T, d))
+                    && P_(1, gpu::op_gemm_q(L.o.q.gpu_slot, T, D));
+        }
+        ok = ok && P_(0, gpu::op_resid_norm_q(X, D, nullptr, g.ln2w, nullptr, false, T, d, eps))
+                && P_(4, gpu::op_gemm_q(g.gu.gpu_slot, T, G))
+                && P_(0, gpu::op_silu_mul_q(G, T, ffn))
+                && P_(4, gpu::op_gemm_q(L.down.q.gpu_slot, T, D));
+        have_d = true;
+        if (gdump && ok) { ok = gpu::op_add_scale(X, D, G, T * d, 1.0f); char nm[64]; snprintf(nm, sizeof nm, "layer_out-%d", il); gd(nm, G, (size_t)T * d); }
+        if (ok) ok = gpu::finish();                        // bounded submissions (i915 watchdog)
+    }
+    // last residual, projector input LayerNorm (eps 1e-6) per patch + 2x2 unshuffle -> int8, then mm.0 -> gelu(erf) -> mm.2
+    ok = ok && gpu::op_add_scale(X, D, X, T * d, 1.0f)
+            && gpu::op_ln_gather_q(X, I.v3src, I.v3_lnw, I.v3_lnb, Tm * mg * mg, d, 1e-6f)
+            && gpu::op_gemm_q(I.v3_mm0.q.gpu_slot, Tm, G) && gpu::op_bias_act_mode_q(G, I.v3_mm0b, 3, Tm, d0)
+            && gpu::op_gemm_q(I.v3_mm2.q.gpu_slot, Tm, D) && gpu::op_bias_add(D, I.v3_mm2b, Tm, dout);
+    out.resize((size_t)Tm * dout);
+    ok = ok && gpu::read(D, out.data(), out.size() * 4);
+    if (prof) { P_(5, true); fprintf(stderr, "[mm-time] lfm3vl T=%d  norms/act %.0f  conv/qkv/o gemm %.0f  dwconv %.0f  qk+attn %.0f  ffn gemm %.0f  patch+tail %.0f ms\n",
+                                     T, tq[0] * 1e3, tq[1] * 1e3, tq[2] * 1e3, tq[3] * 1e3, tq[4] * 1e3, tq[5] * 1e3); }
+    return ok;
+}
+
 static std::vector<float> encode_lfm3vl(MmProj::Impl& I, const std::vector<VisionInput>& in) {
+    if (I.v3gpu) {
+        std::vector<float> out;
+        if (encode_lfm3vl_gpu(I, in, out)) return out;
+        if (getenv("FERRO_VERBOSE")) fprintf(stderr, "[mm] lfm3vl iGPU encode failed -> CPU\n");
+    }
     const int d = I.v3_d, nh = I.v3_heads, nkv = I.v3_kv, hd = I.v3_hd, ps = I.v3_ps, mg = I.v3_merge;
     const int ffn_d = I.v3_ffn;
     const float eps = I.v3_eps;
@@ -608,20 +802,7 @@ static std::vector<float> encode_lfm3vl(MmProj::Impl& I, const std::vector<Visio
     std::vector<float> X((size_t)T * d, 0.0f);
     {
         std::vector<float> CL((size_t)T * kk);
-        Pool::get().parallel_for(T, [&](int lo, int hi) {
-            for (int pi = lo; pi < hi; ++pi) {
-                int si = 0; while (si + 1 < (int)in.size() && off[si + 1] <= pi) ++si;
-                const int w = wps[si], plane = (size_t)in[si].nx * in[si].ny;
-                const int by = ((pi - off[si]) / w) * ps, bx = ((pi - off[si]) % w) * ps;
-                const float* chw = in[si].chw.data();
-                float* cl = CL.data() + (size_t)pi * kk;
-                for (int c = 0; c < 3; ++c)
-                    for (int ky = 0; ky < ps; ++ky) {
-                        const float* src = chw + c * plane + (size_t)(by + ky) * in[si].nx + bx;
-                        memcpy(cl + c * ps * ps + ky * ps, src, ps * 4);
-                    }
-            }
-        });
+        v3_im2col(in, off, wps, ps, T, CL.data());
         gemm_f32(I.v3_patch0.data(), d, kk, CL.data(), T, X.data(), d);
         if (!I.v3_patch1.empty()) {
             std::vector<float> G1((size_t)T * d);
